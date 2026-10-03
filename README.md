@@ -18,10 +18,10 @@
 ## 📸 Скриншоты
 
 <p align="center">
-  <img src="/mica.png" width="48%">
-  <img src="/mica2.png" width="48%">
-  <img src="/acrylic.png" width="48%">
-  <img src="/acrylic2.png" width="48%">
+<img src="screenshots/mica.png" width="48%">
+  <img src="screenshots/mica2.png" width="48%">
+  <img src="screenshots/acrylic.png" width="48%">
+<img src="screenshots/acrylic2.png" width="48%">
 </p>
 
 
