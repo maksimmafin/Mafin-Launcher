@@ -4,7 +4,7 @@
 
 *A modern Minecraft launcher written in Python (tkinter) with Windows 11 Mica / Mica Alt / Acrylic themes.*
 
-Оригинальный тгк с новостями: https://t.me/mafinlauncher
+Оригинальный тгк с новостями: https://t.me/mafinlauncher.
 
 ## ✨ Возможности
 
