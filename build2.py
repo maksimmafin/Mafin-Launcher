@@ -90,6 +90,9 @@ def build_exe(icon_path=None, require_admin=True):
     if os.path.exists(ACHIEVEMENT_SOUND):
         cmd += ["--add-data", f"{ACHIEVEMENT_SOUND}{os.pathsep}."]
 
+    if icon_path and os.path.basename(icon_path).lower() == "icon.ico":
+        cmd += ["--add-data", f"{icon_path}{os.pathsep}."]
+
     hidden_imports = [
         "minecraft_launcher_lib",
         "minecraft_launcher_lib.forge",
