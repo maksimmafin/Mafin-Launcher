@@ -5,7 +5,7 @@
 #define JavaInstallerURL "https://api.adoptium.net/v3/installer/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse"
 
 [Setup]
-AppId={{9F1B7A2E-6B7A-4E2C-9C3F-JALEYLAUNCHER}}
+AppId={{9F1B7A2E-6B7A-4E2C-9C3F-MAFINLAUNCHER}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
