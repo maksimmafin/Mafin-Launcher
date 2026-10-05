@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.secret_key
+config.json
+launcher_config.json
+
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+
+updates/
+gift_images/
+
+.minecraft_mafinlauncher/
