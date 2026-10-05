@@ -5332,6 +5332,12 @@ class LauncherApp:
 
     def _make_tray_image(self):
         from PIL import Image, ImageDraw
+        try:
+            icon_file = resource_path("icon.ico")
+            if os.path.exists(icon_file):
+                return Image.open(icon_file).convert("RGBA")
+        except Exception as e:
+            print(f"Не удалось загрузить icon.ico для трея: {e}")
         img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(67, 181, 129, 255))
