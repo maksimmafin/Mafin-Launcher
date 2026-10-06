@@ -184,7 +184,7 @@ def animate_image_on_label(label, image_bytes, max_px=96, circular=False):
 
 CONFIG_FILE = "launcher_config.json"
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 
 
 def _sha256_file(path):
