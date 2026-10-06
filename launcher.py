@@ -854,8 +854,8 @@ class ServerAPI:
         except Exception:
             return {"error": f"Некорректный ответ сервера (HTTP {resp.status_code})"}
 
-    def _get(self, path, params=None):
-        r = requests.get(f"{self.base_url}{path}", headers=self._headers(), params=params, timeout=10)
+    def _get(self, path, params=None, timeout=10):
+        r = requests.get(f"{self.base_url}{path}", headers=self._headers(), params=params, timeout=timeout)
         return r.status_code, self._safe_json(r)
 
     def _post(self, path, payload=None):
@@ -921,6 +921,12 @@ class ServerAPI:
 
     def report_launch(self, version):
         return self._post("/api/launch", {"version": version})
+
+    def register_mc_session(self, game_name):
+        return self._post("/api/mc/session", {"game_name": game_name})
+
+    def mc_status(self):
+        return self._get("/api/mc/status", timeout=4)
 
     def report_playtime(self, minutes, version, launch_counted=False):
         return self._post("/api/playtime", {
@@ -3411,6 +3417,138 @@ class LauncherCore:
         return proc
 
 
+MRPACK_ALLOWED_HOSTS = ("cdn.modrinth.com", "github.com", "raw.githubusercontent.com", "gitlab.com")
+MRPACK_MAX_OVERRIDES_BYTES = 2 * 1024 ** 3
+
+
+def _mrpack_safe_path(base, rel):
+    """Полный путь внутри base или None, если rel пытается выйти за его пределы."""
+    rel = (rel or "").replace("\\", "/")
+    if not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:", rel):
+        return None
+    base_n = os.path.normpath(base)
+    full = os.path.normpath(os.path.join(base_n, *rel.split("/")))
+    if full != base_n and not full.startswith(base_n + os.sep):
+        return None
+    return full
+
+
+def parse_mrpack_index(mrpack_path):
+    """Читает modrinth.index.json: версия Minecraft, загрузчик и список файлов."""
+    with zipfile.ZipFile(mrpack_path) as z:
+        try:
+            raw = z.read("modrinth.index.json")
+        except KeyError:
+            raise ValueError("В архиве нет modrinth.index.json, это не сборка Modrinth")
+        index = json.loads(raw.decode("utf-8"))
+    if index.get("game", "minecraft") != "minecraft":
+        raise ValueError("Это сборка не для Minecraft")
+    deps = index.get("dependencies") or {}
+    mc = str(deps.get("minecraft") or "").strip()
+    if not mc:
+        raise ValueError("В сборке не указана версия Minecraft")
+    loader, loader_version = "vanilla", ""
+    for key, name in (("fabric-loader", "fabric"), ("quilt-loader", "quilt"),
+                      ("neoforge", "neoforge"), ("forge", "forge")):
+        if deps.get(key):
+            loader, loader_version = name, str(deps[key]).strip()
+            break
+    if loader == "forge" and not loader_version.startswith(mc + "-"):
+        loader_version = f"{mc}-{loader_version}"
+    return {"name": index.get("name") or "Сборка", "mc_version": mc, "loader": loader,
+            "loader_version": loader_version, "files": index.get("files") or []}
+
+
+def install_mrpack(mrpack_path, dest_dir, progress=None, hosts=None, allow_http=False):
+    """Распаковывает сборку Modrinth (.mrpack) в dest_dir: докачивает моды, кладёт overrides.
+    Не трогает интерфейс, можно вызывать из потока. Возвращает информацию о сборке и список ошибок."""
+    import hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    hosts = tuple(h.lower() for h in (hosts or MRPACK_ALLOWED_HOSTS))
+    info = parse_mrpack_index(mrpack_path)
+    os.makedirs(dest_dir, exist_ok=True)
+    files = [f for f in info["files"] if (f.get("env") or {}).get("client") != "unsupported"]
+    total, failed, state, lock = len(files), [], {"done": 0}, threading.Lock()
+
+    def fetch(f):
+        rel = f.get("path", "")
+        name = os.path.basename(rel) or "файл"
+        target = _mrpack_safe_path(dest_dir, rel)
+        if not target:
+            raise ValueError(f"{name}: небезопасный путь")
+        urls = []
+        for u in f.get("downloads") or []:
+            p = urlparse(u)
+            if (p.hostname or "").lower() in hosts and (p.scheme == "https" or (allow_http and p.scheme == "http")):
+                urls.append(u)
+        if not urls:
+            raise ValueError(f"{name}: нет разрешённой ссылки для скачивания")
+        sha1 = ((f.get("hashes") or {}).get("sha1") or "").lower()
+        sha512 = ((f.get("hashes") or {}).get("sha512") or "").lower()
+        if not (sha1 or sha512):
+            raise ValueError(f"{name}: нет контрольной суммы")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        last_error, tmp = None, target + ".part"
+        for url in urls:
+            try:
+                h1, h512 = hashlib.sha1(), hashlib.sha512()
+                with requests.get(url, stream=True, timeout=30, headers=ModrinthClient.HEADERS) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as out:
+                        for chunk in r.iter_content(65536):
+                            out.write(chunk)
+                            h1.update(chunk)
+                            h512.update(chunk)
+                if (sha512 and h512.hexdigest() != sha512) or (sha1 and h1.hexdigest() != sha1):
+                    raise ValueError("не совпала контрольная сумма")
+                os.replace(tmp, target)
+                return
+            except Exception as e:
+                last_error = e
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        raise Exception(f"{name}: {last_error}")
+
+    def job(f):
+        try:
+            fetch(f)
+        except Exception as e:
+            with lock:
+                failed.append(str(e))
+        with lock:
+            state["done"] += 1
+            done = state["done"]
+        if progress:
+            progress(done, total, os.path.basename(f.get("path", "")))
+
+    if total:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(job, files))
+
+    with zipfile.ZipFile(mrpack_path) as z:
+        size = 0
+        for prefix in ("overrides/", "client-overrides/"):
+            for m in z.infolist():
+                if m.is_dir() or not m.filename.startswith(prefix):
+                    continue
+                size += m.file_size
+                if size > MRPACK_MAX_OVERRIDES_BYTES:
+                    raise ValueError("Слишком большой размер файлов сборки")
+                rel = m.filename[len(prefix):]
+                target = _mrpack_safe_path(dest_dir, rel)
+                if not target:
+                    failed.append(f"{rel}: небезопасный путь")
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with z.open(m) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    os.makedirs(os.path.join(dest_dir, "mods"), exist_ok=True)
+    info["failed"] = failed
+    return info
+
+
 class ModrinthClient:
     API = "https://api.modrinth.com/v2"
     LOADERS = {"Любой": [], "Fabric": ["fabric"], "Forge": ["forge"],
@@ -3432,7 +3570,7 @@ class ModrinthClient:
         facets = [[f"project_type:{project_type}"]]
         if game_version:
             facets.append([f"versions:{game_version}"])
-        if loaders and project_type == "mod":
+        if loaders and project_type in ("mod", "modpack"):
             facets.append([f"categories:{l}" for l in loaders])
         params = {"facets": json.dumps(facets), "limit": limit, "offset": offset,
                   "index": self.SORTS.get(sort, "relevance")}
@@ -3635,9 +3773,214 @@ def _short_number(n):
     return str(n)
 
 
+def mc_game_version(version_id):
+    """Версия игры из идентификатора: 1.20.4, fabric-loader-0.15.7-1.20.4, 26.2 и т.п."""
+    text = (version_id or "").strip()
+    m = re.search(r"\b1\.\d{1,2}(?:\.\d{1,2})?\b", text)
+    if m:
+        return m.group(0)
+    m = re.search(r"(?:^|[-_ ])(\d{2}\.\d{1,2}(?:\.\d{1,2})?)(?:$|[-_ ])", text)
+    return m.group(1) if m else ""
+
+
+def mc_version_key(version):
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", (version or "").strip())
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def server_version_range(server):
+    """(от, до) для записи сервера или (None, None), если версия не указана."""
+    lo = (server.get("version_from") or server.get("version") or "").strip()
+    hi = (server.get("version_to") or server.get("version") or "").strip()
+    if not lo and not hi:
+        return None, None
+    lo, hi = lo or hi, hi or lo
+    klo, khi = mc_version_key(lo), mc_version_key(hi)
+    if klo and khi and klo > khi:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def format_server_versions(server):
+    lo, hi = server_version_range(server)
+    if not lo:
+        return ""
+    return lo if lo == hi else f"{lo} – {hi}"
+
+
+def pick_server_launch_version(lo, hi, current):
+    """Какую версию запускать для сервера: текущую, если она подходит, иначе новейшую из диапазона.
+    Возвращает (версия, это_текущая_версия)."""
+    if not lo:
+        return current, True
+    ck, lk, hk = mc_version_key(current), mc_version_key(lo), mc_version_key(hi)
+    if ck and lk and hk and lk <= ck <= hk:
+        return current, True
+    return hi, False
+
+
+def server_join_args(mc_version, address):
+    """Аргументы запуска, чтобы игра сразу подключилась к серверу."""
+    host, _, port = address.partition(":")
+    key = mc_version_key(mc_version)
+    if key is None or key >= (1, 20, 0):
+        return ["--quickPlayMultiplayer", address]
+    return ["--server", host, "--port", port or "25565"]
+
+
+# ----- сервер лаунчера в списке «Сетевая игра» (servers.dat) -----
+LAUNCHER_SERVER_MIN_VERSION = (1, 20, 4)
+
+
+def _nbt_str(text):
+    data = "".join(ch for ch in str(text) if ord(ch) <= 0xFFFF).encode("utf-8")[:65535]
+    return struct.pack(">H", len(data)) + data
+
+
+def _servers_entry_bytes(name, address):
+    """Одна запись сервера: compound { ip: String, name: String }."""
+    return b"\x08" + _nbt_str("ip") + _nbt_str(address) + b"\x08" + _nbt_str("name") + _nbt_str(name) + b"\x00"
+
+
+def _servers_dat_build(entries_raw):
+    body = b"".join(entries_raw)
+    return (b"\x0a" + _nbt_str("") + b"\x09" + _nbt_str("servers") + b"\x0a"
+            + struct.pack(">i", len(entries_raw)) + body + b"\x00")
+
+
+def _servers_dat_read_entry(buf, pos):
+    """Читает compound-запись списка. Возвращает (ip, name, конец_записи)."""
+    ip = name = None
+    while True:
+        t = buf[pos]
+        pos += 1
+        if t == 0:
+            return ip, name, pos
+        key, pos = _nbt_read_string(buf, pos)
+        if t == 8 and key in ("ip", "name"):
+            value, pos = _nbt_read_string(buf, pos)
+            if key == "ip":
+                ip = value
+            else:
+                name = value
+        else:
+            pos = _nbt_skip_payload(buf, pos, t)
+
+
+def servers_dat_add(game_dir, name, address):
+    """Добавляет сервер в servers.dat (список «Сетевая игра»), не трогая остальные записи.
+    Если запись с таким адресом уже есть, ничего не меняется. Старая запись с тем же названием
+    и другим адресом (сервер переехал на другой порт) заменяется. Возвращает True, если файл изменён."""
+    path = os.path.join(game_dir, "servers.dat")
+    new_entry = _servers_entry_bytes(name, address)
+    if not os.path.isfile(path):
+        os.makedirs(game_dir, exist_ok=True)
+        data = _servers_dat_build([new_entry])
+    else:
+        with open(path, "rb") as f:
+            buf = f.read()
+        if len(buf) < 4 or buf[0] != 10:
+            raise ValueError("servers.dat повреждён или не в формате NBT")
+        pos = 1
+        _, pos = _nbt_read_string(buf, pos)  # имя корневого тега
+        list_start = None
+        while True:
+            t = buf[pos]
+            if t == 0:
+                root_end = pos
+                break
+            pos += 1
+            key, pos = _nbt_read_string(buf, pos)
+            if t == 9 and key == "servers" and list_start is None:
+                list_start = pos
+            pos = _nbt_skip_payload(buf, pos, t)
+            if list_start is not None and key == "servers":
+                list_end = pos
+        if list_start is None:
+            tail = b"\x09" + _nbt_str("servers") + b"\x0a" + struct.pack(">i", 1) + new_entry
+            data = buf[:root_end] + tail + buf[root_end:]
+        else:
+            list_type = buf[list_start]
+            count = struct.unpack_from(">i", buf, list_start + 1)[0]
+            if count > 0 and list_type != 10:
+                raise ValueError("В servers.dat неожиданный тип списка серверов")
+            kept, p = [], list_start + 5
+            for _ in range(max(count, 0)):
+                ip, nm, end = _servers_dat_read_entry(buf, p)
+                raw = buf[p:end]
+                p = end
+                if (ip or "").lower() == address.lower():
+                    return False  # уже есть
+                if nm == name:
+                    continue  # устаревшая запись нашего сервера
+                kept.append(raw)
+            kept.append(new_entry)
+            new_list = (b"\x0a" + struct.pack(">i", len(kept)) + b"".join(kept))
+            data = buf[:list_start] + new_list + buf[list_end:]
+        try:
+            shutil.copyfile(path, path + ".launcher_bak")
+        except OSError:
+            pass
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return True
+
+
+
+def ping_minecraft_server(host, port, timeout=3.0):
+    """Server List Ping: версия сервера и число игроков. None, если сервер не ответил."""
+    def varint(n):
+        out = b""
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out += bytes([b | (0x80 if n else 0)])
+            if not n:
+                return out
+
+    def read_varint(sock):
+        n = 0
+        for i in range(5):
+            b = sock.recv(1)
+            if not b:
+                raise ConnectionError("closed")
+            n |= (b[0] & 0x7F) << (7 * i)
+            if not b[0] & 0x80:
+                return n
+        raise ValueError("varint too long")
+
+    try:
+        start = time.time()
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            addr = host.encode("utf-8")
+            hs = b"\x00" + varint(0) + varint(len(addr)) + addr + struct.pack(">H", port) + varint(1)
+            s.sendall(varint(len(hs)) + hs)
+            s.sendall(b"\x01\x00")
+            read_varint(s)
+            if read_varint(s) != 0:
+                return None
+            size = read_varint(s)
+            buf = b""
+            while len(buf) < size:
+                chunk = s.recv(min(65536, size - len(buf)))
+                if not chunk:
+                    raise ConnectionError("closed")
+                buf += chunk
+        data = json.loads(buf.decode("utf-8"))
+        players = data.get("players") or {}
+        return {"version": (data.get("version") or {}).get("name") or "",
+                "online": players.get("online", 0), "max": players.get("max", 0),
+                "ms": int((time.time() - start) * 1000)}
+    except Exception:
+        return None
+
+
 def detect_game_version_and_loader(version_id):
     text = (version_id or "").strip()
-    match = re.search(r"\b1\.\d{1,2}(?:\.\d{1,2})?\b", text)
+    match_version = mc_game_version(text)
     low = text.lower()
     loader = ""
     if "neoforge" in low:
@@ -3648,7 +3991,7 @@ def detect_game_version_and_loader(version_id):
         loader = "Fabric"
     elif "quilt" in low:
         loader = "Quilt"
-    return (match.group(0) if match else ""), loader
+    return match_version, loader
 
 
 class ModrinthBrowser(tk.Toplevel):
@@ -3657,12 +4000,18 @@ class ModrinthBrowser(tk.Toplevel):
     def __init__(self, app, kind="mods"):
         super().__init__(app.root)
         self.app, self.kind = app, kind
-        self.project_type = "mod" if kind == "mods" else "resourcepack"
-        self.target_dir = app.mod_manager.mods_dir if kind == "mods" else app.rp_manager.rp_dir
+        self.project_type = {"mods": "mod", "resourcepacks": "resourcepack", "modpacks": "modpack"}[kind]
+        if kind == "mods":
+            self.target_dir = app.mod_manager.mods_dir
+        elif kind == "modpacks":
+            self.target_dir = tempfile.mkdtemp(prefix="mafin_mrpack_")
+        else:
+            self.target_dir = app.rp_manager.rp_dir
         os.makedirs(self.target_dir, exist_ok=True)
         pack = app.config.get("active_modpack", "")
         suffix = f" → {pack}" if pack and kind == "mods" else ""
-        self.title(("Modrinth — моды" if kind == "mods" else "Modrinth — ресурспаки") + suffix)
+        self.title({"mods": "Modrinth — моды", "resourcepacks": "Modrinth — ресурспаки",
+                    "modpacks": "Modrinth — сборки"}[kind] + suffix)
         self.geometry("940x640")
         self.minsize(780, 520)
         self.transient(app.root)
@@ -3673,6 +4022,8 @@ class ModrinthBrowser(tk.Toplevel):
         if not loader:
             loader = {"forge": "Forge", "fabric": "Fabric", "neoforge": "NeoForge",
                       "quilt": "Quilt"}.get(app.modloader_var.get(), "")
+        if kind == "modpacks":
+            version, loader = "", ""
         self.query_var = tk.StringVar()
         self.version_var = tk.StringVar(value=version)
         self.loader_var = tk.StringVar(value=loader or "Любой")
@@ -3697,7 +4048,7 @@ class ModrinthBrowser(tk.Toplevel):
         ver = ttk.Entry(flt, textvariable=self.version_var, width=9)
         ver.pack(side="left", padx=(4, 12))
         ver.bind("<Return>", lambda e: self.search())
-        if self.kind == "mods":
+        if self.kind in ("mods", "modpacks"):
             ttk.Label(flt, text="Загрузчик:").pack(side="left")
             combo = ttk.Combobox(flt, textvariable=self.loader_var, state="readonly", width=10,
                                  values=list(ModrinthClient.LOADERS))
@@ -3765,7 +4116,7 @@ class ModrinthBrowser(tk.Toplevel):
         threading.Thread(target=runner, daemon=True).start()
 
     def _loaders(self):
-        return ModrinthClient.LOADERS.get(self.loader_var.get(), []) if self.kind == "mods" else []
+        return ModrinthClient.LOADERS.get(self.loader_var.get(), []) if self.kind in ("mods", "modpacks") else []
 
     def search(self, append=False):
         if self.busy:
@@ -3822,6 +4173,9 @@ class ModrinthBrowser(tk.Toplevel):
             return
         loaders = self._loaders()
         version = self.version_var.get().strip()
+        if self.kind == "modpacks":
+            self._install_modpack(hit, version, loaders)
+            return
         want_deps = self.deps_var.get() and self.kind == "mods"
         self.busy = True
         self.progress["value"] = 0
@@ -3855,6 +4209,49 @@ class ModrinthBrowser(tk.Toplevel):
             return self._install_chain(hit, version, loaders, want_deps)
 
         self._run(work, done)
+
+    def _install_modpack(self, hit, version, loaders):
+        title = hit.get("title", hit["project_id"])
+        self.busy = True
+        self.progress["value"] = 0
+
+        def work():
+            self.after(0, lambda: self._set_status(f"Ищу версию сборки: {title}…"))
+            ver = self.client.best_version(hit["project_id"], version, loaders)
+            if not ver:
+                raise Exception("Нет подходящей версии сборки (попробуйте убрать фильтры версии и загрузчика)")
+            file_obj = next((f for f in ver["files"] if (f.get("filename") or "").endswith(".mrpack")), None)
+            if not file_obj:
+                raise Exception("У этой версии нет файла .mrpack, такой формат не поддерживается")
+            self.after(0, lambda: self._set_status(f"Скачиваю сборку «{title}»…"))
+            self._download(title, file_obj)
+            mrpack = os.path.join(self.target_dir, os.path.basename(file_obj["filename"]))
+            name = self.app._unique_pack_name(title)
+            dest = self.app._modpack_dir(name)
+            info = install_mrpack(
+                mrpack, dest,
+                lambda d, t, f: self.after(0, lambda: self._on_pack_progress(title, d, t, f)))
+            try:
+                os.remove(mrpack)
+            except OSError:
+                pass
+            self.app.root.after(0, lambda: self.app._finish_mrpack_install(name, info))
+            return name
+
+        def done(result, error):
+            self.busy = False
+            self.progress["value"] = 0
+            if error:
+                self._set_status(f"Ошибка установки сборки: {error}", error=True)
+            else:
+                self._set_status(f"Сборка «{result}» установлена")
+
+        self._run(work, done)
+
+    def _on_pack_progress(self, title, done, total, fname):
+        if self.winfo_exists() and total:
+            self.progress["value"] = done * 100 / total
+            self.status.configure(text=f"{title}: {done}/{total} — {fname}")
 
     def _install_chain(self, hit, version, loaders, want_deps):
         installed, skipped, missing, seen = [], [], [], set()
@@ -4483,6 +4880,127 @@ class ModUpdateWindow(tk.Toplevel):
         if self.winfo_exists():
             self.progress["value"] = done * 100 / total
             self.status.configure(text=f"Скачиваю {name}: {_fmt_mb(done, total)}", fg="#7a8599")
+
+
+class ServerEditDialog(tk.Toplevel):
+    """Добавление и изменение сервера: название, адрес, версия или диапазон версий."""
+
+    def __init__(self, app, server=None, on_save=None):
+        super().__init__(app.root)
+        self.app, self.on_save = app, on_save
+        server = server or {}
+        self.title("Изменить сервер" if server else "Новый сервер")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.grab_set()
+
+        is_range = bool(server.get("version_from") or server.get("version_to"))
+        self.name_var = tk.StringVar(value=server.get("name", ""))
+        self.addr_var = tk.StringVar(value=server.get("address", ""))
+        self.range_var = tk.BooleanVar(value=is_range)
+        self.v1_var = tk.StringVar(value=server.get("version_from") or server.get("version", ""))
+        self.v2_var = tk.StringVar(value=server.get("version_to", ""))
+        versions = list(getattr(app, "_all_versions", []) or [])
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Название:").grid(row=0, column=0, sticky="w", pady=4)
+        name_entry = ttk.Entry(frm, textvariable=self.name_var, width=34)
+        name_entry.grid(row=0, column=1, columnspan=2, sticky="w", padx=6)
+        name_entry.focus_set()
+
+        ttk.Label(frm, text="Адрес (ip:порт):").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(frm, textvariable=self.addr_var, width=34).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Button(frm, text="🔍 Определить версию", command=self._detect).grid(row=1, column=2, padx=4)
+
+        self.v1_label = ttk.Label(frm, text="Версия:")
+        self.v1_label.grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Combobox(frm, textvariable=self.v1_var, width=18, values=versions).grid(row=2, column=1, sticky="w", padx=6)
+
+        self.v2_label = ttk.Label(frm, text="до версии:")
+        self.v2_label.grid(row=3, column=0, sticky="w", pady=4)
+        self.v2_combo = ttk.Combobox(frm, textvariable=self.v2_var, width=18, values=versions)
+        self.v2_combo.grid(row=3, column=1, sticky="w", padx=6)
+
+        ttk.Checkbutton(frm, text="Диапазон версий (от и до)", variable=self.range_var,
+                        command=self._toggle_range).grid(row=4, column=1, columnspan=2, sticky="w", padx=6, pady=(2, 6))
+        ttk.Label(frm, foreground="#7a8599", justify="left",
+                  text="Версию можно не указывать: тогда игра запустится в той версии, что выбрана сейчас.\n"
+                       "Диапазон нужен серверам с ViaVersion/ViaBackwards: если ваша версия\n"
+                       "в него входит, она и запустится, иначе будет взята новейшая из диапазона.").grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=6, column=0, columnspan=3, sticky="e")
+        ttk.Button(btns, text="Отмена", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="Сохранить", style="Accent.TButton", command=self._save).pack(side="right", padx=4)
+        self._toggle_range()
+
+    def _toggle_range(self):
+        if self.range_var.get():
+            self.v1_label.config(text="Версия от:")
+            self.v2_label.grid()
+            self.v2_combo.grid()
+        else:
+            self.v1_label.config(text="Версия:")
+            self.v2_label.grid_remove()
+            self.v2_combo.grid_remove()
+
+    def _parse_address(self):
+        address = self.addr_var.get().strip()
+        host, _, port_str = address.partition(":")
+        if not re.fullmatch(r"[A-Za-z0-9.\-_]+", host or "") or (port_str and not port_str.isdigit()):
+            return None, None, None
+        port = int(port_str) if port_str else 25565
+        if not 1 <= port <= 65535:
+            return None, None, None
+        return address, host, port
+
+    def _detect(self):
+        address, host, port = self._parse_address()
+        if not address:
+            messagebox.showwarning("Сервер", "Сначала впиши адрес в формате ip:порт.", parent=self)
+            return
+
+        def work():
+            info = ping_minecraft_server(host, port)
+            self.after(0, lambda: self._detected(info))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _detected(self, info):
+        if not self.winfo_exists():
+            return
+        if not info:
+            messagebox.showinfo("Сервер", "Сервер не ответил. Проверь адрес или впиши версию вручную.", parent=self)
+            return
+        m = re.search(r"\d+\.\d+(?:\.\d+)?", info["version"])
+        if m:
+            self.v1_var.set(m.group(0))
+            self.range_var.set(False)
+            self._toggle_range()
+        messagebox.showinfo("Сервер", f"Версия сервера: {info['version'] or 'неизвестна'}\n"
+                                      f"Игроки: {info['online']}/{info['max']}", parent=self)
+
+    def _save(self):
+        address, host, port = self._parse_address()
+        if not address:
+            messagebox.showwarning("Сервер", "Адрес должен быть в формате ip:порт (или домен).", parent=self)
+            return
+        v1, v2 = self.v1_var.get().strip(), self.v2_var.get().strip()
+        for v in (v1, v2 if self.range_var.get() else ""):
+            if v and mc_version_key(v) is None:
+                messagebox.showwarning("Сервер", f"Версия «{v}» непонятна. Пример: 1.20.4 или 26.2.", parent=self)
+                return
+        data = {"name": self.name_var.get().strip() or address, "address": address}
+        if self.range_var.get() and v1 and v2 and v1 != v2:
+            if mc_version_key(v1) > mc_version_key(v2):
+                v1, v2 = v2, v1
+            data["version_from"], data["version_to"] = v1, v2
+        elif v1 or v2:
+            data["version"] = v1 or v2
+        if self.on_save:
+            self.on_save(data)
+        self.destroy()
 
 
 class ModpackCreateDialog(tk.Toplevel):
@@ -6754,6 +7272,7 @@ class LauncherApp:
         ttk.Button(btns, text="▶ Сделать активной", style="Accent.TButton",
                    command=self.modpack_activate).pack(pady=4, fill="x")
         ttk.Button(btns, text="➕ Создать из текущих", command=self.modpack_create).pack(pady=4, fill="x")
+        ttk.Button(btns, text="🌐 Каталог сборок", command=lambda: ModrinthBrowser(self, "modpacks")).pack(pady=4, fill="x")
         ttk.Button(btns, text="💾 Обновить настройки", command=self.modpack_update_settings).pack(pady=4, fill="x")
         ttk.Button(btns, text="⚙ ОЗУ и Java", command=self.modpack_resources_dialog).pack(pady=4, fill="x")
         ttk.Button(btns, text="🛡 Бэкапы", command=self.modpack_backups_dialog).pack(pady=4, fill="x")
@@ -6799,6 +7318,29 @@ class LauncherApp:
 
     def modpack_create(self):
         ModpackCreateDialog(self)
+
+    def _unique_pack_name(self, base):
+        base = re.sub(r'[\\/:*?"<>|]+', "_", base).strip(" .") or "Сборка"
+        name, n = base, 2
+        while self._find_modpack(name) or os.path.exists(self._modpack_dir(name)):
+            name, n = f"{base} {n}", n + 1
+        return name
+
+    def _finish_mrpack_install(self, name, info):
+        self.config.setdefault("modpacks", []).append({
+            "name": name, "mc_version": info["mc_version"],
+            "loader": info["loader"], "loader_version": info["loader_version"],
+        })
+        save_json_file(CONFIG_FILE, self.config)
+        self.refresh_modpacks()
+        text = f"Сборка «{name}» установлена ({info['loader']} {info['mc_version']})."
+        failed = info.get("failed") or []
+        if failed:
+            text += f"\n\nНе удалось скачать ({len(failed)}):\n" + "\n".join(failed[:8])
+            text += "\n\nСборка может не запуститься, пока эти файлы не будут добавлены."
+        text += "\n\nСделать её активной?"
+        if messagebox.askyesno("Сборка установлена", text):
+            self._activate_modpack(name)
 
     def _create_modpack(self, name, mc_version, loader, loader_version):
         path = self._modpack_dir(name)
@@ -7821,35 +8363,183 @@ class LauncherApp:
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="▶ Играть на выбранном", style="Accent.TButton",
+                   command=self.play_selected_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="➕ Добавить", command=self.add_server).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="✏ Изменить", command=self.edit_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.remove_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="📶 Проверить", command=self.ping_server).pack(side="left", padx=5)
+        self.server_listbox.bind("<Double-Button-1>", lambda e: self.play_selected_server())
+        self._pinned_server = None
         self.refresh_servers_ui()
+        self.refresh_pinned_server()
+        self._schedule_pinned_refresh()
+
+    def _pinned_label(self):
+        p = self._pinned_server
+        if p.get("ready"):
+            state = f"🟢 {p.get('players_online', 0)}/{p.get('players_max', 0)}"
+        elif p.get("running"):
+            state = "🟡 запускается"
+        else:
+            state = "🔴 выключен"
+        ver = format_server_versions({"version_from": p.get("version_min") or p.get("version"),
+                                      "version_to": p.get("version_max") or p.get("version")})
+        ver = f"  [{ver}]" if ver else ""
+        return f"  ⭐ {p.get('name') or 'Mafin Server'}  ({p['address']})  {state}{ver}"
+
+    def _config_server_index(self, row):
+        """Номер строки списка -> номер в config['servers'] (None для закреплённого сервера)."""
+        offset = 1 if getattr(self, "_pinned_server", None) else 0
+        idx = row - offset
+        return idx if idx >= 0 else None
+
+    PINNED_REFRESH_MS = 5000
+    PINNED_FAILS_BEFORE_HIDE = 3
+
+    def refresh_pinned_server(self):
+        if getattr(self, "_pinned_busy", False):
+            return
+        self._pinned_busy = True
+
+        def work():
+            info, ok = None, False
+            try:
+                status, data = self.api.mc_status()
+                if status == 200 and data.get("success") and data.get("address"):
+                    info, ok = data, True
+            except Exception:
+                pass
+            try:
+                self.root.after(0, lambda: self._set_pinned_server(info, ok))
+            except Exception:
+                self._pinned_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_pinned_server(self, info, ok=True):
+        self._pinned_busy = False
+        if ok:
+            self._pinned_fails = 0
+        else:
+            # одиночный сбой сети не должен прятать сервер: убираем его после нескольких неудач подряд
+            self._pinned_fails = getattr(self, "_pinned_fails", 0) + 1
+            if self._pinned_fails < self.PINNED_FAILS_BEFORE_HIDE and self._pinned_server:
+                return
+            info = None
+        if info == self._pinned_server:
+            return
+        self._pinned_server = info
+        self.refresh_servers_ui()
+
+    def _schedule_pinned_refresh(self):
+        def tick():
+            try:
+                if self.root.winfo_exists():
+                    self.refresh_pinned_server()
+                    self.root.after(self.PINNED_REFRESH_MS, tick)
+            except Exception:
+                pass
+        self.root.after(self.PINNED_REFRESH_MS, tick)
+
+    def play_selected_server(self):
+        sel = self.server_listbox.curselection()
+        if not sel:
+            if self.server_listbox.size():
+                sel = (0,)
+            else:
+                messagebox.showinfo("Серверы", "Выбери сервер в списке или добавь новый.")
+                return
+        idx = self._config_server_index(sel[0])
+        if idx is None:
+            p = self._pinned_server
+            if not p.get("ready"):
+                messagebox.showinfo("Серверы", "Сервер выключен или ещё запускается. Попробуй позже.")
+                return
+            if not self.api.is_logged_in():
+                messagebox.showwarning("Серверы", "Войди в аккаунт лаунчера на вкладке «Аккаунт»: "
+                                                  "без этого сервер тебя не пустит.")
+                return
+            server = {"name": p.get("name") or "Mafin Server", "address": p["address"],
+                      "version_from": p.get("version_min") or p.get("version") or "",
+                      "version_to": p.get("version_max") or p.get("version") or ""}
+        else:
+            server = self.config["servers"][idx]
+        if self.installing or (self.process is not None and self.process.poll() is None):
+            messagebox.showwarning("Серверы", "Дождись окончания установки или закрой запущенную игру.")
+            return
+
+        lo, hi = server_version_range(server)
+        current = mc_game_version(self.version_var.get())
+        version, keep = pick_server_launch_version(lo, hi, current)
+        text = f"Запустить Minecraft {version} и подключиться к «{server['name']}» ({server['address']})?".replace("Minecraft  ", "Minecraft ")
+        if lo and not keep:
+            text += f"\n\nВыбранная сейчас версия ({current or 'не выбрана'}) серверу не подходит, поэтому будет использована {version}."
+        if not messagebox.askyesno("Играть на сервере", text):
+            return
+        if lo and not keep:
+            self.version_var.set(version)
+            if self.modloader_var.get() != "vanilla":
+                self.modloader_var.set("vanilla")
+                self._on_loader_change()
+        self.config["last_server"] = server["address"]
+        self.save_config()
+        self._pending_join_address = server["address"]
+        self.install_and_launch()
 
     def refresh_servers_ui(self):
         if not hasattr(self, "server_listbox"):
             return
+        previous = getattr(self, "_server_row_addrs", [])
+        selected = self.server_listbox.curselection()
+        keep_addr = previous[selected[0]] if selected and selected[0] < len(previous) else None
         self.server_listbox.delete(0, tk.END)
+        addrs = []
+        if getattr(self, "_pinned_server", None):
+            self.server_listbox.insert(tk.END, self._pinned_label())
+            addrs.append(self._pinned_server["address"])
         for s in self.config.get("servers", []):
-            self.server_listbox.insert(tk.END, f"  🌐 {s['name']}  ({s['address']})")
+            ver = format_server_versions(s)
+            self.server_listbox.insert(tk.END, f"  🌐 {s['name']}  ({s['address']})" + (f"  [{ver}]" if ver else ""))
+            addrs.append(s["address"])
+        self._server_row_addrs = addrs
+        wanted = keep_addr or self.config.get("last_server")
+        if wanted in addrs:
+            self.server_listbox.selection_set(addrs.index(wanted))
 
     def add_server(self):
-        name = simpledialog.askstring("Новый сервер", "Название:")
-        if not name:
-            return
-        address = simpledialog.askstring("Новый сервер", "Адрес (ip:порт):")
-        if not address:
-            return
-        self.config.setdefault("servers", []).append({"name": name, "address": address})
+        ServerEditDialog(self, None, on_save=self._save_new_server)
+
+    def _save_new_server(self, data):
+        self.config.setdefault("servers", []).append(data)
         self.save_config()
         self.refresh_servers_ui()
         self._bump_achievement("servers_added_total", 1)
+
+    def edit_server(self):
+        sel = self.server_listbox.curselection()
+        if not sel:
+            messagebox.showinfo("Серверы", "Выбери сервер, который хочешь изменить.")
+            return
+        idx = self._config_server_index(sel[0])
+        if idx is None:
+            messagebox.showinfo("Серверы", "Закреплённый сервер настраивается администратором в панели сервера.")
+            return
+
+        def save(data):
+            self.config["servers"][idx] = data
+            self.save_config()
+            self.refresh_servers_ui()
+        ServerEditDialog(self, dict(self.config["servers"][idx]), on_save=save)
 
     def remove_server(self):
         sel = self.server_listbox.curselection()
         if not sel:
             return
-        del self.config["servers"][sel[0]]
+        idx = self._config_server_index(sel[0])
+        if idx is None:
+            messagebox.showinfo("Серверы", "Этот сервер закреплён, его нельзя удалить.")
+            return
+        del self.config["servers"][idx]
         self.save_config()
         self.refresh_servers_ui()
 
@@ -7857,19 +8547,29 @@ class LauncherApp:
         sel = self.server_listbox.curselection()
         if not sel:
             return
-        server = self.config["servers"][sel[0]]
+        idx = self._config_server_index(sel[0])
+        if idx is None:
+            p = self._pinned_server
+            server = {"name": p.get("name") or "Mafin Server", "address": p["address"]}
+        else:
+            server = self.config["servers"][idx]
         address = server["address"]
         host, _, port_str = address.partition(":")
         port = int(port_str) if port_str.isdigit() else 25565
 
         def check():
-            start = time.time()
-            try:
-                with socket.create_connection((host, port), timeout=3):
-                    ms = int((time.time() - start) * 1000)
-                    msg = f"{server['name']}: ✅ отвечает ({ms} мс)"
-            except Exception as e:
-                msg = f"{server['name']}: ❌ недоступен ({e})"
+            info = ping_minecraft_server(host, port)
+            if info:
+                msg = (f"{server['name']}: ✅ отвечает ({info['ms']} мс)\n"
+                       f"Версия сервера: {info['version'] or 'неизвестна'}\n"
+                       f"Игроки: {info['online']}/{info['max']}")
+            else:
+                start = time.time()
+                try:
+                    with socket.create_connection((host, port), timeout=3):
+                        msg = f"{server['name']}: ✅ порт открыт ({int((time.time() - start) * 1000)} мс), но сервер не отдал статус"
+                except Exception as e:
+                    msg = f"{server['name']}: ❌ недоступен ({e})"
             self.root.after(0, lambda: messagebox.showinfo("Пинг", msg))
             self._bump_achievement("server_pings", 1)
 
@@ -9953,12 +10653,15 @@ class LauncherApp:
                     self.root.after(0, lambda: self.status_var.set(stage))
 
             self.root.after(0, lambda: self.status_var.set(f"📥 Установка {version}..."))
+            was_installed = os.path.isfile(os.path.join(minecraft_dir, "versions", version, f"{version}.json"))
             meter.start(show_mb)
             try:
                 self.core.install_version(version, callback)
             finally:
                 meter.stop()
             self._bump_achievement("versions_installed", 1)
+            if not was_installed:
+                self._add_launcher_server_to_game(version)
 
             loader = self.modloader_var.get()
             launch_version = version
@@ -10012,6 +10715,29 @@ class LauncherApp:
             self.root.after(0, lambda: self.launch_btn.config(state="normal"))
             self.root.after(0, lambda: self.progress.config(value=0))
             self.root.after(0, lambda: self.status_var.set("Готов"))
+
+    def _add_launcher_server_to_game(self, version):
+        """После скачивания версии 1.20.4 и новее кладёт сервер лаунчера в «Сетевая игра»."""
+        try:
+            key = mc_version_key(mc_game_version(version))
+            if not key or key < LAUNCHER_SERVER_MIN_VERSION:
+                return
+            info = None
+            try:
+                status, data = self.api.mc_status()
+                if status == 200 and data.get("success") and data.get("address"):
+                    info = data
+            except Exception:
+                info = None
+            info = info or getattr(self, "_pinned_server", None)
+            if not info or not info.get("address"):
+                _log_install("Сервер лаунчера не добавлен в «Сетевая игра»: адрес сервера недоступен")
+                return
+            name = info.get("name") or "Mafin Server"
+            if servers_dat_add(self.core.game_path(), name, info["address"]):
+                _log_install(f"Сервер «{name}» ({info['address']}) добавлен в «Сетевая игра» для {version}")
+        except Exception as e:
+            _log_install(f"Не удалось добавить сервер лаунчера в «Сетевая игра»: {e}")
 
     def launch_only(self):
         if self.installing:
@@ -10096,8 +10822,17 @@ class LauncherApp:
             self.core.memory = mem
             self._current_world = None
 
+            if self.api.is_logged_in():
+                try:
+                    self.api.register_mc_session(player)
+                except Exception as e:
+                    print(f"Не удалось зарегистрировать игровой ник на сервере: {e}")
+
+            join = getattr(self, "_pending_join_address", None)
+            self._pending_join_address = None
             proc = self.core.launch(
                 version, player,
+                extra_args=server_join_args(mc_game_version(version), join) if join else None,
                 callback=lambda p: self.root.after(0, lambda: self.status_var.set("🎮 Игра запущена")),
                 status_callback=lambda text: self.root.after(0, lambda: self.status_var.set(text)),
             )
@@ -10264,6 +10999,9 @@ class LauncherApp:
             self.root.after(0, lambda: self.discord.set_world(world_name, mode_label))
 
     def _resolve_server_label(self, host, port):
+        pinned = getattr(self, "_pinned_server", None)
+        if pinned and pinned.get("address", "").split(":")[0].strip().lower() == host.lower():
+            return pinned.get("name") or f"{host}:{port}"
         for s in self.config.get("servers", []):
             saved_host = s.get("address", "").split(":")[0].strip()
             if saved_host and saved_host.lower() == host.lower():
