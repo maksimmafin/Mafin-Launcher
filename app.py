@@ -6,6 +6,17 @@ import hashlib
 import secrets
 import time
 import threading
+import re
+import socket
+import struct
+import signal
+import zipfile
+import shutil
+import subprocess
+import urllib.request
+import urllib.parse
+import urllib.error
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string, send_from_directory
@@ -708,6 +719,99 @@ def heartbeat():
     db = get_db()
     touch_last_seen(db, g.current_profile['nickname'])
     return jsonify({"success": True})
+
+# ===== Авторизация игроков на Minecraft-сервере (плагин MafinAuth) =====
+def _load_mc_secret():
+    """Секрет для плагина MafinAuth: из MAFIN_MC_SECRET или из файла .mc_secret.
+    Если ни того ни другого нет, создаётся случайный и сохраняется в .mc_secret."""
+    env = os.environ.get("MAFIN_MC_SECRET", "").strip()
+    if env:
+        return env
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mc_secret")
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = f.read().strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    value = secrets.token_urlsafe(32)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value + "\n")
+    except OSError as e:
+        print(f"Не удалось сохранить .mc_secret: {e}. Секрет будет действовать до перезапуска.")
+    return value
+
+MC_SECRET = _load_mc_secret()
+_mc_sessions = {}
+_mc_sessions_lock = threading.Lock()
+
+def _normalize_ip(ip):
+    ip = (ip or "").strip()
+    if ip.lower().startswith("::ffff:"):
+        ip = ip[7:]
+    return ip
+
+@app.route('/api/mc/session', methods=['POST'])
+@auth_required
+def mc_register_session():
+    """Лаунчер сообщает, под каким игровым ником аккаунт собирается играть."""
+    data = request.get_json(silent=True) or {}
+    game_name = str(data.get('game_name', '')).strip()
+    if not (3 <= len(game_name) <= 16) or not game_name.isascii() or not game_name.replace('_', '').isalnum():
+        return jsonify({"error": "Некорректный игровой ник"}), 400
+
+    me = g.current_profile['nickname']
+    key = game_name.lower()
+    db = get_db()
+    with _mc_sessions_lock:
+        cur = _mc_sessions.get(key)
+        if cur and cur['nick'] != me:
+            other = db.execute(
+                "SELECT last_seen, is_banned FROM profiles WHERE nickname = ?", (cur['nick'],)
+            ).fetchone()
+            if other and not other['is_banned'] and is_online(other['last_seen']):
+                return jsonify({"error": "Этот игровой ник сейчас используется другим аккаунтом"}), 409
+        for k in [k for k, v in _mc_sessions.items() if v['nick'] == me and k != key]:
+            del _mc_sessions[k]
+        _mc_sessions[key] = {"nick": me, "ip": _normalize_ip(request.remote_addr)}
+    return jsonify({"success": True})
+
+def _mc_access(db, name, ip):
+    """Единая проверка входа на сервер. Возвращает (разрешено, причина)."""
+    with _mc_sessions_lock:
+        sess = _mc_sessions.get(str(name).strip().lower())
+    if not sess:
+        return False, "not_logged_in"
+    profile = db.execute(
+        "SELECT last_seen, is_banned FROM profiles WHERE nickname = ?", (sess['nick'],)
+    ).fetchone()
+    if not profile:
+        return False, "not_logged_in"
+    if profile['is_banned']:
+        return False, "banned"
+    if not is_online(profile['last_seen']):
+        return False, "offline"
+    if sess['ip'] != _normalize_ip(ip):
+        return False, "ip_mismatch"
+    return True, None
+
+@app.route('/api/mc/check', methods=['POST'])
+def mc_check():
+    """Вызывается плагином MafinAuth при входе игрока на Minecraft-сервер."""
+    if not MC_SECRET:
+        return jsonify({"allowed": False, "reason": "disabled"}), 503
+    given = request.headers.get('X-Mc-Secret', '')
+    if not secrets.compare_digest(given.encode('utf-8'), MC_SECRET.encode('utf-8')):
+        return jsonify({"allowed": False, "reason": "forbidden"}), 403
+
+    data = request.get_json(silent=True) or {}
+    ok, reason = _mc_access(get_db(), str(data.get('name', '')), data.get('ip', ''))
+    if ok:
+        return jsonify({"allowed": True})
+    return jsonify({"allowed": False, "reason": reason})
 
 @app.route('/api/online/<nickname>', methods=['GET'])
 def get_online_status(nickname):
@@ -1459,7 +1563,7 @@ tr:hover{background:#2d323c}
 <body>
 <header>
   <h1>🛡️ Mafin Launcher — Админ-панель</h1>
-  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
+  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/minecraft">🖥 Сервер</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
 </header>
 <main>
   <div class="stats">
@@ -1745,6 +1849,1527 @@ def web_admin_required(f):
         return f(*args, **kwargs)
     return decorated
 
+
+# ===== Minecraft-сервер (Paper) под управлением app.py =====
+# Всё лежит в папке MAFIN_MC_DIR (по умолчанию mcserver/ рядом с app.py).
+# Процесс запускается отдельной группой и переживает перезапуск app.py;
+# команды в консоль идут через именованный канал (только Linux).
+MC_DIR = os.path.abspath(os.environ.get("MAFIN_MC_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcserver")))
+MC_VERSION = os.environ.get("MAFIN_MC_VERSION", "26.2")
+MC_JAVA = os.environ.get("MAFIN_MC_JAVA", "java")
+MC_MEMORY = os.environ.get("MAFIN_MC_MEMORY", "4G")
+MC_PORT = int(os.environ.get("MAFIN_MC_PORT", "25565"))
+MC_PUBLIC_HOST = os.environ.get("MAFIN_MC_HOST", "")
+MC_NAME = os.environ.get("MAFIN_MC_NAME", "Mafin Server")
+MC_PAPER_API = os.environ.get("MAFIN_MC_PAPER_API", "https://fill.papermc.io/v3/projects/paper")
+_MC_API_OVERRIDDEN = "MAFIN_MC_PAPER_API" in os.environ
+_mc_lock = threading.Lock()
+_mc_proc = None
+
+
+def _mc_path(*parts):
+    return os.path.join(MC_DIR, *parts)
+
+
+def _mc_find_jar():
+    preferred = _mc_path("paper.jar")
+    if os.path.isfile(preferred):
+        return preferred
+    if not os.path.isdir(MC_DIR):
+        return None
+    jars = [os.path.join(MC_DIR, n) for n in os.listdir(MC_DIR)
+            if n.lower().startswith("paper") and n.lower().endswith(".jar")]
+    if not jars:
+        # запасной вариант: в папке лежит ровно один .jar с version.json внутри
+        for n in os.listdir(MC_DIR):
+            p = os.path.join(MC_DIR, n)
+            if n.lower().endswith(".jar") and _mc_jar_info(p)["id"]:
+                jars.append(p)
+    return max(jars, key=os.path.getmtime) if jars else None
+
+
+def _mc_jar_info(jar):
+    """Версия Minecraft и нужная Java из version.json внутри paper.jar."""
+    try:
+        with zipfile.ZipFile(jar) as z:
+            data = json.loads(z.read("version.json").decode("utf-8"))
+        return {"id": data.get("id"), "java": data.get("java_version")}
+    except Exception:
+        return {"id": None, "java": None}
+
+
+def _mc_java_major():
+    try:
+        out = subprocess.run([MC_JAVA, "-version"], capture_output=True, text=True, timeout=10)
+        text = (out.stderr or "") + (out.stdout or "")
+        m = re.search(r'version "(\d+)', text)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def _mc_port():
+    """Порт, настроенный в server.properties (или MAFIN_MC_PORT по умолчанию)."""
+    v = _mc_read_props().get("server-port", "")
+    return int(v) if v.isdigit() and 1 <= int(v) <= 65535 else MC_PORT
+
+
+def _mc_max_players():
+    v = _mc_read_props().get("max-players", "")
+    return int(v) if v.isdigit() else 20
+
+
+def _mc_run_port():
+    """Порт, на котором сервер был запущен (если он сейчас работает)."""
+    if not _mc_pid():
+        return None
+    try:
+        with open(_mc_path("server.runport")) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _mc_port_free(port):
+    sock = socket.socket()
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _mc_plugin_jars():
+    d = _mc_path("plugins")
+    if not os.path.isdir(d):
+        return []
+    return [n for n in os.listdir(d) if n.lower().startswith("mafinauth") and n.lower().endswith(".jar")]
+
+
+def _mc_eula_accepted():
+    try:
+        with open(_mc_path("eula.txt"), encoding="utf-8") as f:
+            return any(line.strip().lower() == "eula=true" for line in f)
+    except OSError:
+        return False
+
+
+def _mc_read_props():
+    props = {}
+    try:
+        with open(_mc_path("server.properties"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return props
+
+
+def _mc_set_props(updates):
+    os.makedirs(MC_DIR, exist_ok=True)
+    path = _mc_path("server.properties")
+    lines = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        pass
+    pending = dict(updates)
+    for i, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip()
+        if not line.lstrip().startswith("#") and key in pending:
+            lines[i] = f"{key}={pending.pop(key)}"
+    for k, v in pending.items():
+        lines.append(f"{k}={v}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _mc_write_plugin_config():
+    """Кладёт настройки для плагина MafinAuth, чтобы не вписывать секрет руками."""
+    if not MC_SECRET:
+        return
+    cfg_dir = _mc_path("plugins", "MafinAuth")
+    os.makedirs(cfg_dir, exist_ok=True)
+    api_port = int(os.environ.get("MAFIN_PORT", "10074"))
+    with open(os.path.join(cfg_dir, "config.yml"), "w", encoding="utf-8") as f:
+        f.write(f'api_url: "http://127.0.0.1:{api_port}"\n')
+        f.write(f"secret: {json.dumps(MC_SECRET)}\n")
+        f.write("timeout_ms: 5000\n")
+
+
+# ----- оперативная память сервера -----
+MC_MIN_MEMORY_MB = 512
+
+
+def _mc_fmt_mb(mb):
+    if mb % 1024 == 0:
+        return f"{mb // 1024} ГБ"
+    if mb >= 1024:
+        return f"{mb / 1024:.2f}".rstrip("0").rstrip(".") + " ГБ"
+    return f"{mb} МБ"
+
+
+def _mc_parse_memory(amount, unit):
+    """Переводит введённое число и единицу (G или M) в мегабайты. Бросает ValueError с понятным текстом."""
+    text = str(amount if amount is not None else "").strip().replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError("Введи объём памяти числом, например 4")
+    if not value == value or value in (float("inf"), float("-inf")):
+        raise ValueError("Введи объём памяти числом, например 4")
+    unit = str(unit or "G").strip().upper()[:1]
+    if unit not in ("G", "M"):
+        raise ValueError("Единица должна быть ГБ или МБ")
+    mb = int(round(value * (1024 if unit == "G" else 1)))
+    if mb < MC_MIN_MEMORY_MB:
+        raise ValueError(f"Минимум {MC_MIN_MEMORY_MB} МБ, иначе сервер не запустится")
+    total = _mc_system_ram_mb()
+    if total and mb > total:
+        raise ValueError(f"В системе всего {_mc_fmt_mb(total)} памяти, больше выделить нельзя")
+    return mb
+
+
+def _mc_system_ram_mb():
+    """Сколько оперативной памяти в системе (МБ) или None, если узнать не удалось."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _mc_default_memory_mb():
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([GgMm])[Bb]?\s*", MC_MEMORY or "")
+    if m:
+        mb = int(round(float(m.group(1)) * (1024 if m.group(2).lower() == "g" else 1)))
+        if mb >= MC_MIN_MEMORY_MB:
+            return mb
+    return 4096
+
+
+def _mc_get_memory_mb():
+    """Память, выбранная в панели (launcher_memory.json), иначе MAFIN_MC_MEMORY, иначе 4 ГБ."""
+    try:
+        with open(_mc_path("launcher_memory.json"), encoding="utf-8") as f:
+            mb = json.load(f).get("memory_mb")
+        if isinstance(mb, int) and mb >= MC_MIN_MEMORY_MB:
+            return mb
+    except (OSError, ValueError, AttributeError):
+        pass
+    return _mc_default_memory_mb()
+
+
+def _mc_save_memory(amount, unit):
+    mb = _mc_parse_memory(amount, unit)
+    os.makedirs(MC_DIR, exist_ok=True)
+    tmp = _mc_path("launcher_memory.json.part")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"memory_mb": mb}, f)
+    os.replace(tmp, _mc_path("launcher_memory.json"))
+    note = " Применится после перезапуска сервера" if _mc_pid() else ""
+    return f"Память сервера: {_mc_fmt_mb(mb)}.{note}"
+
+
+def _mc_pid():
+    """PID запущенного сервера или None."""
+    global _mc_proc
+    try:
+        with open(_mc_path("server.pid")) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if _mc_proc is not None and _mc_proc.pid == pid and _mc_proc.poll() is not None:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+                return None
+    except (OSError, IndexError):
+        pass
+    return pid
+
+
+def _mc_send(command):
+    fifo = _mc_path("console.fifo")
+    fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        os.write(fd, (command + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+# ----- вторая линия защиты: проверка при заходе игрока -----
+# Плагин MafinAuth проверяет игрока ещё до входа (AsyncPlayerPreLoginEvent). Если по какой-то причине
+# проверку удалось обойти (например, зашли через ViaVersion со старой версии), эта служба читает
+# консоль сервера, видит строку «Ник[/IP:порт] logged in», проверяет игрока тем же правилом и кикает.
+_MC_JOIN_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16})\[/([0-9A-Fa-f:.]+):\d+\] logged in with entity id")
+_MC_KICK_TEXT = {
+    "not_logged_in": "Войди в Mafin Launcher и запусти игру из него.",
+    "offline": "Сессия устарела. Запусти Mafin Launcher и зайди снова.",
+    "ip_mismatch": "Твой IP не совпадает с IP лаунчера. Зайди с того же устройства, где открыт лаунчер.",
+    "banned": "Профиль заблокирован.",
+}
+_mc_guard_started = False
+
+
+def _mc_guard_handle(name, ip):
+    """Проверяет зашедшего игрока и кикает, если ему нельзя. Возвращает причину кика или None."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        ok, reason = _mc_access(db, name, ip)
+        if ok:
+            return None
+        reason = reason or "not_logged_in"
+        try:
+            _mc_send(f"kick {name} {_MC_KICK_TEXT.get(reason, 'Доступ запрещён.')}")
+        except OSError as e:
+            print(f"[mc-guard] не удалось кикнуть {name}: {e}")
+        try:
+            db.execute("INSERT INTO server_logs (action, nickname, details) VALUES (?, ?, ?)",
+                       ("mc_guard_kick", name, f"{reason}, ip {ip}"))
+            db.commit()
+        except sqlite3.Error:
+            pass
+        print(f"[mc-guard] кикнут {name} ({ip}): {reason}")
+        return reason
+    finally:
+        db.close()
+
+
+def _mc_guard_loop():
+    log_path = _mc_path("console.log")
+    pos = None
+    buf = b""
+    while True:
+        time.sleep(0.4)
+        try:
+            size = os.path.getsize(log_path)
+        except OSError:
+            pos = None
+            continue
+        if pos is None or size < pos:
+            pos = size if pos is None else 0  # при первом чтении старое не разбираем
+            buf = b""
+            if pos == size:
+                continue
+        if size == pos:
+            continue
+        try:
+            with open(log_path, "rb") as f:
+                f.seek(pos)
+                chunk = f.read(size - pos)
+            pos += len(chunk)
+        except OSError:
+            continue
+        buf += chunk
+        *lines, buf = buf.split(b"\n")
+        for raw in lines:
+            line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw.decode("utf-8", "replace"))
+            m = _MC_JOIN_RE.search(line)
+            if m:
+                try:
+                    _mc_guard_handle(m.group(1), m.group(2))
+                except Exception as e:
+                    print(f"[mc-guard] ошибка проверки {m.group(1)}: {e}")
+
+
+def _mc_guard_start():
+    global _mc_guard_started
+    if _mc_guard_started:
+        return
+    _mc_guard_started = True
+    threading.Thread(target=_mc_guard_loop, name="mc-guard", daemon=True).start()
+
+
+def _mc_start():
+    global _mc_proc
+    if not hasattr(os, "mkfifo"):
+        raise RuntimeError("Запуск сервера из app.py работает только на Linux")
+    with _mc_lock:
+        if _mc_pid():
+            raise RuntimeError("Сервер уже запущен")
+        jar = _mc_find_jar()
+        if not jar:
+            raise RuntimeError("Paper не установлен. Нажми «Установить Paper» или положи paper.jar в папку сервера")
+        need_java = _mc_jar_info(jar)["java"]
+        if not _mc_eula_accepted():
+            raise RuntimeError("Сначала прими EULA Mojang")
+        have = _mc_java_major()
+        if have is None:
+            raise RuntimeError(f"Не найдена Java («{MC_JAVA}»). Установи Java или задай MAFIN_MC_JAVA")
+        if need_java and have < int(need_java):
+            raise RuntimeError(f"Нужна Java {need_java} или новее, установлена {have}")
+        mem_mb = _mc_get_memory_mb()
+        total = _mc_system_ram_mb()
+        if total and mem_mb > total:
+            raise RuntimeError(f"Выделено {_mc_fmt_mb(mem_mb)} памяти, а в системе всего {_mc_fmt_mb(total)}. Уменьши объём в настройках")
+        port = _mc_port()
+        # Вход защищает MafinAuth (плюс проверка при заходе в app.py), поэтому online-mode всегда false
+        _mc_set_props({"online-mode": "false", "server-port": str(port)})
+        _mc_write_plugin_config()
+        fifo = _mc_path("console.fifo")
+        if not os.path.exists(fifo):
+            os.mkfifo(fifo)
+        fd = os.open(fifo, os.O_RDWR)
+        out = open(_mc_path("console.log"), "ab")
+        try:
+            cmd = [MC_JAVA, f"-Xms{mem_mb}M", f"-Xmx{mem_mb}M", "-jar", os.path.basename(jar), "nogui"]
+            _mc_proc = subprocess.Popen(cmd, cwd=MC_DIR, stdin=fd, stdout=out, stderr=out, start_new_session=True)
+        finally:
+            os.close(fd)
+            out.close()
+        with open(_mc_path("server.pid"), "w") as f:
+            f.write(str(_mc_proc.pid))
+        with open(_mc_path("server.runport"), "w") as f:
+            f.write(str(port))
+    return f"Сервер запускается с {_mc_fmt_mb(mem_mb)} памяти (первый запуск может занять несколько минут)"
+
+
+def _mc_stop(timeout=45):
+    pid = _mc_pid()
+    if not pid:
+        return "Сервер уже остановлен"
+    try:
+        _mc_send("stop")
+    except OSError:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _mc_pid():
+            return "Сервер остановлен"
+        time.sleep(0.5)
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        if not _mc_pid():
+            return "Сервер остановлен (принудительно, SIGTERM)"
+        time.sleep(0.5)
+    os.kill(pid, signal.SIGKILL)
+    return "Сервер убит (SIGKILL)"
+
+
+def _mc_ping(host="127.0.0.1", port=None, timeout=1.5):
+    """Server List Ping: сервер уже принимает подключения? Сколько игроков?"""
+    port = port or _mc_run_port() or _mc_port()
+
+    def varint(n):
+        out = b""
+        while True:
+            b = n & 0x7F
+            n >>= 7
+            out += bytes([b | (0x80 if n else 0)])
+            if not n:
+                return out
+
+    def read_varint(sock):
+        n = 0
+        for i in range(5):
+            b = sock.recv(1)
+            if not b:
+                raise ConnectionError("closed")
+            n |= (b[0] & 0x7F) << (7 * i)
+            if not b[0] & 0x80:
+                return n
+        raise ValueError("varint too long")
+
+    def read_exact(sock, size):
+        buf = b""
+        while len(buf) < size:
+            chunk = sock.recv(size - len(buf))
+            if not chunk:
+                raise ConnectionError("closed")
+            buf += chunk
+        return buf
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            addr = host.encode("utf-8")
+            hs = b"\x00" + varint(0) + varint(len(addr)) + addr + struct.pack(">H", port) + varint(1)
+            s.sendall(varint(len(hs)) + hs)
+            s.sendall(b"\x01\x00")
+            read_varint(s)
+            if read_varint(s) != 0:
+                return None
+            size = read_varint(s)
+            data = json.loads(read_exact(s, size).decode("utf-8"))
+        players = data.get("players") or {}
+        return {"online": players.get("online", 0), "max": players.get("max", 0),
+                "version": (data.get("version") or {}).get("name")}
+    except Exception:
+        return None
+
+
+def _mc_status():
+    jar = _mc_find_jar()
+    pid = _mc_pid()
+    ping = _mc_ping() if pid else None
+    props = _mc_read_props()
+    info = _mc_jar_info(jar) if jar else {"id": None, "java": None}
+    mem_mb = _mc_get_memory_mb()
+    return {
+        "installed": bool(jar),
+        "minecraft_version": info["id"],
+        "java_required": info["java"],
+        "java_installed": _mc_java_major(),
+        "eula": _mc_eula_accepted(),
+        "running": bool(pid),
+        "ready": bool(ping),
+        "players_online": ping["online"] if ping else 0,
+        "players_max": ping["max"] if ping else 0,
+        "online_mode": props.get("online-mode"),
+        "port": _mc_port(),
+        "run_port": _mc_run_port(),
+        "max_players": _mc_max_players(),
+        "plugin_installed": bool(_mc_plugin_jars()),
+        "plugin_files": _mc_plugin_jars(),
+        "dir": MC_DIR,
+        "branding": _mc_branding(),
+        "plugins": _mc_list_plugins(),
+        "jar_file": os.path.basename(jar) if jar else None,
+        "secret_set": bool(MC_SECRET),
+        "supported": hasattr(os, "mkfifo"),
+        "core": "paper",
+        "memory_mb": mem_mb,
+        "memory_text": _mc_fmt_mb(mem_mb),
+        "system_ram_mb": _mc_system_ram_mb(),
+        "motd": _mc_get_motd(),
+        "worlds": _mc_list_worlds(),
+        "active_world": _mc_active_world(),
+    }
+
+
+def _mc_download_paper(version):
+    if not re.fullmatch(r"\d+(\.\d+){1,3}", version):
+        raise ValueError("Некорректная версия")
+    headers = {"User-Agent": "MafinLauncherServer/1.0"}
+    req = urllib.request.Request(f"{MC_PAPER_API}/versions/{version}/builds/latest", headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    downloads = data.get("downloads") or {}
+    dl = downloads.get("server:default") or next((v for v in downloads.values() if isinstance(v, dict) and v.get("url")), None)
+    if not dl or not dl.get("url"):
+        raise RuntimeError("PaperMC не вернул ссылку на скачивание для этой версии")
+    url = dl["url"]
+    host = (urlparse(url).hostname or "").lower()
+    if not _MC_API_OVERRIDDEN and not (urlparse(url).scheme == "https" and (host == "papermc.io" or host.endswith(".papermc.io"))):
+        raise RuntimeError(f"Ссылка ведёт не на papermc.io: {host}")
+    expected = ((dl.get("checksums") or {}).get("sha256") or "").lower()
+    os.makedirs(MC_DIR, exist_ok=True)
+    tmp = _mc_path("paper.jar.part")
+    sha = hashlib.sha256()
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resp, open(tmp, "wb") as f:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            sha.update(chunk)
+            f.write(chunk)
+    if expected and sha.hexdigest() != expected:
+        os.remove(tmp)
+        raise RuntimeError("Контрольная сумма скачанного файла не совпала, файл удалён")
+    os.replace(tmp, _mc_path("paper.jar"))
+    return f"Paper {version} build {data.get('id', '?')} ({data.get('channel', '?')}) скачан"
+
+
+# ----- название сервера и версии для игроков -----
+def _mc_branding():
+    data = {"name": MC_NAME, "version_min": "", "version_max": ""}
+    try:
+        with open(_mc_path("launcher_server.json"), encoding="utf-8") as f:
+            saved = json.load(f)
+        for k in data:
+            if isinstance(saved.get(k), str):
+                data[k] = saved[k]
+    except (OSError, ValueError):
+        pass
+    return data
+
+
+def _mc_version_key(v):
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?$", (v or "").strip())
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+
+def _mc_save_branding(name, vmin, vmax):
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()
+    if not 1 <= len(name) <= 40:
+        raise ValueError("Название должно быть от 1 до 40 символов")
+    vmin, vmax = str(vmin or "").strip(), str(vmax or "").strip()
+    for v in (vmin, vmax):
+        if v and not _mc_version_key(v):
+            raise ValueError(f"Некорректная версия «{v}». Пример: 1.20.4 или 26.2")
+    if vmin and vmax and _mc_version_key(vmin) > _mc_version_key(vmax):
+        raise ValueError("Версия «от» не может быть новее версии «до»")
+    os.makedirs(MC_DIR, exist_ok=True)
+    with open(_mc_path("launcher_server.json"), "w", encoding="utf-8") as f:
+        json.dump({"name": name, "version_min": vmin, "version_max": vmax}, f, ensure_ascii=False, indent=2)
+    return f"Сохранено: «{name}»" + (f", версии {vmin or '…'} – {vmax or '…'}" if (vmin or vmax) else "")
+
+
+# ----- плагины из Modrinth -----
+MODRINTH_API = os.environ.get("MAFIN_MODRINTH_API", "https://api.modrinth.com/v2").rstrip("/")
+_MODRINTH_OVERRIDDEN = "MAFIN_MODRINTH_API" in os.environ
+MC_PLUGIN_LOADERS = ["paper", "spigot", "bukkit", "folia", "purpur"]
+MC_PLUGIN_MAX_BYTES = 100 * 1024 * 1024
+MC_PROTECTED_PLUGINS = ("mafinauth",)
+
+
+class _McPluginError(Exception):
+    def __init__(self, message, can_force=False):
+        super().__init__(message)
+        self.can_force = can_force
+
+
+def _modrinth_get(path, params=None):
+    url = MODRINTH_API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "MafinLauncherServer/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise _McPluginError("Не найдено на Modrinth")
+        raise _McPluginError(f"Modrinth ответил ошибкой {e.code}")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise _McPluginError(f"Не удалось связаться с Modrinth: {e}")
+
+
+def _mc_plugin_yml_name(jar_path):
+    try:
+        with zipfile.ZipFile(jar_path) as z:
+            for fn in ("plugin.yml", "paper-plugin.yml"):
+                if fn in z.namelist():
+                    text = z.read(fn).decode("utf-8", errors="replace")
+                    m = re.search(r"^name:\s*['\"]?([^'\"\r\n#]+)", text, re.M)
+                    return m.group(1).strip() if m else ""
+    except (OSError, zipfile.BadZipFile):
+        pass
+    return None
+
+
+def _mc_list_plugins():
+    d = _mc_path("plugins")
+    out = []
+    if os.path.isdir(d):
+        for n in sorted(os.listdir(d), key=str.lower):
+            p = os.path.join(d, n)
+            if n.lower().endswith(".jar") and os.path.isfile(p):
+                out.append({"file": n, "name": _mc_plugin_yml_name(p) or n[:-4],
+                            "size": os.path.getsize(p),
+                            "protected": n.lower().startswith(MC_PROTECTED_PLUGINS)})
+    return out
+
+
+def _mc_plugin_search(query, compat):
+    facets = [["categories:" + c for c in MC_PLUGIN_LOADERS]]
+    if compat:
+        ver = _mc_jar_info(_mc_find_jar()).get("id") if _mc_find_jar() else None
+        facets.append(["versions:" + (ver or MC_VERSION)])
+    data = _modrinth_get("/search", {"query": query, "facets": json.dumps(facets), "limit": 20,
+                                     "index": "relevance" if query else "downloads"})
+    return [{"slug": h.get("slug"), "title": h.get("title"), "description": h.get("description"),
+             "author": h.get("author"), "downloads": h.get("downloads", 0)} for h in data.get("hits", [])]
+
+
+def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
+    """Ставит плагин с Modrinth и его обязательные зависимости. Возвращает список сообщений."""
+    seen = _seen if _seen is not None else set()
+    if project in seen or _depth > 3:
+        return []
+    seen.add(project)
+    params = {"loaders": json.dumps(MC_PLUGIN_LOADERS)}
+    ver = _mc_jar_info(_mc_find_jar()).get("id") if _mc_find_jar() else None
+    ver = ver or MC_VERSION
+    if not force:
+        params["game_versions"] = json.dumps([ver])
+    versions = _modrinth_get(f"/project/{urllib.parse.quote(str(project), safe='')}/version", params)
+    if not versions:
+        raise _McPluginError(f"Для Minecraft {ver} подходящей версии плагина нет. "
+                             f"Можно поставить последнюю версию для Paper без гарантии совместимости", can_force=True)
+    chosen = next((v for v in versions if v.get("version_type") == "release"), versions[0])
+    files = chosen.get("files") or []
+    f = next((x for x in files if x.get("primary")), None) or next(
+        (x for x in files if str(x.get("filename", "")).lower().endswith(".jar")), None)
+    if not f:
+        raise _McPluginError("В этой версии нет файла .jar")
+    filename = secure_filename(f.get("filename", ""))
+    if not filename.lower().endswith(".jar"):
+        raise _McPluginError("Файл плагина должен быть .jar")
+    url = f.get("url", "")
+    host = (urlparse(url).hostname or "").lower()
+    if not _MODRINTH_OVERRIDDEN and not (urlparse(url).scheme == "https" and host == "cdn.modrinth.com"):
+        raise _McPluginError(f"Ссылка ведёт не на cdn.modrinth.com: {host}")
+    hashes = f.get("hashes") or {}
+    if not (hashes.get("sha512") or hashes.get("sha1")):
+        raise _McPluginError("У файла нет контрольной суммы")
+
+    plugins_dir = _mc_path("plugins")
+    os.makedirs(plugins_dir, exist_ok=True)
+    tmp = os.path.join(plugins_dir, filename + ".part")
+    h512, h1, size = hashlib.sha512(), hashlib.sha1(), 0
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "MafinLauncherServer/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > MC_PLUGIN_MAX_BYTES:
+                        raise _McPluginError("Файл плагина слишком большой")
+                    h512.update(chunk)
+                    h1.update(chunk)
+                    out.write(chunk)
+        except (urllib.error.URLError, OSError) as e:
+            raise _McPluginError(f"Не удалось скачать файл плагина: {e}")
+        if (hashes.get("sha512") and h512.hexdigest() != hashes["sha512"].lower()) or \
+           (hashes.get("sha1") and h1.hexdigest() != hashes["sha1"].lower()):
+            raise _McPluginError("Контрольная сумма файла не совпала, плагин не установлен")
+        new_name = _mc_plugin_yml_name(tmp)
+        if new_name is None:
+            raise _McPluginError("Это не плагин для Paper (внутри нет plugin.yml)")
+        # заменяем старые копии того же плагина (обновление или ручная установка)
+        for old in _mc_list_plugins():
+            if old["name"].lower() == new_name.lower() and old["file"] != filename:
+                if old["protected"]:
+                    raise _McPluginError("Защитный плагин MafinAuth заменить из панели нельзя")
+                os.remove(_mc_path("plugins", old["file"]))
+        os.replace(tmp, os.path.join(plugins_dir, filename))
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+    messages = [f"{new_name or filename} {chosen.get('version_number', '')} установлен".replace("  ", " ")]
+    for dep in chosen.get("dependencies") or []:
+        if dep.get("dependency_type") == "required" and dep.get("project_id"):
+            messages += _mc_install_plugin(dep["project_id"], force=force, _depth=_depth + 1, _seen=seen)
+    return messages
+
+
+# Плагин входа через лаунчер, собранный под Paper 26.2 (исходники в репозитории: mc-auth-plugin)
+MAFINAUTH_JAR_B64 = (
+    "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"
+)
+MAFINAUTH_JAR_SHA256 = "42b1fdf1669e551ac32039edc4be2757c17405f84cfeac52d39406e1decd499f"
+
+
+def _mc_install_builtin_mafinauth():
+    import base64
+    data = base64.b64decode(MAFINAUTH_JAR_B64)
+    if hashlib.sha256(data).hexdigest() != MAFINAUTH_JAR_SHA256:
+        raise _McPluginError("Встроенный файл MafinAuth повреждён")
+    os.makedirs(_mc_path("plugins"), exist_ok=True)
+    dest = _mc_path("plugins", "MafinAuth.jar")
+    tmp = dest + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, dest)
+    return "MafinAuth установлен. Секрет для него создаётся и записывается автоматически при запуске сервера"
+
+
+def _mc_delete_plugin(filename):
+    if filename != os.path.basename(filename) or not filename.lower().endswith(".jar"):
+        raise _McPluginError("Некорректное имя файла")
+    if filename.lower().startswith(MC_PROTECTED_PLUGINS):
+        raise _McPluginError("Защитный плагин MafinAuth удалить из панели нельзя: без него сервер откроется для всех")
+    path = _mc_path("plugins", filename)
+    if not os.path.isfile(path):
+        raise _McPluginError("Файл не найден")
+    os.remove(path)
+    return f"{filename} удалён. Перезапусти сервер, чтобы изменения вступили в силу"
+
+
+# ===== Миры и описание сервера (MOTD) =====
+MC_ZIP_MAX_ENTRIES = 60000
+MC_WORLD_MAX_BYTES = 8 * 1024 ** 3
+MC_RESERVED_WORLD_NAMES = {
+    "mods", "config", "plugins", "libraries", "logs", "cache", "versions", "defaultconfigs",
+    "kubejs", "scripts", "resourcepacks", "datapacks", "crash-reports", "backups",
+}
+
+
+def _mc_rm(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+# ----- безопасные пути и распаковка -----
+def _mc_safe_rel(rel, root):
+    """Нормализует путь из архива. Возвращает (чистый_путь, полный_путь) или None,
+    если путь пытается выйти за пределы папки."""
+    raw = str(rel or "").replace("\\", "/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or "\x00" in raw:
+        return None
+    parts = [p for p in raw.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    full = os.path.normpath(os.path.join(root, *parts))
+    if os.path.commonpath([root, full]) != root:
+        return None
+    return "/".join(parts), full
+
+
+def _mc_extract_zip(zf, prefix, dest_root, limit):
+    """Распаковывает записи с префиксом prefix в dest_root. Возвращает (список файлов, пропущено)."""
+    written, total, skipped = [], 0, 0
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if info.is_dir() or not name.startswith(prefix):
+            continue
+        rel = name[len(prefix):]
+        if "__MACOSX/" in name or rel.endswith(".DS_Store"):
+            continue
+        if ((info.external_attr >> 16) & 0o170000) == 0o120000:  # символическая ссылка
+            skipped += 1
+            continue
+        res = _mc_safe_rel(rel, dest_root)
+        if not res:
+            skipped += 1
+            continue
+        rel_clean, full = res
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with zf.open(info) as src, open(full, "wb") as out:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise _McPluginError("Архив слишком большой после распаковки")
+                out.write(chunk)
+        written.append(rel_clean)
+    return written, skipped
+
+
+# ----- миры -----
+def _mc_active_world():
+    return _mc_read_props().get("level-name") or "world"
+
+
+def _mc_list_worlds():
+    out = []
+    try:
+        names = sorted(os.listdir(MC_DIR), key=str.lower)
+    except OSError:
+        return out
+    for n in names:
+        p = _mc_path(n)
+        if os.path.isdir(p) and not os.path.islink(p) and os.path.isfile(os.path.join(p, "level.dat")):
+            out.append(n)
+    return out
+
+
+def _mc_world_activate(name):
+    if _mc_pid():
+        raise ValueError("Сначала останови сервер")
+    if name not in _mc_list_worlds():
+        raise ValueError("Такого мира нет")
+    _mc_set_props({"level-name": name})
+    return f"Активный мир: «{name}». Он загрузится при следующем запуске сервера"
+
+
+def _mc_world_delete(name):
+    if _mc_pid():
+        raise ValueError("Сначала останови сервер")
+    if name not in _mc_list_worlds():
+        raise ValueError("Такого мира нет")
+    if name == _mc_active_world():
+        raise ValueError("Активный мир удалить нельзя. Сначала сделай активным другой")
+    shutil.rmtree(_mc_path(name))
+    return f"Мир «{name}» удалён"
+
+
+def _mc_world_import(zip_path, wanted_name, fallback_name):
+    """Ставит мир из zip-архива как отдельную папку (существующие миры не перезаписываются)."""
+    stage = _mc_path(".world_stage")
+    shutil.rmtree(stage, ignore_errors=True)
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            if len(z.infolist()) > MC_ZIP_MAX_ENTRIES:
+                raise _McPluginError("В архиве слишком много файлов")
+            roots = []
+            for i in z.infolist():
+                n = i.filename.replace("\\", "/")
+                if "__MACOSX/" in n:
+                    continue
+                if n == "level.dat" or n.endswith("/level.dat"):
+                    roots.append(n[:-len("level.dat")])
+            if not roots:
+                raise _McPluginError("В архиве нет мира (не найден level.dat)")
+            roots.sort(key=lambda r: (r.count("/"), r))
+            root = roots[0]
+            if len(roots) > 1 and roots[1].count("/") == root.count("/"):
+                raise _McPluginError("В архиве несколько миров. Загрузи их по одному")
+            base = (wanted_name or "").strip() or root.rstrip("/").split("/")[-1] or fallback_name or "world"
+            name = re.sub(r"[^A-Za-z0-9_.-]", "_", base).strip(".")[:40]
+            if not name.strip("_"):
+                name = "world_import"
+            if name.lower() in MC_RESERVED_WORLD_NAMES:
+                raise _McPluginError(f"Имя «{name}» зарезервировано, выбери другое")
+            if os.path.lexists(_mc_path(name)):
+                raise _McPluginError(f"Папка «{name}» уже существует. Укажи другое имя мира")
+            os.makedirs(stage)
+            _mc_extract_zip(z, root, stage, MC_WORLD_MAX_BYTES)
+        if not os.path.isfile(os.path.join(stage, "level.dat")):
+            raise _McPluginError("Не удалось распаковать мир")
+        os.replace(stage, _mc_path(name))
+        return f"Мир «{name}» загружен. Сделай его активным в списке миров и перезапусти сервер"
+    except zipfile.BadZipFile:
+        raise _McPluginError("Файл повреждён или это не .zip")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+# ----- описание сервера (MOTD) -----
+def _mc_props_unescape(s):
+    def repl(m):
+        t = m.group(1)
+        if t[0] == "u" and len(t) == 5:
+            return chr(int(t[1:], 16))
+        return {"n": "\n", "t": "\t", "r": "\r"}.get(t, t)
+    out = re.sub(r"\\(u[0-9a-fA-F]{4}|.)", repl, s)
+    try:
+        return out.encode("utf-16", "surrogatepass").decode("utf-16")
+    except UnicodeError:
+        return out
+
+
+def _mc_props_escape(s):
+    out = []
+    for ch in s:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif o < 32 or o > 126:
+            b = ch.encode("utf-16-be")
+            out.append("".join("\\u%04x" % int.from_bytes(b[i:i + 2], "big") for i in range(0, len(b), 2)))
+        else:
+            out.append(ch)
+    text = "".join(out)
+    return "\\u0020" + text[1:] if text.startswith(" ") else text
+
+
+def _mc_get_motd():
+    """Описание для редактирования: цветовые коды показываются как &a, &6 и т.д."""
+    raw = _mc_read_props().get("motd")
+    return _mc_props_unescape(raw).replace("\u00a7", "&") if raw is not None else ""
+
+
+def _mc_motd_plain():
+    raw = _mc_read_props().get("motd")
+    text = _mc_props_unescape(raw) if raw is not None else ""
+    return re.sub("\u00a7.", "", text).replace("\n", " ").strip()
+
+
+def _mc_save_motd(text):
+    text = str(text or "").replace("\r", "")
+    text = "".join(ch for ch in text if ch == "\n" or (ch >= " " and ch != "\x7f"))
+    lines = text.split("\n")
+    if len(lines) > 2:
+        raise ValueError("В описании не больше двух строк")
+    lines = [re.sub(r"&([0-9a-fk-orA-FK-OR])", "\u00a7\\1", ln.rstrip()) for ln in lines]
+    for ln in lines:
+        if len(re.sub("\u00a7.", "", ln)) > 100:
+            raise ValueError("Строка описания слишком длинная (максимум 100 символов)")
+    _mc_set_props({"motd": _mc_props_escape("\n".join(lines))})
+    note = " Применится после перезапуска сервера" if _mc_pid() else ""
+    return "Описание сервера сохранено." + note
+
+
+@app.route('/admin/minecraft/world/upload', methods=['POST'])
+@web_admin_required
+def admin_minecraft_world_upload():
+    f = request.files.get('file')
+    if not f or not f.filename or not f.filename.lower().endswith('.zip'):
+        return jsonify({"success": False, "error": "Выбери архив .zip с миром"}), 400
+    os.makedirs(MC_DIR, exist_ok=True)
+    tmp = _mc_path("world_upload.part")
+    f.save(tmp)
+    try:
+        msg = _mc_world_import(tmp, request.form.get('name', ''),
+                               os.path.splitext(secure_filename(f.filename))[0])
+    except _McPluginError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    finally:
+        _mc_rm(tmp)
+    print(f"[mc] {g.web_admin['nickname']}: world upload -> {msg}")
+    return jsonify({"success": True, "message": msg})
+
+
+@app.route('/api/mc/status', methods=['GET'])
+def mc_public_status():
+    """Публичный статус для лаунчера (без чувствительных данных)."""
+    st = _mc_status()
+    host = MC_PUBLIC_HOST or request.host.split(':')[0]
+    return jsonify({
+        "success": True,
+        "name": _mc_branding()["name"], "version_min": _mc_branding()["version_min"],
+        "version_max": _mc_branding()["version_max"], "running": st["running"], "ready": st["ready"],
+        "players_online": st["players_online"], "players_max": st["players_max"],
+        "version": st["minecraft_version"], "address": f"{host}:{st['run_port'] or st['port']}",
+        "description": _mc_motd_plain(), "core": "paper",
+        "modpack": None,
+    })
+
+
+@app.route('/admin/minecraft', methods=['GET'])
+@web_admin_required
+def admin_minecraft_page():
+    return render_template_string(MC_ADMIN_TEMPLATE, default_version=MC_VERSION)
+
+
+@app.route('/admin/minecraft/status', methods=['GET'])
+@web_admin_required
+def admin_minecraft_status():
+    return jsonify(_mc_status())
+
+
+@app.route('/admin/minecraft/plugins/search', methods=['GET'])
+@web_admin_required
+def admin_minecraft_plugin_search():
+    try:
+        results = _mc_plugin_search(request.args.get('q', '').strip()[:100], request.args.get('compat') == '1')
+        return jsonify({"success": True, "results": results})
+    except _McPluginError as e:
+        return jsonify({"success": False, "error": str(e)}), 502
+
+
+@app.route('/admin/minecraft/log', methods=['GET'])
+@web_admin_required
+def admin_minecraft_log():
+    for p in (_mc_path("logs", "latest.log"), _mc_path("console.log")):
+        try:
+            with open(p, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 60000))
+                text = f.read().decode("utf-8", errors="replace")
+            return jsonify({"log": "\n".join(text.splitlines()[-200:])})
+        except OSError:
+            continue
+    return jsonify({"log": ""})
+
+
+@app.route('/admin/minecraft/upload/<kind>', methods=['POST'])
+@web_admin_required
+def admin_minecraft_upload(kind):
+    """Загрузка плагина (kind=plugin) или серверного Paper (kind=server) прямо из админки."""
+    f = request.files.get('file')
+    if kind not in ('plugin', 'server') or not f or not f.filename:
+        return jsonify({"success": False, "error": "Выбери файл .jar"}), 400
+    name = secure_filename(f.filename)
+    if not name.lower().endswith('.jar'):
+        return jsonify({"success": False, "error": "Нужен файл .jar"}), 400
+    if kind == 'server' and _mc_pid():
+        return jsonify({"success": False, "error": "Сначала останови сервер"}), 400
+    os.makedirs(MC_DIR, exist_ok=True)
+    tmp = _mc_path("upload.part")
+    f.save(tmp)
+    try:
+        if os.path.getsize(tmp) > 300 * 1024 * 1024:
+            raise ValueError("Файл слишком большой")
+        with zipfile.ZipFile(tmp) as z:
+            names = set(z.namelist())
+        if kind == 'plugin' and not ({'plugin.yml', 'paper-plugin.yml'} & names):
+            raise ValueError("Это не плагин (внутри нет plugin.yml)")
+        if kind == 'server' and 'version.json' not in names:
+            raise ValueError("Это не серверный Paper (внутри нет version.json)")
+        if kind == 'plugin':
+            os.makedirs(_mc_path("plugins"), exist_ok=True)
+            dest = _mc_path("plugins", name)
+            msg = f"Плагин {name} загружен в plugins/. Перезапусти сервер, чтобы он заработал"
+        else:
+            dest = _mc_path("paper.jar")
+            msg = f"Сервер загружен как paper.jar ({name})"
+        os.replace(tmp, dest)
+    except zipfile.BadZipFile:
+        return jsonify({"success": False, "error": "Файл повреждён или это не .jar"}), 400
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    print(f"[mc] {g.web_admin['nickname']}: upload {kind} {name}")
+    return jsonify({"success": True, "message": msg})
+
+
+@app.route('/admin/minecraft/<action>', methods=['POST'])
+@web_admin_required
+def admin_minecraft_action(action):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Ожидается JSON"}), 400
+    data = request.get_json(silent=True) or {}
+    try:
+        if action == "install":
+            msg = _mc_download_paper(str(data.get("version") or MC_VERSION).strip())
+        elif action == "accept_eula":
+            if data.get("accept") is not True:
+                return jsonify({"success": False, "error": "Нужно явно подтвердить согласие"}), 400
+            os.makedirs(MC_DIR, exist_ok=True)
+            with open(_mc_path("eula.txt"), "w", encoding="utf-8") as f:
+                f.write("# Принято администратором через админ-панель Mafin Launcher\n"
+                        "# https://aka.ms/MinecraftEULA\neula=true\n")
+            msg = "EULA принята"
+        elif action == "branding":
+            msg = _mc_save_branding(data.get("name"), data.get("version_min"), data.get("version_max"))
+        elif action == "plugin_install":
+            project = str(data.get("project", "")).strip()
+            if not re.fullmatch(r"[A-Za-z0-9_\-]{2,64}", project):
+                return jsonify({"success": False, "error": "Некорректный плагин"}), 400
+            msg = "; ".join(_mc_install_plugin(project, force=bool(data.get("force"))))
+            if _mc_pid():
+                msg += ". Перезапусти сервер, чтобы плагин заработал"
+        elif action == "plugin_install_builtin":
+            if data.get("name") != "mafinauth":
+                return jsonify({"success": False, "error": "Неизвестный встроенный плагин"}), 400
+            msg = _mc_install_builtin_mafinauth()
+            if _mc_pid():
+                msg += ". Перезапусти сервер, чтобы плагин заработал"
+        elif action == "plugin_delete":
+            msg = _mc_delete_plugin(str(data.get("file", "")))
+        elif action == "settings":
+            try:
+                new_port = int(data.get("port"))
+                new_slots = int(data.get("max_players"))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": "Порт и слоты должны быть числами"}), 400
+            if not 1024 <= new_port <= 65535:
+                return jsonify({"success": False, "error": "Порт должен быть от 1024 до 65535"}), 400
+            if not 1 <= new_slots <= 1000:
+                return jsonify({"success": False, "error": "Слотов должно быть от 1 до 1000"}), 400
+            if new_port == int(os.environ.get("MAFIN_PORT", "10074")):
+                return jsonify({"success": False, "error": "Этот порт занят самим API лаунчера"}), 400
+            if new_port != (_mc_run_port() or _mc_port()) and not _mc_port_free(new_port):
+                return jsonify({"success": False, "error": f"Порт {new_port} уже занят другой программой"}), 400
+            _mc_set_props({"server-port": str(new_port), "max-players": str(new_slots)})
+            if _mc_pid():
+                msg = f"Сохранено: порт {new_port}, слотов {new_slots}. Применится после перезапуска сервера"
+            else:
+                msg = f"Сохранено: порт {new_port}, слотов {new_slots}"
+        elif action == "motd":
+            msg = _mc_save_motd(data.get("motd"))
+        elif action == "world_activate":
+            msg = _mc_world_activate(str(data.get("name", "")))
+        elif action == "world_delete":
+            msg = _mc_world_delete(str(data.get("name", "")))
+        elif action == "memory":
+            msg = _mc_save_memory(data.get("amount"), data.get("unit"))
+        elif action == "start":
+            msg = _mc_start()
+        elif action == "stop":
+            msg = _mc_stop()
+        elif action == "restart":
+            _mc_stop()
+            msg = _mc_start()
+        elif action == "command":
+            cmd = str(data.get("command", "")).replace("\r", " ").replace("\n", " ").strip().lstrip("/")
+            if not cmd or len(cmd) > 250:
+                return jsonify({"success": False, "error": "Пустая или слишком длинная команда"}), 400
+            if not _mc_pid():
+                return jsonify({"success": False, "error": "Сервер не запущен"}), 400
+            _mc_send(cmd)
+            msg = f"Отправлено: {cmd}"
+        else:
+            return jsonify({"success": False, "error": "Неизвестное действие"}), 404
+    except _McPluginError as e:
+        return jsonify({"success": False, "error": str(e), "can_force": e.can_force}), (409 if e.can_force else 400)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    print(f"[mc] {g.web_admin['nickname']}: {action} -> {msg}")
+    return jsonify({"success": True, "message": msg})
+
+
+MC_ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Mafin Launcher — Minecraft-сервер</title>
+<style>
+* {box-sizing:border-box}
+body{background:#1a1d23;color:#e1e4e8;font-family:'Segoe UI',Arial,sans-serif;margin:0}
+header{background:#242830;padding:16px 28px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2d323c}
+header h1{font-size:18px;margin:0;color:#43b581}
+header a{color:#7a8599;text-decoration:none;font-size:13px;margin-left:14px}
+header a:hover{color:#fff}
+main{padding:24px 28px;max-width:1000px;margin:0 auto}
+section{background:#242830;border-radius:10px;padding:20px;margin-bottom:20px}
+section h2{margin-top:0;font-size:15px;color:#43b581}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
+button{background:#2d323c;color:#e1e4e8;border:none;padding:9px 16px;border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{background:#3a3f4a}
+button.primary{background:#43b581;color:#fff;font-weight:bold}
+button.primary:hover{background:#379768}
+button.danger:hover{background:#f04747}
+button:disabled{opacity:.45;cursor:not-allowed}
+input[type=text]{flex:1;min-width:200px;padding:9px;border-radius:6px;border:1px solid #2d323c;background:#2d323c;color:#fff;font-size:13px}
+.kv{display:grid;grid-template-columns:200px 1fr;gap:6px 12px;font-size:13px}
+.kv div:nth-child(odd){color:#7a8599}
+.ok{color:#43b581}.bad{color:#f04747}.warn{color:#faa61a}
+pre{background:#14161a;border-radius:8px;padding:12px;font-size:12px;max-height:380px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:0}
+#msg{margin-top:12px;font-size:13px;min-height:18px}
+.muted{color:#7a8599;font-size:12px}
+.item{background:#14161a;border-radius:8px;padding:10px 12px;margin-top:8px;display:flex;gap:12px;align-items:center;justify-content:space-between}
+.item .t{font-weight:bold;font-size:13px}
+.item .d{color:#7a8599;font-size:12px;margin-top:2px}
+code{background:#14161a;padding:1px 5px;border-radius:4px}
+.bar{background:#14161a;border-radius:6px;height:8px;margin-top:6px}
+.bar div{background:#43b581;height:8px;border-radius:6px}
+</style></head>
+<body>
+<header><h1>🖥 Minecraft-сервер</h1>
+<div><a href="/admin/dashboard">← Назад в панель</a><a href="/admin/logout">Выйти</a></div></header>
+<main>
+<section>
+  <h2>Состояние</h2>
+  <div class="kv" id="kv"><div>Загрузка…</div><div></div></div>
+  <div id="msg"></div>
+</section>
+<section>
+  <h2>Управление</h2>
+  <div class="row">
+    <input type="text" id="ver" value="{{ default_version }}" style="max-width:140px;flex:none" title="Версия Minecraft">
+    <button onclick="act('install',{version:val('ver')})">⬇ Установить / обновить Paper</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="eula"> Я принимаю <a href="https://aka.ms/MinecraftEULA" target="_blank" style="color:#43b581">EULA Mojang</a></label>
+    <button onclick="acceptEula()">Принять EULA</button>
+  </div>
+  <div class="row">
+    <label>Порт <input type="text" id="port" style="width:90px;flex:none" inputmode="numeric"></label>
+    <label>Слоты <input type="text" id="slots" style="width:80px;flex:none" inputmode="numeric"></label>
+    <button onclick="saveSettings()">💾 Сохранить порт и слоты</button>
+  </div>
+  <p class="muted">Порт нужно открыть в фаерволе VDS (TCP). Изменения применяются после перезапуска сервера.</p>
+  <div class="row">
+    <label>Оперативная память <input type="text" id="mem_amount" style="width:90px;flex:none" inputmode="decimal" placeholder="4"></label>
+    <select id="mem_unit" style="padding:9px;border-radius:6px;background:#2d323c;color:#fff;border:1px solid #2d323c">
+      <option value="G">ГБ</option><option value="M">МБ</option>
+    </select>
+    <button onclick="saveMemory()">💾 Сохранить память</button>
+  </div>
+  <p class="muted" id="mem_hint">Сколько памяти выделить серверу (Java -Xms и -Xmx). Пиши число, например 4 или 1.5 (ГБ), либо 2048 и выбери МБ. Минимум 512 МБ, больше, чем есть в системе, указать нельзя. Применится после перезапуска сервера.</p>
+  <div class="row">
+    <button class="primary" onclick="act('start')">▶ Запустить</button>
+    <button onclick="act('restart')">⟳ Перезапустить</button>
+    <button class="danger" onclick="if(confirm('Остановить сервер?'))act('stop')">■ Остановить</button>
+  </div>
+  <div class="row">
+    <input type="text" id="cmd" placeholder="Команда консоли, например: say Привет" onkeydown="if(event.key==='Enter')sendCmd()">
+    <button onclick="sendCmd()">Отправить</button>
+  </div>
+  <p class="muted">Установка скачивает Paper с papermc.io (около 60 МБ). Остановка ждёт до 45 секунд.</p>
+</section>
+<section>
+  <h2>Название и версии в лаунчере</h2>
+  <div class="row">
+    <label>Название <input type="text" id="b_name" style="width:220px;flex:none" maxlength="40"></label>
+    <label>Версии от <input type="text" id="b_min" style="width:90px;flex:none" placeholder="1.20.4"></label>
+    <label>до <input type="text" id="b_max" style="width:90px;flex:none" placeholder="26.2"></label>
+    <button onclick="saveBranding()">💾 Сохранить</button>
+  </div>
+  <p class="muted">Это видят игроки на вкладке «Серверы» в лаунчере. Диапазон версий нужен, если стоят ViaVersion и ViaBackwards: лаунчер запустит игру в подходящей версии. Пусто означает только версию сервера.</p>
+</section>
+<section>
+  <h2>Описание сервера (MOTD)</h2>
+  <div class="row">
+    <textarea id="motd" rows="2" maxlength="210" placeholder="Первая строка&#10;Вторая строка (необязательно)" style="flex:1;min-width:260px;padding:9px;border-radius:6px;border:1px solid #2d323c;background:#2d323c;color:#fff;font-size:13px;font-family:inherit;resize:vertical"></textarea>
+    <button onclick="saveMotd()">💾 Сохранить описание</button>
+  </div>
+  <p class="muted">Текст под названием сервера в списке серверов Minecraft. До двух строк, лучше не длиннее 60 символов в строке. Цвета и стили: <code>&amp;a</code>, <code>&amp;6</code>, <code>&amp;l</code> и так далее. Применится после перезапуска сервера.</p>
+</section>
+<section>
+  <h2>Плагины (Modrinth)</h2>
+  <div class="row">
+    <input type="text" id="pq" placeholder="Поиск плагина…" onkeydown="if(event.key==='Enter')searchPlugins()">
+    <label><input type="checkbox" id="pcompat"> только для моей версии</label>
+    <button onclick="searchPlugins()">🔎 Найти</button>
+  </div>
+  <div class="row">
+    <button class="primary" onclick="act('plugin_install_builtin',{name:'mafinauth'})">🛡 MafinAuth (вход через лаунчер)</button>
+    <button onclick="installPlugin('viaversion')">ViaVersion</button>
+    <button onclick="installPlugin('viabackwards')">ViaBackwards</button>
+  </div>
+  <div class="row">
+    <button onclick="installVia()">🔀 Универсальный сервер: ViaVersion + ViaBackwards</button>
+    <button onclick="installAll()">⬇ Всё сразу: MafinAuth + Via</button>
+  </div>
+  <p class="muted">MafinAuth встроен в панель и ставится без интернета. ViaVersion и ViaBackwards скачиваются с Modrinth. После установки перезапусти сервер.</p>
+  <div id="presults" class="muted" style="margin-top:12px">Нажми «Найти», чтобы показать популярные плагины.</div>
+  <h2 style="margin-top:22px">Установленные</h2>
+  <div id="pinstalled" class="muted">—</div>
+</section>
+<section>
+  <h2>Миры</h2>
+  <div id="worlds" class="muted">—</div>
+  <div class="row">
+    <label>Мир (.zip) <input type="file" id="f_world" accept=".zip"></label>
+    <label>Имя папки <input type="text" id="w_name" style="width:160px;flex:none" maxlength="40" placeholder="необязательно"></label>
+    <button onclick="uploadWorld()">⬆ Загрузить мир</button>
+  </div>
+  <p class="muted">В архиве должна быть папка мира с файлом level.dat. Загруженный мир ставится отдельной папкой и ничего не перезаписывает. Чтобы играть в нём, сделай его активным (сервер при этом остановлен) и запусти сервер. Размер архива до 500 МБ.</p>
+</section>
+<section>
+  <h2>Файлы</h2>
+  <p class="muted">Если установка не сработала, загрузи файлы вручную. Они попадут в папку сервера.</p>
+  <div class="row">
+    <label>Paper (.jar) <input type="file" id="f_server" accept=".jar"></label>
+    <button onclick="upload('server')">⬆ Загрузить сервер</button>
+  </div>
+  <div class="row">
+    <label>Плагин MafinAuth (.jar) <input type="file" id="f_plugin" accept=".jar"></label>
+    <button onclick="upload('plugin')">⬆ Загрузить плагин</button>
+  </div>
+</section>
+<section>
+  <h2>Консоль</h2>
+  <pre id="log">—</pre>
+</section>
+</main>
+<script>
+function val(id){return document.getElementById(id).value.trim()}
+function setMsg(t,ok){const m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'bad'}
+async function call(action,body){
+  const r=await fetch('/admin/minecraft/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  let d={};try{d=await r.json()}catch(e){}
+  return d;
+}
+async function act(action,body){
+  setMsg('Выполняю…',true);
+  const d=await call(action,body);
+  setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);
+  refresh();
+}
+function acceptEula(){
+  if(!document.getElementById('eula').checked){setMsg('Отметь галочку согласия',false);return}
+  act('accept_eula',{accept:true});
+}
+function esc2(t){return esc(t).split('"').join('&quot;')}
+function saveBranding(){act('branding',{name:val('b_name'),version_min:val('b_min'),version_max:val('b_max')})}
+async function searchPlugins(){
+  const box=document.getElementById('presults');box.textContent='Ищу…';
+  const c=document.getElementById('pcompat').checked?'1':'0';
+  let d={};
+  try{d=await (await fetch('/admin/minecraft/plugins/search?q='+encodeURIComponent(val('pq'))+'&compat='+c)).json()}catch(e){}
+  if(!d.success){box.textContent=d.error||'Ошибка поиска';return}
+  if(!d.results.length){box.textContent='Ничего не найдено';return}
+  box.innerHTML=d.results.map(r=>'<div class="item"><div><div class="t">'+esc(r.title)+' <span class="muted">— '+esc(r.author)+', '+(Number(r.downloads)||0)+' загрузок</span></div><div class="d">'+esc(r.description)+'</div></div><button class="primary" data-install="'+esc2(r.slug)+'">Установить</button></div>').join('');
+}
+async function installPlugin(slug,force){
+  setMsg('Устанавливаю '+slug+'…',true);
+  const d=await call('plugin_install',{project:slug,force:!!force});
+  if(!d.success&&d.can_force&&confirm(d.error+'. Установить всё равно?'))return installPlugin(slug,true);
+  setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);
+  refresh();
+}
+async function installVia(){await installPlugin('viaversion');await installPlugin('viabackwards')}
+async function installAll(){await call('plugin_install_builtin',{name:'mafinauth'});await installVia()}
+function delPlugin(file){if(confirm('Удалить '+file+'?'))act('plugin_delete',{file:file})}
+document.addEventListener('click',function(e){
+  const i=e.target.closest('button[data-install]');if(i)installPlugin(i.dataset.install);
+  const x=e.target.closest('button[data-del]');if(x)delPlugin(x.dataset.del);
+});
+let brandingLoaded=false;
+function renderPlugins(list){
+  const box=document.getElementById('pinstalled');
+  if(!list.length){box.textContent='Плагинов нет';return}
+  box.innerHTML=list.map(p=>'<div class="item"><div><div class="t">'+esc(p.name)+'</div><div class="d">'+esc(p.file)+' · '+Math.round(p.size/1024)+' КБ</div></div>'+(p.protected?'<span class="muted">🔒 защитный</span>':'<button data-del="'+esc2(p.file)+'">Удалить</button>')+'</div>').join('');
+}
+let motdLoaded=false,memLoaded=false;
+function saveMotd(){act('motd',{motd:document.getElementById('motd').value})}
+function saveMemory(){act('memory',{amount:val('mem_amount'),unit:val('mem_unit')})}
+async function uploadWorld(){
+  const inp=document.getElementById('f_world');
+  if(!inp.files.length){setMsg('Выбери архив .zip с миром',false);return}
+  const fd=new FormData();fd.append('file',inp.files[0]);fd.append('name',val('w_name'));
+  setMsg('Загружаю мир…',true);
+  let d={};
+  try{const r=await fetch('/admin/minecraft/world/upload',{method:'POST',body:fd});d=await r.json()}catch(e){}
+  setMsg(d.success?d.message:(d.error||'Ошибка загрузки'),!!d.success);
+  inp.value='';refresh();
+}
+function renderWorlds(s){
+  const box=document.getElementById('worlds');
+  const list=s.worlds||[];
+  const busy=s.running;
+  let html='<div class="muted" style="margin-bottom:6px">Активный мир (level-name): <code>'+esc(s.active_world||'world')+'</code></div>';
+  if(!list.length){box.innerHTML=html+'Миров пока нет. Папка мира появится после первого запуска сервера или загрузки архива.';return}
+  html+=list.map(w=>{
+    const isAct=(w===s.active_world);
+    return '<div class="item"><div><div class="t">'+esc(w)+(isAct?' <span class="ok">— активный</span>':'')+'</div></div><div>'+(isAct?'':'<button data-wact="'+esc2(w)+'"'+(busy?' disabled':'')+'>Сделать активным</button> <button class="danger" data-wdel="'+esc2(w)+'"'+(busy?' disabled':'')+'>Удалить</button>')+'</div></div>';
+  }).join('');
+  box.innerHTML=html;
+}
+function renderExtra(s){
+  if(!motdLoaded&&typeof s.motd==='string'){document.getElementById('motd').value=s.motd;motdLoaded=true}
+  if(!memLoaded&&s.memory_mb){
+    const gb=s.memory_mb%1024===0;
+    document.getElementById('mem_amount').value=gb?(s.memory_mb/1024):s.memory_mb;
+    document.getElementById('mem_unit').value=gb?'G':'M';
+    memLoaded=true;
+  }
+  renderWorlds(s);
+}
+document.addEventListener('click',function(e){
+  const c=e.target.closest('button[data-wact]');
+  if(c&&confirm('Сделать мир «'+c.dataset.wact+'» активным? Он загрузится при запуске сервера.'))act('world_activate',{name:c.dataset.wact});
+  const d=e.target.closest('button[data-wdel]');
+  if(d&&confirm('Удалить мир «'+d.dataset.wdel+'» НАВСЕГДА? Это нельзя отменить.'))act('world_delete',{name:d.dataset.wdel});
+});
+async function upload(kind){
+  const inp=document.getElementById('f_'+kind);
+  if(!inp.files.length){setMsg('Выбери файл .jar',false);return}
+  const fd=new FormData();fd.append('file',inp.files[0]);
+  setMsg('Загружаю…',true);
+  let d={};
+  try{const r=await fetch('/admin/minecraft/upload/'+kind,{method:'POST',body:fd});d=await r.json()}catch(e){}
+  setMsg(d.success?d.message:(d.error||'Ошибка загрузки'),!!d.success);
+  inp.value='';refresh();
+}
+function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
+function saveSettings(){
+  act('settings',{port:val('port'),max_players:val('slots')});
+}
+let settingsLoaded=false;
+function sendCmd(){
+  const c=val('cmd');if(!c)return;
+  act('command',{command:c});document.getElementById('cmd').value='';
+}
+function yn(v,good){return '<span class="'+(v===good?'ok':'bad')+'">'+(v?'да':'нет')+'</span>'}
+async function refresh(){
+  try{
+    const s=await (await fetch('/admin/minecraft/status')).json();
+    const rows=[
+      ['Папка сервера','<code>'+esc(s.dir)+'</code>'],
+      ['Платформа',s.supported?'<span class="ok">Linux, управление доступно</span>':'<span class="bad">управление запуском недоступно (только Linux)</span>'],
+      ['Paper установлен',yn(s.installed,true)+(s.jar_file?' — '+esc(s.jar_file):'')+(s.minecraft_version?' (Minecraft '+s.minecraft_version+')':'')],
+      ['Java',(s.java_installed?s.java_installed:'<span class="bad">не найдена</span>')+(s.java_required?' (нужна '+s.java_required+'+)':'')],
+      ['EULA принята',yn(s.eula,true)],
+      ['Процесс',s.running?'<span class="ok">запущен</span>':'остановлен'],
+      ['Принимает игроков',s.ready?'<span class="ok">да</span>':(s.running?'<span class="warn">запускается…</span>':'—')],
+      ['Игроков',s.ready?(s.players_online+' / '+s.players_max):'—'],
+      ['online-mode',s.online_mode==='false'?'<span class="ok">false (нужно для лаунчера)</span>':'<span class="warn">'+(s.online_mode||'не задан')+' — при запуске будет выставлено false</span>'],
+      ['Память',esc(s.memory_text||'—')+(s.system_ram_mb?' <span class="muted">(в системе '+Math.round(s.system_ram_mb/102.4)/10+' ГБ)</span>':'')],
+      ['Плагин MafinAuth',s.plugin_installed?'<span class="ok">найден: '+s.plugin_files.map(esc).join(', ')+'</span>':'<span class="warn">не найден. Загрузи кнопкой ниже или положи .jar в <code>'+esc(s.dir)+'/plugins</code></span>'],
+      ['MAFIN_MC_SECRET',s.secret_set?'<span class="ok">задан</span>':'<span class="bad">не задан — плагин никого не пустит</span>'],
+      ['Порт',s.port+(s.run_port&&s.run_port!==s.port?' <span class="warn">(работает на '+s.run_port+', новый порт после перезапуска)</span>':'')],
+      ['Слоты',s.max_players]
+    ];
+    renderPlugins(s.plugins||[]);
+    renderExtra(s);
+    if(!brandingLoaded&&s.branding){
+      document.getElementById('b_name').value=s.branding.name;
+      document.getElementById('b_min').value=s.branding.version_min;
+      document.getElementById('b_max').value=s.branding.version_max;
+      brandingLoaded=true;
+    }
+    if(!settingsLoaded){
+      document.getElementById('port').value=s.port;
+      document.getElementById('slots').value=s.max_players;
+      settingsLoaded=true;
+    }
+    document.getElementById('kv').innerHTML=rows.map(r=>'<div>'+r[0]+'</div><div>'+r[1]+'</div>').join('');
+    const l=await (await fetch('/admin/minecraft/log')).json();
+    const pre=document.getElementById('log');
+    const atEnd=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-20;
+    pre.textContent=l.log||'—';
+    if(atEnd)pre.scrollTop=pre.scrollHeight;
+  }catch(e){}
+}
+refresh();setInterval(refresh,4000);
+</script>
+</body></html>
+"""
 
 @app.route('/admin', methods=['GET'])
 def admin_login_page():
@@ -3072,6 +4697,12 @@ if __name__ == '__main__':
         _cli_admin_code(sys.argv[2], create="--create" in sys.argv[3:])
         sys.exit(0)
     init_db()
+    _mc_guard_start()
+    if os.environ.get("MAFIN_MC_AUTOSTART") == "1":
+        try:
+            print("[mc]", _mc_start())
+        except Exception as e:
+            print(f"[mc] автозапуск не удался: {e}")
     print("=" * 60)
     print("🚀 Mafin Launcher Server запущен")
     print("📡 API адрес: http://0.0.0.0:10074")
