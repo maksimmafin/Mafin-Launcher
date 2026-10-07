@@ -184,7 +184,7 @@ def animate_image_on_label(label, image_bytes, max_px=96, circular=False):
 
 CONFIG_FILE = "launcher_config.json"
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.8.1"
 
 
 def _sha256_file(path):
@@ -243,7 +243,74 @@ def play_achievement_sound():
 DISCORD_CLIENT_ID = "1548297015220371496"
 
 # Адрес сервера лаунчера. Задай через переменную окружения MAFIN_SERVER_URL
-SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://127.0.0.1:3092")
+SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://127.0.0.1:2062")
+
+AUTHLIB_INJECTOR_LATEST = "https://authlib-injector.yushi.moe/artifact/latest.json"
+AUTHLIB_INJECTOR_FALLBACK = ("https://github.com/yushijinhun/authlib-injector/releases/download/"
+                             "v1.2.5/authlib-injector-1.2.5.jar")
+
+
+def offline_uuid(name):
+    import hashlib
+    return str(uuid_module.UUID(bytes=hashlib.md5(("OfflinePlayer:" + name).encode("utf-8")).digest(), version=3))
+
+
+def ensure_authlib_injector(status_callback=None):
+    import hashlib
+    path = os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), "authlib-injector.jar")
+    if os.path.isfile(path) and zipfile.is_zipfile(path):
+        return path
+    if status_callback:
+        status_callback("⬇️ Скачиваю модуль скинов (authlib-injector)...")
+    urls, sha = [], None
+    try:
+        info = requests.get(AUTHLIB_INJECTOR_LATEST, timeout=8).json()
+        if info.get("download_url"):
+            urls.append(info["download_url"])
+            sha = (info.get("checksums") or {}).get("sha256")
+    except Exception as e:
+        print(f"authlib-injector: не удалось получить latest.json: {e}")
+    urls.append(AUTHLIB_INJECTOR_FALLBACK)
+    for i, url in enumerate(urls):
+        try:
+            data = requests.get(url, timeout=40).content
+            if len(data) < 50 * 1024:
+                continue
+            if i == 0 and sha and hashlib.sha256(data).hexdigest().lower() != str(sha).lower():
+                print("authlib-injector: контрольная сумма не совпала")
+                continue
+            tmp = path + ".part"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            if not zipfile.is_zipfile(tmp):
+                os.remove(tmp)
+                continue
+            os.replace(tmp, path)
+            return path
+        except Exception as e:
+            print(f"authlib-injector: не удалось скачать {url}: {e}")
+    return None
+
+
+def skin_agent_jvm_args(api_base, status_callback=None):
+    if not api_base:
+        return []
+    try:
+        root = api_base.rstrip("/") + "/yggdrasil"
+        r = requests.get(root + "/", timeout=4)
+        if r.status_code != 200:
+            return []
+        import base64
+        prefetched = base64.b64encode(r.content).decode("ascii")
+        jar = ensure_authlib_injector(status_callback)
+        if not jar:
+            return []
+        return [f"-javaagent:{jar}={root}",
+                f"-Dauthlibinjector.yggdrasil.prefetched={prefetched}",
+                "-Dauthlibinjector.noShowServerName"]
+    except Exception as e:
+        print(f"Скины: сервер скинов недоступен, запускаю без него: {e}")
+        return []
 
 LAUNCHER_THEMES = {
     "green":  {"label": "🟢 Зелёная (по умолчанию)", "accent": "#43b581", "accent_hover": "#379768"},
@@ -791,6 +858,7 @@ DEFAULT_CONFIG = {
     "accounts": [],
     "selected_account": 0,
     "skin_auto_download": True,
+    "skin_system_enabled": True,
     "launcher_theme": DEFAULT_LAUNCHER_THEME,
     "window_material": DEFAULT_WINDOW_MATERIAL,
     "nav_style": "list",
@@ -959,6 +1027,21 @@ class ServerAPI:
 
     def list_gifts(self):
         return self._get("/api/gifts")
+
+    def skin_upload(self, game_name, png_bytes, model="default"):
+        import base64
+        return self._post("/api/skin/upload", {
+            "game_name": game_name, "model": model,
+            "png_b64": base64.b64encode(png_bytes).decode("ascii")})
+
+    def skin_delete(self, game_name):
+        return self._post("/api/skin/delete", {"game_name": game_name})
+
+    def shop_items(self):
+        return self._get("/api/shop/items", timeout=4)
+
+    def shop_buy(self, item_id, game_name):
+        return self._post("/api/shop/buy", {"item_id": item_id, "game_name": game_name})
 
     def send_gift(self, gift_id, to, message=""):
         return self._post("/api/gifts/send", {"gift_id": gift_id, "to": to, "message": message})
@@ -3358,7 +3441,7 @@ class LauncherCore:
                     "Java не найдена ни в системе, ни через автозагрузку. "
                     "Проверьте подключение к интернету или укажите свою Java в настройках."
                 )
-        player_uuid = str(uuid_module.uuid3(uuid_module.NAMESPACE_DNS, player_name))
+        player_uuid = offline_uuid(player_name)
 
         options = {
             "username": player_name,
@@ -3367,6 +3450,9 @@ class LauncherCore:
             "userType": "legacy",
             "jvmArguments": [f"-Xmx{self.effective_memory()}M", f"-Xms{self.effective_memory() // 2}M"],
         }
+        skin_url = getattr(self, "skin_server_url", "")
+        if skin_url:
+            options["jvmArguments"] += skin_agent_jvm_args(skin_url, status_callback)
         if resolved_java and resolved_java != "java":
             options["executablePath"] = resolved_java
         if self.game_dir:
@@ -4882,6 +4968,15 @@ class ModUpdateWindow(tk.Toplevel):
             self.status.configure(text=f"Скачиваю {name}: {_fmt_mb(done, total)}", fg="#7a8599")
 
 
+SHOP_STATUS_TEXT = {"pending": "⏳ ждёт выдачи", "applied": "✅ выдано",
+                    "failed": "❌ ошибка", "refunded": "↩ возврат"}
+SHOP_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+
+
+def shop_duration_text(days):
+    return "навсегда" if not days else f"{int(days)} дн."
+
+
 class ServerEditDialog(tk.Toplevel):
     """Добавление и изменение сервера: название, адрес, версия или диапазон версий."""
 
@@ -6212,6 +6307,7 @@ class LauncherApp:
             ("🖥️ Аккаунт", self.build_account_tab),
             ("👥 Друзья", self.build_friends_tab),
             ("🎁 Подарки", self.build_gifts_tab),
+            ("👑 Привилегии", self.build_privileges_tab),
             ("📋 Задания", self.build_quests_tab),
             ("🛡️ Админка", self.build_admin_tab),
             ("⚙️ Настройки", self.build_settings_tab),
@@ -6241,6 +6337,8 @@ class LauncherApp:
                 self.quests_tab_frame = tab
             if name == "🎁 Подарки":
                 self.gifts_tab_frame = tab
+            if name == "👑 Привилегии":
+                self.privileges_tab_frame = tab
 
         if self.admin_tab_id is not None:
             self.notebook.tab(self.admin_tab_id, state="hidden")
@@ -7021,10 +7119,10 @@ class LauncherApp:
     def build_skin_tab(self, frame):
         ttk.Label(
             frame,
-            text="ℹ️ Здесь можно поставить свой скин локальным файлом (PNG 64×64 или 64×32,\n"
-                 "как в обычном Minecraft). Это меняет только превью в лаунчере и файл в папке\n"
-                 "игры — на то, каким вас видят другие игроки на серверах, это не влияет:\n"
-                 "их клиент, как и раньше, тянет скин с серверов Mojang по вашему логину.",
+            text="ℹ️ Выберите PNG-скин (64×64 или 64×32). Он загружается на наш сервер скинов и\n"
+                 "виден всем, кто играет через этот лаунчер, — на нашем сервере и на любых\n"
+                 "пиратских (offline) серверах. Нужен вход в аккаунт лаунчера. Игроки с другими\n"
+                 "лаунчерами видят стандартного Стива/Алекс.",
             foreground="#7a8599", justify="left", wraplength=520
         ).pack(anchor="w", padx=10, pady=(10, 15))
 
@@ -7057,6 +7155,17 @@ class LauncherApp:
                    command=self._choose_custom_skin).pack(side="left", padx=(0, 8))
         ttk.Button(btn_row, text="♻️ Сбросить (авто по нику)",
                    command=self._reset_custom_skin).pack(side="left")
+
+        model_row = ttk.Frame(info_frame)
+        model_row.pack(anchor="w", pady=(10, 0))
+        ttk.Label(model_row, text="Руки:").pack(side="left", padx=(0, 6))
+        acc0 = self._current_account() or {}
+        self.skin_model_var = tk.StringVar(
+            value="Тонкие (Alex)" if acc0.get("skin_model") == "slim" else "Классические (Steve)")
+        model_cb = ttk.Combobox(model_row, textvariable=self.skin_model_var, state="readonly", width=22,
+                                values=("Классические (Steve)", "Тонкие (Alex)"))
+        model_cb.pack(side="left")
+        model_cb.bind("<<ComboboxSelected>>", lambda e: self._on_skin_model_change())
 
         self._refresh_skin_tab()
 
@@ -7119,6 +7228,57 @@ class LauncherApp:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _skin_model_value(self):
+        var = getattr(self, "skin_model_var", None)
+        return "slim" if var is not None and "Alex" in var.get() else "default"
+
+    def _skin_upload_async(self, acc, notify=True):
+        """Заливает скин аккаунта на сервер скинов (в фоне). Без входа в аккаунт лаунчера не работает."""
+        path = acc.get("skin_path")
+        name = acc.get("name", "")
+        model = acc.get("skin_model", "default")
+        if not path or not os.path.isfile(path) or not name:
+            return
+        if not self.api.is_logged_in():
+            if notify:
+                messagebox.showinfo("Скин", "Скин сохранён локально. Чтобы его видели другие игроки, "
+                                            "войдите в аккаунт на вкладке «🖥️ Аккаунт» и выберите скин ещё раз "
+                                            "(или он загрузится при следующем запуске игры после входа).")
+            return
+
+        def work():
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                status, resp = self.api.skin_upload(name, data, model)
+            except Exception as e:
+                status, resp = 0, {"error": str(e)}
+            ok = status == 200 and resp.get("success")
+            if ok:
+                acc["skin_uploaded"] = f"{os.path.getmtime(path)}:{model}"
+                self.root.after(0, self.save_config)
+            if notify or not ok:
+                msg = "Скин загружен на сервер: его видят другие игроки лаунчера." if ok else \
+                      f"Не удалось загрузить скин на сервер: {resp.get('error', 'нет связи')}"
+                self.root.after(0, lambda: (messagebox.showinfo if ok else messagebox.showwarning)("Скин", msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _skin_needs_upload(self, acc):
+        path = acc.get("skin_path")
+        if not path or not os.path.isfile(path):
+            return False
+        return acc.get("skin_uploaded") != f"{os.path.getmtime(path)}:{acc.get('skin_model', 'default')}"
+
+    def _on_skin_model_change(self):
+        acc = self._current_account()
+        if not acc:
+            return
+        acc["skin_model"] = self._skin_model_value()
+        acc.pop("skin_uploaded", None)
+        self.save_config()
+        if acc.get("skin_path"):
+            self._skin_upload_async(acc, notify=True)
+
     def _choose_custom_skin(self):
         acc = self._current_account()
         if not acc:
@@ -7159,19 +7319,25 @@ class LauncherApp:
             return
 
         acc["skin_path"] = dest_path
+        acc["skin_model"] = self._skin_model_value()
+        acc.pop("skin_uploaded", None)
         self.save_config()
         self._refresh_skin_tab()
         if HAS_PIL and self.config.get("skin_auto_download", True):
             self.load_skin(acc.get("name", ""))
         self._bump_achievement("skins_changed", 1)
-        messagebox.showinfo("Готово", "Скин обновлён. Учтите: другие игроки на серверах видят стандартный скин Mojang по вашему нику — это только локальное превью.")
+        self._skin_upload_async(acc, notify=True)
 
     def _reset_custom_skin(self):
         acc = self._current_account()
         if not acc:
             return
         if acc.pop("skin_path", None) is not None:
+            acc.pop("skin_uploaded", None)
             self.save_config()
+            if self.api.is_logged_in():
+                name = acc.get("name", "")
+                threading.Thread(target=lambda: self.api.skin_delete(name), daemon=True).start()
         self._refresh_skin_tab()
         if HAS_PIL and self.config.get("skin_auto_download", True):
             self.load_skin(acc.get("name", ""))
@@ -8878,6 +9044,7 @@ class LauncherApp:
         self._rebuild_friends_tab()
         self._rebuild_quests_tab()
         self._rebuild_gifts_tab()
+        self._rebuild_privileges_tab()
         self._achievements_restore_pending = True
         threading.Thread(target=self._sync_achievements_from_server, daemon=True).start()
         self.refresh_news_admin_visibility()
@@ -8902,6 +9069,178 @@ class LauncherApp:
         for child in frame.winfo_children():
             child.destroy()
         self.build_quests_tab(frame)
+
+    def build_privileges_tab(self, frame):
+        if not self.api.is_logged_in():
+            ttk.Label(
+                frame, text="Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы покупать привилегии за монеты.",
+                foreground="#7a8599", wraplength=500, justify="left"
+            ).pack(padx=20, pady=30)
+            return
+        self._build_privileges_tab(frame)
+
+    def _rebuild_privileges_tab(self):
+        frame = getattr(self, "privileges_tab_frame", None)
+        if frame is None:
+            return
+        self._priv_gen = getattr(self, "_priv_gen", 0) + 1
+        for child in frame.winfo_children():
+            child.destroy()
+        self.build_privileges_tab(frame)
+
+    def _build_privileges_tab(self, frame):
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Button(top, text="🔄 Обновить", command=self._load_privileges).pack(side="left")
+        self._priv_balance = ttk.Label(top, text="🪙 …", font=("Segoe UI Semibold", 11))
+        self._priv_balance.pack(side="left", padx=12)
+        ttk.Label(top, text="Привилегии выдаются на нашем сервере через LuckPerms",
+                  foreground="#7a8599").pack(side="left")
+
+        who = ttk.Frame(frame)
+        who.pack(fill="x", padx=8, pady=4)
+        ttk.Label(who, text="Ник в игре:").pack(side="left")
+        self._priv_name_var = tk.StringVar(value=self.player_var.get().strip())
+        ttk.Entry(who, textvariable=self._priv_name_var, width=20).pack(side="left", padx=6)
+        ttk.Label(who, text="кому выдать (латиница, цифры, _)", foreground="#7a8599").pack(side="left")
+
+        self._priv_tree = ttk.Treeview(frame, columns=("title", "duration", "price"), show="headings",
+                                       height=7, selectmode="browse")
+        for col, text, width in (("title", "Привилегия", 260), ("duration", "Срок", 110), ("price", "Цена, 🪙", 90)):
+            self._priv_tree.heading(col, text=text)
+            self._priv_tree.column(col, width=width, anchor="w")
+        self._priv_tree.pack(fill="x", padx=8, pady=4)
+        self._priv_tree.bind("<<TreeviewSelect>>", lambda e: self._priv_show_description())
+
+        self._priv_desc = ttk.Label(frame, text="", foreground="#7a8599", wraplength=560, justify="left")
+        self._priv_desc.pack(anchor="w", padx=10)
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", padx=8, pady=6)
+        ttk.Button(btns, text="👑 Купить", style="Accent.TButton", command=self._buy_privilege).pack(side="left")
+        self._priv_status = ttk.Label(btns, text="Загрузка...", foreground="#7a8599")
+        self._priv_status.pack(side="left", padx=10)
+
+        ttk.Label(frame, text="Мои покупки", font=("Segoe UI Semibold", 10)).pack(anchor="w", padx=10, pady=(8, 2))
+        self._priv_hist = ttk.Treeview(frame, columns=("when", "item", "player", "status"), show="headings",
+                                       height=5, selectmode="none")
+        for col, text, width in (("when", "Когда", 120), ("item", "Привилегия", 190),
+                                 ("player", "Игрок", 120), ("status", "Статус", 130)):
+            self._priv_hist.heading(col, text=text)
+            self._priv_hist.column(col, width=width, anchor="w")
+        self._priv_hist.pack(fill="x", padx=8, pady=(0, 8))
+        self._priv_items = {}
+        self._priv_loading = False
+        self._priv_gen = getattr(self, "_priv_gen", 0) + 1
+        self._load_privileges()
+        self._schedule_privileges_refresh(self._priv_gen)
+
+    def _schedule_privileges_refresh(self, gen):
+        """Раз в 5 секунд обновляет вкладку, пока она открыта. Старые таймеры гасятся при пересборке вкладки."""
+        def tick():
+            if gen != getattr(self, "_priv_gen", None):
+                return
+            try:
+                if not self._priv_tree.winfo_exists():
+                    return
+                if self._priv_tree.winfo_ismapped() and not self._priv_loading:
+                    self._load_privileges()
+                self.root.after(5000, tick)
+            except Exception:
+                pass
+        self.root.after(5000, tick)
+
+    def _load_privileges(self):
+        if getattr(self, "_priv_loading", False):
+            return
+        self._priv_loading = True
+
+        def work():
+            try:
+                status, data = self.api.shop_items()
+            except Exception as e:
+                status, data = 0, {"error": str(e)}
+            self.root.after(0, lambda: self._apply_privileges(status, data))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_privileges(self, status, data):
+        self._priv_loading = False
+        if not hasattr(self, "_priv_tree") or not self._priv_tree.winfo_exists():
+            return
+        if status != 200 or not data.get("success"):
+            self._priv_status.config(text=f"Не удалось загрузить: {data.get('error', 'нет связи с сервером')}")
+            return
+        self.api.coins = data.get("coins", self.api.coins)
+        self._priv_balance.config(text=f"🪙 {data.get('coins', 0):g}")
+        keep = self._priv_tree.selection()
+        for row in self._priv_tree.get_children():
+            self._priv_tree.delete(row)
+        self._priv_items = {}
+        for it in data.get("items", []):
+            iid = str(it["id"])
+            self._priv_items[iid] = it
+            self._priv_tree.insert("", "end", iid=iid, values=(
+                it["title"], shop_duration_text(it["duration_days"]), f"{it['price']:g}"))
+        if keep and keep[0] in self._priv_items:
+            self._priv_tree.selection_set(keep[0])
+        self._priv_status.config(text="" if self._priv_items else "Привилегий пока нет в продаже")
+        for row in self._priv_hist.get_children():
+            self._priv_hist.delete(row)
+        for p in data.get("purchases", []):
+            self._priv_hist.insert("", "end", values=(
+                str(p.get("created_at", ""))[:16], f"{p['item_title']} ({shop_duration_text(p['duration_days'])})",
+                p["game_name"], SHOP_STATUS_TEXT.get(p.get("status"), p.get("status", ""))))
+        self._priv_show_description()
+
+    def _priv_show_description(self):
+        sel = self._priv_tree.selection()
+        it = self._priv_items.get(sel[0]) if sel else None
+        self._priv_desc.config(text=(it.get("description") or "") if it else "")
+
+    def _buy_privilege(self):
+        sel = self._priv_tree.selection()
+        if not sel or sel[0] not in self._priv_items:
+            messagebox.showinfo("Привилегии", "Выбери привилегию в списке.")
+            return
+        item = self._priv_items[sel[0]]
+        name = self._priv_name_var.get().strip()
+        if not SHOP_NAME_RE.match(name):
+            messagebox.showwarning("Привилегии", "Ник в игре: 3–16 символов, латиница, цифры и _.")
+            return
+        if self.api.coins < item["price"]:
+            messagebox.showwarning("Привилегии", f"Не хватает монет: нужно {item['price']:g}, у тебя {self.api.coins:g}.")
+            return
+        if not messagebox.askyesno(
+                "Покупка", f"Купить «{item['title']}» ({shop_duration_text(item['duration_days'])}) "
+                           f"за {item['price']:g} монет?\n\nПривилегия будет выдана игроку {name} на сервере."):
+            return
+        self._priv_status.config(text="Покупаю...")
+
+        def work():
+            try:
+                status, data = self.api.shop_buy(item["id"], name)
+            except Exception as e:
+                status, data = 0, {"error": str(e)}
+            self.root.after(0, lambda: self._privilege_bought(status, data, item, name))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _privilege_bought(self, status, data, item, name):
+        if status != 200 or not data.get("success"):
+            self._priv_status.config(text="")
+            messagebox.showerror("Привилегии", data.get("error", "Не удалось купить"))
+            self._load_privileges()
+            return
+        self.api.coins = data.get("total_coins", self.api.coins)
+        if data.get("status") == "applied":
+            messagebox.showinfo("Привилегии", f"Готово! «{item['title']}» выдана игроку {name}.\n"
+                                              f"Зайди на сервер (если уже в игре, перезайди).")
+        else:
+            messagebox.showinfo("Привилегии", "Покупка оплачена. Привилегия будет выдана автоматически, "
+                                              "когда сервер запущен и готов.")
+        try:
+            self._refresh_account_info_label()
+        except Exception:
+            pass
+        self._load_privileges()
 
     def _rebuild_gifts_tab(self):
         frame = getattr(self, "gifts_tab_frame", None)
@@ -9197,6 +9536,7 @@ class LauncherApp:
             self._rebuild_friends_tab()
             self._rebuild_quests_tab()
             self._rebuild_gifts_tab()
+            self._rebuild_privileges_tab()
             self.refresh_news_admin_visibility()
             if hasattr(self, "news_text"):
                 self.refresh_news(show_errors=False)
@@ -10144,6 +10484,11 @@ class LauncherApp:
                             variable=self.skin_auto_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
 
         row += 1
+        self.skin_system_var = tk.BooleanVar(value=self.config.get("skin_system_enabled", True))
+        ttk.Checkbutton(frame, text="Показывать скины на серверах (модуль authlib-injector)",
+                        variable=self.skin_system_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
+
+        row += 1
         self.show_alpha_beta_var = tk.BooleanVar(value=self.config.get("show_alpha_beta", False))
         ttk.Checkbutton(frame, text="Показывать альфа/бета версии",
                         variable=self.show_alpha_beta_var,
@@ -10296,6 +10641,7 @@ class LauncherApp:
         self.config["auto_clean_logs"] = self.auto_clean_var.get()
         if HAS_PIL:
             self.config["skin_auto_download"] = self.skin_auto_var.get()
+        self.config["skin_system_enabled"] = self.skin_system_var.get()
 
         self.save_config()
         if self.config.get("active_modpack"):
@@ -10827,6 +11173,21 @@ class LauncherApp:
                     self.api.register_mc_session(player)
                 except Exception as e:
                     print(f"Не удалось зарегистрировать игровой ник на сервере: {e}")
+
+            skins_on = self.config.get("skin_system_enabled", True)
+            self.core.skin_server_url = self.api.base_url if skins_on else ""
+            if skins_on and self.api.is_logged_in():
+                acc_skin = self._get_account_by_name(player)
+                if acc_skin and self._skin_needs_upload(acc_skin):
+                    try:
+                        with open(acc_skin["skin_path"], "rb") as f:
+                            st, rs = self.api.skin_upload(player, f.read(), acc_skin.get("skin_model", "default"))
+                        if st == 200 and rs.get("success"):
+                            acc_skin["skin_uploaded"] = (f"{os.path.getmtime(acc_skin['skin_path'])}:"
+                                                         f"{acc_skin.get('skin_model', 'default')}")
+                            self.root.after(0, self.save_config)
+                    except Exception as e:
+                        print(f"Не удалось загрузить скин на сервер: {e}")
 
             join = getattr(self, "_pending_join_address", None)
             self._pending_join_address = None
