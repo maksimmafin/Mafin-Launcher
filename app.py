@@ -47,6 +47,7 @@ def _load_secret_key():
 SECRET_KEY = _load_secret_key()
 
 ADMIN_SESSION_DAYS = 30
+LAUNCHER_SESSION_DAYS = 7  # сколько живёт сессия лаунчера (скользящее окно)
 ADMIN_CODE_TTL_SECONDS = 300
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -250,6 +251,45 @@ def init_db():
             price_paid REAL NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS skins (
+            game_name_lower TEXT PRIMARY KEY,
+            game_name TEXT NOT NULL,
+            uuid TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT 'default',
+            hash TEXT NOT NULL,
+            png BLOB NOT NULL,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_skins_uuid ON skins(uuid);
+
+        CREATE TABLE IF NOT EXISTS shop_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            group_name TEXT NOT NULL,
+            duration_days INTEGER NOT NULL DEFAULT 0,
+            price REAL NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS shop_purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nickname TEXT NOT NULL,
+            game_name TEXT NOT NULL,
+            item_id INTEGER,
+            item_title TEXT NOT NULL,
+            group_name TEXT NOT NULL,
+            duration_days INTEGER NOT NULL,
+            price REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            applied_at TEXT
+        );
     """)
     
     existing_cols = [row[1] for row in db.execute("PRAGMA table_info(profiles)").fetchall()]
@@ -261,6 +301,9 @@ def init_db():
         db.commit()
     if "gifts_visible" not in existing_cols:
         db.execute("ALTER TABLE profiles ADD COLUMN gifts_visible INTEGER DEFAULT 1")
+        db.commit()
+    if "token_expires_at" not in existing_cols:
+        db.execute("ALTER TABLE profiles ADD COLUMN token_expires_at INTEGER")
         db.commit()
 
     existing_gift_cols = [row[1] for row in db.execute("PRAGMA table_info(gifts)").fetchall()]
@@ -333,6 +376,9 @@ def verify_password(password, salt, stored_hash):
 
 def generate_token():
     return secrets.token_hex(32)
+
+def new_token_expiry():
+    return int(time.time()) + LAUNCHER_SESSION_DAYS * 86400
 
 def yekb_input_to_system_naive(dt_str):
     if not dt_str:
@@ -435,9 +481,22 @@ def auth_required(f):
         
         if not profile:
             return jsonify({"error": "Недействительный токен"}), 401
+
+        now_ts = int(time.time())
+        expires_at = profile['token_expires_at']
+        if expires_at is not None and expires_at < now_ts:
+            db.execute("UPDATE profiles SET token = NULL, token_expires_at = NULL WHERE id = ?", (profile['id'],))
+            db.commit()
+            return jsonify({"error": "Сессия истекла, войдите заново", "code": "session_expired"}), 401
         
         if profile['is_banned']:
             return jsonify({"error": f"Профиль заблокирован: {profile['ban_reason']}"}), 403
+
+        # Скользящее окно: продлеваем до 7 дней, но пишем в БД не чаще раза в час.
+        # Старые токены без срока получают его при первом же запросе.
+        if expires_at is None or expires_at - now_ts < LAUNCHER_SESSION_DAYS * 86400 - 3600:
+            db.execute("UPDATE profiles SET token_expires_at = ? WHERE id = ?", (new_token_expiry(), profile['id']))
+            db.commit()
         
         g.current_profile = dict(profile)
         touch_last_seen(db, profile['nickname'])
@@ -489,8 +548,8 @@ def register():
     token = generate_token()
     
     db.execute(
-        "INSERT INTO profiles (nickname, password_hash, salt, token, last_login) VALUES (?, ?, ?, ?, ?)",
-        (nickname, password_hash, salt, token, datetime.now().isoformat())
+        "INSERT INTO profiles (nickname, password_hash, salt, token, token_expires_at, last_login) VALUES (?, ?, ?, ?, ?, ?)",
+        (nickname, password_hash, salt, token, new_token_expiry(), datetime.now().isoformat())
     )
     db.commit()
     
@@ -558,18 +617,24 @@ def login():
 
     _clear_login_failures(nickname)
 
-    token = generate_token()
+    now_ts = int(time.time())
+    old_exp = profile['token_expires_at']
+    if profile['token'] and (old_exp is None or old_exp >= now_ts):
+        token = profile['token']
+    else:
+        token = generate_token()
+    expires_at = new_token_expiry()
     now_iso = datetime.now().isoformat()
     if needs_upgrade:
         new_hash = hash_password(password, profile['salt'])
         db.execute(
-            "UPDATE profiles SET token = ?, last_login = ?, last_seen = ?, password_hash = ? WHERE id = ?",
-            (token, now_iso, now_iso, new_hash, profile['id'])
+            "UPDATE profiles SET token = ?, token_expires_at = ?, last_login = ?, last_seen = ?, password_hash = ? WHERE id = ?",
+            (token, expires_at, now_iso, now_iso, new_hash, profile['id'])
         )
     else:
         db.execute(
-            "UPDATE profiles SET token = ?, last_login = ?, last_seen = ? WHERE id = ?",
-            (token, now_iso, now_iso, profile['id'])
+            "UPDATE profiles SET token = ?, token_expires_at = ?, last_login = ?, last_seen = ? WHERE id = ?",
+            (token, expires_at, now_iso, now_iso, profile['id'])
         )
     db.commit()
     
@@ -720,10 +785,7 @@ def heartbeat():
     touch_last_seen(db, g.current_profile['nickname'])
     return jsonify({"success": True})
 
-# ===== Авторизация игроков на Minecraft-сервере (плагин MafinAuth) =====
 def _load_mc_secret():
-    """Секрет для плагина MafinAuth: из MAFIN_MC_SECRET или из файла .mc_secret.
-    Если ни того ни другого нет, создаётся случайный и сохраняется в .mc_secret."""
     env = os.environ.get("MAFIN_MC_SECRET", "").strip()
     if env:
         return env
@@ -757,7 +819,6 @@ def _normalize_ip(ip):
 @app.route('/api/mc/session', methods=['POST'])
 @auth_required
 def mc_register_session():
-    """Лаунчер сообщает, под каким игровым ником аккаунт собирается играть."""
     data = request.get_json(silent=True) or {}
     game_name = str(data.get('game_name', '')).strip()
     if not (3 <= len(game_name) <= 16) or not game_name.isascii() or not game_name.replace('_', '').isalnum():
@@ -780,7 +841,6 @@ def mc_register_session():
     return jsonify({"success": True})
 
 def _mc_access(db, name, ip):
-    """Единая проверка входа на сервер. Возвращает (разрешено, причина)."""
     with _mc_sessions_lock:
         sess = _mc_sessions.get(str(name).strip().lower())
     if not sess:
@@ -800,7 +860,6 @@ def _mc_access(db, name, ip):
 
 @app.route('/api/mc/check', methods=['POST'])
 def mc_check():
-    """Вызывается плагином MafinAuth при входе игрока на Minecraft-сервер."""
     if not MC_SECRET:
         return jsonify({"allowed": False, "reason": "disabled"}), 503
     given = request.headers.get('X-Mc-Secret', '')
@@ -1563,7 +1622,7 @@ tr:hover{background:#2d323c}
 <body>
 <header>
   <h1>🛡️ Mafin Launcher — Админ-панель</h1>
-  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/minecraft">🖥 Сервер</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
+  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/minecraft">🖥 Сервер</a> &nbsp;|&nbsp; <a href="/admin/shop">🛒 Магазин</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
 </header>
 <main>
   <div class="stats">
@@ -1850,10 +1909,6 @@ def web_admin_required(f):
     return decorated
 
 
-# ===== Minecraft-сервер (Paper) под управлением app.py =====
-# Всё лежит в папке MAFIN_MC_DIR (по умолчанию mcserver/ рядом с app.py).
-# Процесс запускается отдельной группой и переживает перезапуск app.py;
-# команды в консоль идут через именованный канал (только Linux).
 MC_DIR = os.path.abspath(os.environ.get("MAFIN_MC_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcserver")))
 MC_VERSION = os.environ.get("MAFIN_MC_VERSION", "26.2")
 MC_JAVA = os.environ.get("MAFIN_MC_JAVA", "java")
@@ -1880,7 +1935,6 @@ def _mc_find_jar():
     jars = [os.path.join(MC_DIR, n) for n in os.listdir(MC_DIR)
             if n.lower().startswith("paper") and n.lower().endswith(".jar")]
     if not jars:
-        # запасной вариант: в папке лежит ровно один .jar с version.json внутри
         for n in os.listdir(MC_DIR):
             p = os.path.join(MC_DIR, n)
             if n.lower().endswith(".jar") and _mc_jar_info(p)["id"]:
@@ -1889,7 +1943,6 @@ def _mc_find_jar():
 
 
 def _mc_jar_info(jar):
-    """Версия Minecraft и нужная Java из version.json внутри paper.jar."""
     try:
         with zipfile.ZipFile(jar) as z:
             data = json.loads(z.read("version.json").decode("utf-8"))
@@ -1909,7 +1962,6 @@ def _mc_java_major():
 
 
 def _mc_port():
-    """Порт, настроенный в server.properties (или MAFIN_MC_PORT по умолчанию)."""
     v = _mc_read_props().get("server-port", "")
     return int(v) if v.isdigit() and 1 <= int(v) <= 65535 else MC_PORT
 
@@ -1920,7 +1972,6 @@ def _mc_max_players():
 
 
 def _mc_run_port():
-    """Порт, на котором сервер был запущен (если он сейчас работает)."""
     if not _mc_pid():
         return None
     try:
@@ -1992,7 +2043,6 @@ def _mc_set_props(updates):
 
 
 def _mc_write_plugin_config():
-    """Кладёт настройки для плагина MafinAuth, чтобы не вписывать секрет руками."""
     if not MC_SECRET:
         return
     cfg_dir = _mc_path("plugins", "MafinAuth")
@@ -2004,7 +2054,6 @@ def _mc_write_plugin_config():
         f.write("timeout_ms: 5000\n")
 
 
-# ----- оперативная память сервера -----
 MC_MIN_MEMORY_MB = 512
 
 
@@ -2017,7 +2066,6 @@ def _mc_fmt_mb(mb):
 
 
 def _mc_parse_memory(amount, unit):
-    """Переводит введённое число и единицу (G или M) в мегабайты. Бросает ValueError с понятным текстом."""
     text = str(amount if amount is not None else "").strip().replace(",", ".")
     try:
         value = float(text)
@@ -2038,7 +2086,6 @@ def _mc_parse_memory(amount, unit):
 
 
 def _mc_system_ram_mb():
-    """Сколько оперативной памяти в системе (МБ) или None, если узнать не удалось."""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -2059,7 +2106,6 @@ def _mc_default_memory_mb():
 
 
 def _mc_get_memory_mb():
-    """Память, выбранная в панели (launcher_memory.json), иначе MAFIN_MC_MEMORY, иначе 4 ГБ."""
     try:
         with open(_mc_path("launcher_memory.json"), encoding="utf-8") as f:
             mb = json.load(f).get("memory_mb")
@@ -2082,7 +2128,6 @@ def _mc_save_memory(amount, unit):
 
 
 def _mc_pid():
-    """PID запущенного сервера или None."""
     global _mc_proc
     try:
         with open(_mc_path("server.pid")) as f:
@@ -2113,10 +2158,6 @@ def _mc_send(command):
         os.close(fd)
 
 
-# ----- вторая линия защиты: проверка при заходе игрока -----
-# Плагин MafinAuth проверяет игрока ещё до входа (AsyncPlayerPreLoginEvent). Если по какой-то причине
-# проверку удалось обойти (например, зашли через ViaVersion со старой версии), эта служба читает
-# консоль сервера, видит строку «Ник[/IP:порт] logged in», проверяет игрока тем же правилом и кикает.
 _MC_JOIN_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16})\[/([0-9A-Fa-f:.]+):\d+\] logged in with entity id")
 _MC_KICK_TEXT = {
     "not_logged_in": "Войди в Mafin Launcher и запусти игру из него.",
@@ -2128,7 +2169,6 @@ _mc_guard_started = False
 
 
 def _mc_guard_handle(name, ip):
-    """Проверяет зашедшего игрока и кикает, если ему нельзя. Возвращает причину кика или None."""
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     try:
@@ -2164,7 +2204,7 @@ def _mc_guard_loop():
             pos = None
             continue
         if pos is None or size < pos:
-            pos = size if pos is None else 0  # при первом чтении старое не разбираем
+            pos = size if pos is None else 0
             buf = b""
             if pos == size:
                 continue
@@ -2220,7 +2260,6 @@ def _mc_start():
         if total and mem_mb > total:
             raise RuntimeError(f"Выделено {_mc_fmt_mb(mem_mb)} памяти, а в системе всего {_mc_fmt_mb(total)}. Уменьши объём в настройках")
         port = _mc_port()
-        # Вход защищает MafinAuth (плюс проверка при заходе в app.py), поэтому online-mode всегда false
         _mc_set_props({"online-mode": "false", "server-port": str(port)})
         _mc_write_plugin_config()
         fifo = _mc_path("console.fifo")
@@ -2264,7 +2303,6 @@ def _mc_stop(timeout=45):
 
 
 def _mc_ping(host="127.0.0.1", port=None, timeout=1.5):
-    """Server List Ping: сервер уже принимает подключения? Сколько игроков?"""
     port = port or _mc_run_port() or _mc_port()
 
     def varint(n):
@@ -2387,7 +2425,6 @@ def _mc_download_paper(version):
     return f"Paper {version} build {data.get('id', '?')} ({data.get('channel', '?')}) скачан"
 
 
-# ----- название сервера и версии для игроков -----
 def _mc_branding():
     data = {"name": MC_NAME, "version_min": "", "version_max": ""}
     try:
@@ -2422,7 +2459,6 @@ def _mc_save_branding(name, vmin, vmax):
     return f"Сохранено: «{name}»" + (f", версии {vmin or '…'} – {vmax or '…'}" if (vmin or vmax) else "")
 
 
-# ----- плагины из Modrinth -----
 MODRINTH_API = os.environ.get("MAFIN_MODRINTH_API", "https://api.modrinth.com/v2").rstrip("/")
 _MODRINTH_OVERRIDDEN = "MAFIN_MODRINTH_API" in os.environ
 MC_PLUGIN_LOADERS = ["paper", "spigot", "bukkit", "folia", "purpur"]
@@ -2547,7 +2583,6 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
         new_name = _mc_plugin_yml_name(tmp)
         if new_name is None:
             raise _McPluginError("Это не плагин для Paper (внутри нет plugin.yml)")
-        # заменяем старые копии того же плагина (обновление или ручная установка)
         for old in _mc_list_plugins():
             if old["name"].lower() == new_name.lower() and old["file"] != filename:
                 if old["protected"]:
@@ -2565,7 +2600,6 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
     return messages
 
 
-# Плагин входа через лаунчер, собранный под Paper 26.2 (исходники в репозитории: mc-auth-plugin)
 MAFINAUTH_JAR_B64 = (
     "UEsDBAoAAAgAAGCARV0AAAAAAAAAAAAAAAAJAAQATUVUQS1JTkYv/soAAFBLAwQUAAgICABggEVdAAAAAAAAAAAAAAAAFAAA"
     "AE1FVEEtSU5GL01BTklGRVNULk1G803My0xLLS7RDUstKs7Mz7NSMNQz4OVyLkpNLElN0XWqtFIwMtUz0DPRM1TQcE3OySwo"
@@ -2666,7 +2700,6 @@ def _mc_delete_plugin(filename):
     return f"{filename} удалён. Перезапусти сервер, чтобы изменения вступили в силу"
 
 
-# ===== Миры и описание сервера (MOTD) =====
 MC_ZIP_MAX_ENTRIES = 60000
 MC_WORLD_MAX_BYTES = 8 * 1024 ** 3
 MC_RESERVED_WORLD_NAMES = {
@@ -2682,10 +2715,7 @@ def _mc_rm(path):
         pass
 
 
-# ----- безопасные пути и распаковка -----
 def _mc_safe_rel(rel, root):
-    """Нормализует путь из архива. Возвращает (чистый_путь, полный_путь) или None,
-    если путь пытается выйти за пределы папки."""
     raw = str(rel or "").replace("\\", "/")
     if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or "\x00" in raw:
         return None
@@ -2699,7 +2729,6 @@ def _mc_safe_rel(rel, root):
 
 
 def _mc_extract_zip(zf, prefix, dest_root, limit):
-    """Распаковывает записи с префиксом prefix в dest_root. Возвращает (список файлов, пропущено)."""
     written, total, skipped = [], 0, 0
     for info in zf.infolist():
         name = info.filename.replace("\\", "/")
@@ -2730,7 +2759,6 @@ def _mc_extract_zip(zf, prefix, dest_root, limit):
     return written, skipped
 
 
-# ----- миры -----
 def _mc_active_world():
     return _mc_read_props().get("level-name") or "world"
 
@@ -2769,7 +2797,6 @@ def _mc_world_delete(name):
 
 
 def _mc_world_import(zip_path, wanted_name, fallback_name):
-    """Ставит мир из zip-архива как отдельную папку (существующие миры не перезаписываются)."""
     stage = _mc_path(".world_stage")
     shutil.rmtree(stage, ignore_errors=True)
     try:
@@ -2809,7 +2836,6 @@ def _mc_world_import(zip_path, wanted_name, fallback_name):
         shutil.rmtree(stage, ignore_errors=True)
 
 
-# ----- описание сервера (MOTD) -----
 def _mc_props_unescape(s):
     def repl(m):
         t = m.group(1)
@@ -2841,7 +2867,6 @@ def _mc_props_escape(s):
 
 
 def _mc_get_motd():
-    """Описание для редактирования: цветовые коды показываются как &a, &6 и т.д."""
     raw = _mc_read_props().get("motd")
     return _mc_props_unescape(raw).replace("\u00a7", "&") if raw is not None else ""
 
@@ -2923,6 +2948,92 @@ def admin_minecraft_plugin_search():
         return jsonify({"success": True, "results": results})
     except _McPluginError as e:
         return jsonify({"success": False, "error": str(e)}), 502
+
+
+def _mc_system_stats():
+    stats = {"cpus": os.cpu_count()}
+    try:
+        stats["load"] = [round(x, 2) for x in os.getloadavg()]
+    except (OSError, AttributeError):
+        pass
+
+    def read_cpu():
+        with open("/proc/stat") as f:
+            return [int(x) for x in f.readline().split()[1:9]]
+    try:
+        a = read_cpu()
+        time.sleep(1)
+        b = read_cpu()
+        d = [y - x for x, y in zip(a, b)]
+        total = sum(d) or 1
+        stats["cpu_busy_pct"] = round(100 * (total - d[3] - d[4]) / total, 1)
+        stats["cpu_steal_pct"] = round(100 * d[7] / total, 1)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                mem[k] = int(v.split()[0])
+        stats["mem_available_mb"] = mem["MemAvailable"] // 1024
+        stats["mem_total_mb"] = mem["MemTotal"] // 1024
+    except (OSError, ValueError, KeyError):
+        pass
+    return stats
+
+
+def _mc_diagnose():
+    if not _mc_pid():
+        raise ValueError("Сервер не запущен")
+    log_path = _mc_path("logs", "latest.log")
+    try:
+        start = os.path.getsize(log_path)
+    except OSError:
+        start = 0
+    for cmd in ("tps", "mspt", "spark ping"):
+        _mc_send(cmd)
+        time.sleep(0.3)
+    system = _mc_system_stats()
+    time.sleep(1.5)
+    lines = []
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(start if start <= os.path.getsize(log_path) else 0)
+            text = f.read(60000).decode("utf-8", errors="replace")
+        for raw in text.splitlines():
+            line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw).strip()
+            if line:
+                lines.append(line)
+    except OSError:
+        pass
+    hints = []
+    steal = system.get("cpu_steal_pct")
+    if steal is not None and steal >= 5:
+        hints.append(f"Процессор «крадут» соседи по VDS ({steal}%): это даёт скачки пинга у всех сразу. Поможет другой тариф или хостинг.")
+    busy, cpus, load = system.get("cpu_busy_pct"), system.get("cpus") or 1, (system.get("load") or [0])[0]
+    if load > cpus:
+        hints.append(f"Load average ({load}) выше числа ядер ({cpus}): VDS перегружен.")
+    elif busy is not None and busy >= 85:
+        hints.append(f"Процессор занят на {busy}%.")
+    avail = system.get("mem_available_mb")
+    if avail is not None and avail < 1024:
+        hints.append(f"Свободно только {avail} МБ памяти: возможна подкачка, из-за неё сервер лагает.")
+    if not hints:
+        hints.append("Сам VDS выглядит нормально. Если TPS и MSPT ниже тоже в порядке, пинг у конкретных игроков чаще всего "
+                     "из-за маршрута до сервера (расстояние, провайдер).")
+    return {"system": system, "output": lines[-40:], "hints": hints}
+
+
+@app.route('/admin/minecraft/diagnose', methods=['GET'])
+@web_admin_required
+def admin_minecraft_diagnose():
+    try:
+        return jsonify({"success": True, **_mc_diagnose()})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except OSError as e:
+        return jsonify({"success": False, "error": f"Консоль сервера недоступна: {e}"}), 500
 
 
 @app.route('/admin/minecraft/log', methods=['GET'])
@@ -3179,6 +3290,8 @@ code{background:#14161a;padding:1px 5px;border-radius:4px}
     <button class="primary" onclick="act('plugin_install_builtin',{name:'mafinauth'})">🛡 MafinAuth (вход через лаунчер)</button>
     <button onclick="installPlugin('viaversion')">ViaVersion</button>
     <button onclick="installPlugin('viabackwards')">ViaBackwards</button>
+    <button onclick="installPlugin('luckperms')">LuckPerms</button>
+    <button onclick="installPlugin('skinsrestorer')">SkinsRestorer (скины)</button>
   </div>
   <div class="row">
     <button onclick="installVia()">🔀 Универсальный сервер: ViaVersion + ViaBackwards</button>
@@ -3210,6 +3323,14 @@ code{background:#14161a;padding:1px 5px;border-radius:4px}
     <label>Плагин MafinAuth (.jar) <input type="file" id="f_plugin" accept=".jar"></label>
     <button onclick="upload('plugin')">⬆ Загрузить плагин</button>
   </div>
+</section>
+<section>
+  <h2>Диагностика пинга</h2>
+  <div class="row">
+    <button onclick="diagnose()">🩺 Проверить сервер</button>
+  </div>
+  <p class="muted">Показывает нагрузку VDS, TPS и время тика (MSPT) сервера и пинг игроков. Занимает несколько секунд, сервер должен быть запущен.</p>
+  <pre id="diag" style="margin-top:10px;display:none"></pre>
 </section>
 <section>
   <h2>Консоль</h2>
@@ -3306,6 +3427,18 @@ document.addEventListener('click',function(e){
   const d=e.target.closest('button[data-wdel]');
   if(d&&confirm('Удалить мир «'+d.dataset.wdel+'» НАВСЕГДА? Это нельзя отменить.'))act('world_delete',{name:d.dataset.wdel});
 });
+async function diagnose(){
+  const box=document.getElementById('diag');box.style.display='block';box.textContent='Проверяю…';
+  let d={};
+  try{d=await (await fetch('/admin/minecraft/diagnose')).json()}catch(e){}
+  if(!d.success){box.textContent=d.error||'Ошибка';return}
+  const s=d.system||{};
+  const head=[
+    'VDS: ядер '+(s.cpus||'?')+', load '+((s.load||[]).join(' / ')||'?')+', занято '+(s.cpu_busy_pct!=null?s.cpu_busy_pct+'%':'?')+', украдено соседями '+(s.cpu_steal_pct!=null?s.cpu_steal_pct+'%':'?'),
+    'Память: свободно '+(s.mem_available_mb!=null?s.mem_available_mb+' МБ из '+s.mem_total_mb+' МБ':'?'),
+    '', 'Выводы:'].concat(d.hints.map(h=>' • '+h)).concat(['','Ответ сервера (tps, mspt, spark ping):']).concat(d.output.length?d.output:['(пусто, подожди пару секунд и повтори)']);
+  box.textContent=head.join(String.fromCharCode(10));
+}
 async function upload(kind){
   const inp=document.getElementById('f_'+kind);
   if(!inp.files.length){setMsg('Выбери файл .jar',false);return}
@@ -4689,6 +4822,594 @@ def _cli_set_password(nickname):
     db.close()
     print("Пароль изменён, старые токены лаунчера сброшены (нужно залогиниться заново).")
 
+SKIN_MAX_BYTES = 256 * 1024
+SKIN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+SKIN_KEY_PATH = os.environ.get("MAFIN_SKIN_KEY", os.path.join(BASE_DIR, "skin_signing_key.pem"))
+_skin_key_lock = threading.Lock()
+_skin_key_cache = {}
+
+
+def _skin_signing_key():
+    with _skin_key_lock:
+        if "key" in _skin_key_cache:
+            return _skin_key_cache["key"]
+        key = None
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            if os.path.isfile(SKIN_KEY_PATH):
+                with open(SKIN_KEY_PATH, "rb") as f:
+                    key = serialization.load_pem_private_key(f.read(), password=None)
+            else:
+                key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+                pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                        serialization.NoEncryption())
+                with open(SKIN_KEY_PATH, "wb") as f:
+                    f.write(pem)
+                try:
+                    os.chmod(SKIN_KEY_PATH, 0o600)
+                except OSError:
+                    pass
+        except Exception as e:
+            print(f"[skins] подпись текстур отключена ({e}). Установи: pip install cryptography")
+            key = None
+        _skin_key_cache["key"] = key
+        return key
+
+
+def _skin_public_pem():
+    key = _skin_signing_key()
+    if not key:
+        return None
+    from cryptography.hazmat.primitives import serialization
+    return key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode("ascii")
+
+
+def _skin_sign(value):
+    key = _skin_signing_key()
+    if not key:
+        return None
+    import base64
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    return base64.b64encode(key.sign(value.encode("ascii"), padding.PKCS1v15(), hashes.SHA1())).decode("ascii")
+
+
+def _skin_base_url():
+    return (os.environ.get("MAFIN_PUBLIC_URL") or request.host_url).rstrip("/")
+
+
+def _skin_png_ok(data):
+    if len(data) > SKIN_MAX_BYTES or len(data) < 70 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return False
+    w, h = struct.unpack(">II", data[16:24])
+    return (w, h) in ((64, 64), (64, 32))
+
+
+@app.route('/api/skin/upload', methods=['POST'])
+@auth_required
+def skin_upload():
+    import base64
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('game_name', '')).strip()
+    model = 'slim' if str(data.get('model', 'default')) == 'slim' else 'default'
+    if not SKIN_NAME_RE.fullmatch(name):
+        return jsonify({"error": "Некорректный игровой ник (3–16 символов: латиница, цифры, _)"}), 400
+    try:
+        png = base64.b64decode(str(data.get('png_b64', '')), validate=True)
+    except Exception:
+        return jsonify({"error": "Файл скина повреждён"}), 400
+    if not _skin_png_ok(png):
+        return jsonify({"error": "Скин должен быть PNG 64×64 или 64×32 (до 256 КБ)"}), 400
+
+    me = g.current_profile['nickname']
+    db = get_db()
+    row = db.execute("SELECT owner FROM skins WHERE game_name_lower = ?", (name.lower(),)).fetchone()
+    if row and row['owner'] != me:
+        return jsonify({"error": "Этот игровой ник уже занят скином другого аккаунта"}), 403
+    digest = hashlib.sha256(png + model.encode()).hexdigest()
+    db.execute(
+        "INSERT INTO skins (game_name_lower, game_name, uuid, owner, model, hash, png, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(game_name_lower) DO UPDATE SET game_name=excluded.game_name, model=excluded.model, "
+        "hash=excluded.hash, png=excluded.png, updated_at=excluded.updated_at",
+        (name.lower(), name, _offline_uuid(name), me, model, digest, png,
+         datetime.now(timezone.utc).isoformat(timespec="seconds")))
+    db.commit()
+    _skin_public_base["url"] = _skin_base_url()
+    return jsonify({"success": True, "hash": digest})
+
+
+_skin_public_base = {}
+_skin_pushed = {}
+
+
+def _skinsrestorer_installed():
+    return any("skinsrestorer" in p["name"].lower() for p in _mc_list_plugins())
+
+
+def _skin_push_pending():
+    """Передаёт загруженные скины плагину SkinsRestorer через консоль сервера (нужно для версий 1.20.2+)."""
+    base = _skin_public_base.get("url") or os.environ.get("MAFIN_PUBLIC_URL", "").rstrip("/")
+    if not base or not _mc_pid() or not _skinsrestorer_installed() or not _mc_ping():
+        return 0
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute("SELECT game_name, model, hash FROM skins").fetchall()
+    finally:
+        db.close()
+    done = 0
+    for r in rows:
+        name, h = r["game_name"], r["hash"]
+        if _skin_pushed.get(name) == h or not SKIN_NAME_RE.fullmatch(name) or not re.fullmatch(r"[0-9a-f]{64}", h):
+            continue
+        custom = f"mafin_{name}_{h[:8]}"
+        kind = "slim" if r["model"] == "slim" else "classic"
+        try:
+            _mc_send(f"sr createcustom {custom} {base}/yggdrasil/textures/{h} {kind}")
+            time.sleep(8)
+            _mc_send(f"sr setskin {name} {custom}")
+        except OSError as e:
+            print(f"[skins] консоль сервера недоступна: {e}")
+            return done
+        _skin_pushed[name] = h
+        done += 1
+        print(f"[skins] скин {name} передан в SkinsRestorer")
+    return done
+
+
+def _skin_push_loop():
+    while True:
+        time.sleep(30)
+        try:
+            _skin_push_pending()
+        except Exception as e:
+            print(f"[skins] ошибка передачи в SkinsRestorer: {e}")
+
+
+@app.route('/api/skin/delete', methods=['POST'])
+@auth_required
+def skin_delete():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('game_name', '')).strip().lower()
+    db = get_db()
+    db.execute("DELETE FROM skins WHERE game_name_lower = ? AND owner = ?",
+               (name, g.current_profile['nickname']))
+    db.commit()
+    return jsonify({"success": True})
+
+
+@app.route('/yggdrasil', methods=['GET'])
+@app.route('/yggdrasil/', methods=['GET'])
+def ygg_meta():
+    host = request.host.split(':')[0]
+    meta = {
+        "meta": {"serverName": "Mafin Skins", "implementationName": "mafin-skins",
+                 "implementationVersion": "1.0"},
+        "skinDomains": [host],
+    }
+    pem = _skin_public_pem()
+    if pem:
+        meta["signaturePublicKey"] = pem
+    return jsonify(meta)
+
+
+def _ygg_undashed(u):
+    return str(u).replace("-", "").lower()
+
+
+@app.route('/yggdrasil/sessionserver/session/minecraft/profile/<uid>', methods=['GET'])
+def ygg_profile(uid):
+    import base64
+    uid_nd = _ygg_undashed(uid)
+    if not re.fullmatch(r"[0-9a-f]{32}", uid_nd):
+        return "", 204
+    dashed = f"{uid_nd[:8]}-{uid_nd[8:12]}-{uid_nd[12:16]}-{uid_nd[16:20]}-{uid_nd[20:]}"
+    row = get_db().execute("SELECT game_name, model, hash FROM skins WHERE uuid = ?", (dashed,)).fetchone()
+    if not row:
+        return "", 204
+    skin = {"url": f"{_skin_base_url()}/yggdrasil/textures/{row['hash']}"}
+    if row['model'] == 'slim':
+        skin["metadata"] = {"model": "slim"}
+    payload = {"timestamp": int(time.time() * 1000), "profileId": uid_nd,
+               "profileName": row['game_name'], "textures": {"SKIN": skin}}
+    value = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
+    prop = {"name": "textures", "value": value}
+    if request.args.get("unsigned", "true").lower() == "false":
+        sig = _skin_sign(value)
+        if sig:
+            prop["signature"] = sig
+        else:
+            print("[skins] клиент просит подписанные текстуры, а подписать нечем: pip install cryptography")
+    print(f"[skins] профиль {row['game_name']} отдан клиенту ({request.remote_addr})")
+    return jsonify({"id": uid_nd, "name": row['game_name'], "properties": [prop]})
+
+
+@app.route('/yggdrasil/api/profiles/minecraft', methods=['POST'])
+def ygg_profiles_by_name():
+    names = request.get_json(silent=True)
+    if not isinstance(names, list):
+        return jsonify([])
+    out = []
+    db = get_db()
+    for n in names[:100]:
+        row = db.execute("SELECT game_name, uuid FROM skins WHERE game_name_lower = ?",
+                         (str(n).lower(),)).fetchone()
+        if row:
+            out.append({"id": _ygg_undashed(row['uuid']), "name": row['game_name']})
+    return jsonify(out)
+
+
+@app.route('/yggdrasil/textures/<texture_hash>', methods=['GET'])
+def ygg_texture(texture_hash):
+    if not re.fullmatch(r"[0-9a-f]{64}", texture_hash):
+        return "", 404
+    row = get_db().execute("SELECT png FROM skins WHERE hash = ?", (texture_hash,)).fetchone()
+    if not row:
+        return "", 404
+    resp = app.response_class(bytes(row['png']), mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
+SHOP_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+SHOP_GROUP_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
+_shop_lock = threading.Lock()
+
+
+def _offline_uuid(name):
+    import uuid
+    return str(uuid.UUID(bytes=hashlib.md5(("OfflinePlayer:" + name).encode("utf-8")).digest(), version=3))
+
+
+def _shop_command(purchase):
+    name, group = str(purchase["game_name"]), str(purchase["group_name"])
+    days = int(purchase["duration_days"])
+    if not SHOP_NAME_RE.fullmatch(name) or not SHOP_GROUP_RE.fullmatch(group) or not 0 <= days <= 3650:
+        raise ValueError("некорректные данные покупки")
+    uid = _offline_uuid(name)
+    if days > 0:
+        return f"lp user {uid} parent addtemp {group} {days}d accumulate"
+    return f"lp user {uid} parent add {group}"
+
+
+def _shop_luckperms_installed():
+    return any(p["name"].lower() == "luckperms" for p in _mc_list_plugins())
+
+
+def _shop_apply_pending():
+    with _shop_lock:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        try:
+            rows = db.execute("SELECT * FROM shop_purchases WHERE status = 'pending' ORDER BY id LIMIT 50").fetchall()
+            if not rows or not _mc_pid():
+                return 0
+            if not _shop_luckperms_installed():
+                db.execute("UPDATE shop_purchases SET error = ? WHERE status = 'pending'",
+                           ("LuckPerms не установлен на сервере",))
+                db.commit()
+                return 0
+            if not _mc_ping():
+                return 0
+            done = 0
+            for r in rows:
+                try:
+                    _mc_send(_shop_command(r))
+                except ValueError as e:
+                    db.execute("UPDATE shop_purchases SET status = 'failed', error = ? WHERE id = ?", (str(e), r["id"]))
+                    continue
+                except OSError as e:
+                    db.execute("UPDATE shop_purchases SET error = ? WHERE id = ?", (f"консоль недоступна: {e}", r["id"]))
+                    break
+                db.execute("UPDATE shop_purchases SET status = 'applied', error = NULL, applied_at = ? WHERE id = ?",
+                           (datetime.now(timezone.utc).isoformat(timespec="seconds"), r["id"]))
+                done += 1
+                time.sleep(0.2)
+            db.commit()
+            return done
+        finally:
+            db.close()
+
+
+def _shop_loop():
+    while True:
+        time.sleep(20)
+        try:
+            _shop_apply_pending()
+        except Exception as e:
+            print(f"[shop] ошибка выдачи: {e}")
+
+
+def _shop_start():
+    threading.Thread(target=_shop_loop, daemon=True).start()
+
+
+@app.route('/api/shop/items', methods=['GET'])
+@auth_required
+def shop_items():
+    db = get_db()
+    items = db.execute(
+        "SELECT id, title, description, duration_days, price FROM shop_items WHERE enabled = 1 "
+        "ORDER BY sort_order, id").fetchall()
+    mine = db.execute(
+        "SELECT item_title, game_name, price, duration_days, status, created_at FROM shop_purchases "
+        "WHERE nickname = ? ORDER BY id DESC LIMIT 10", (g.current_profile['nickname'],)).fetchall()
+    return jsonify({"success": True, "coins": g.current_profile['coins'],
+                    "items": [dict(r) for r in items], "purchases": [dict(r) for r in mine]})
+
+
+@app.route('/api/shop/buy', methods=['POST'])
+@auth_required
+def shop_buy():
+    data = request.get_json(silent=True) or {}
+    try:
+        item_id = int(data.get('item_id'))
+    except (TypeError, ValueError):
+        return jsonify({"error": "item_id обязателен"}), 400
+    game_name = str(data.get('game_name', '')).strip()
+    if not SHOP_NAME_RE.fullmatch(game_name):
+        return jsonify({"error": "Игровой ник: 3–16 символов, латиница, цифры и _"}), 400
+
+    db = get_db()
+    item = db.execute("SELECT * FROM shop_items WHERE id = ? AND enabled = 1", (item_id,)).fetchone()
+    if not item:
+        return jsonify({"error": "Товар не найден или снят с продажи"}), 404
+    price = float(item['price'])
+    cur = db.execute(
+        "UPDATE profiles SET coins = coins - ? WHERE id = ? AND coins >= ?",
+        (price, g.current_profile['id'], price))
+    if cur.rowcount == 0:
+        db.rollback()
+        return jsonify({"error": "Недостаточно монет"}), 402
+    me = g.current_profile['nickname']
+    purchase_id = db.execute(
+        "INSERT INTO shop_purchases (nickname, game_name, item_id, item_title, group_name, duration_days, price) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (me, game_name, item['id'], item['title'], item['group_name'], item['duration_days'], price)).lastrowid
+    db.commit()
+    log_action("shop_buy", me, f"{item['title']} -> {game_name} (-{price:g} монет)")
+    try:
+        _shop_apply_pending()
+    except Exception as e:
+        print(f"[shop] выдача при покупке не удалась: {e}")
+    status = db.execute("SELECT status FROM shop_purchases WHERE id = ?", (purchase_id,)).fetchone()['status']
+    coins = db.execute("SELECT coins FROM profiles WHERE id = ?", (g.current_profile['id'],)).fetchone()['coins']
+    return jsonify({"success": True, "total_coins": coins, "status": status, "purchase_id": purchase_id})
+
+
+@app.route('/admin/shop', methods=['GET'])
+@web_admin_required
+def admin_shop_page():
+    return render_template_string(SHOP_ADMIN_TEMPLATE)
+
+
+@app.route('/admin/shop/data', methods=['GET'])
+@web_admin_required
+def admin_shop_data():
+    db = get_db()
+    items = db.execute("SELECT * FROM shop_items ORDER BY sort_order, id").fetchall()
+    purchases = db.execute("SELECT * FROM shop_purchases ORDER BY id DESC LIMIT 60").fetchall()
+    return jsonify({"items": [dict(r) for r in items], "purchases": [dict(r) for r in purchases],
+                    "luckperms": _shop_luckperms_installed(), "server_running": bool(_mc_pid())})
+
+
+@app.route('/admin/shop/<action>', methods=['POST'])
+@web_admin_required
+def admin_shop_action(action):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Ожидается JSON"}), 400
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    admin = g.web_admin['nickname']
+
+    def fail(msg, code=400):
+        return jsonify({"success": False, "error": msg}), code
+
+    if action == "item_save":
+        title = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("title", ""))).strip()
+        desc = re.sub(r"[\x00-\x1f\x7f]", " ", str(data.get("description", ""))).strip()
+        group = str(data.get("group_name", "")).strip()
+        try:
+            days = int(data.get("duration_days", 0))
+            price = float(data.get("price"))
+            order = int(data.get("sort_order", 0))
+        except (TypeError, ValueError):
+            return fail("Срок, цена и порядок должны быть числами")
+        if not 1 <= len(title) <= 40:
+            return fail("Название: от 1 до 40 символов")
+        if len(desc) > 200:
+            return fail("Описание: не больше 200 символов")
+        if not SHOP_GROUP_RE.fullmatch(group):
+            return fail("Группа LuckPerms: латиница, цифры, _ . - (до 32 символов)")
+        if not 0 <= days <= 3650:
+            return fail("Срок: от 0 (навсегда) до 3650 дней")
+        if not 0 < price <= 1000000:
+            return fail("Цена должна быть больше 0")
+        enabled = 1 if data.get("enabled", True) else 0
+        item_id = data.get("id")
+        if item_id:
+            cur = db.execute(
+                "UPDATE shop_items SET title=?, description=?, group_name=?, duration_days=?, price=?, enabled=?, sort_order=? WHERE id=?",
+                (title, desc, group, days, price, enabled, order, int(item_id)))
+            if cur.rowcount == 0:
+                return fail("Товар не найден", 404)
+        else:
+            db.execute(
+                "INSERT INTO shop_items (title, description, group_name, duration_days, price, enabled, sort_order) VALUES (?,?,?,?,?,?,?)",
+                (title, desc, group, days, price, enabled, order))
+        db.commit()
+        log_action("shop_item_save", admin, f"{title} ({group}, {days} дн., {price:g})")
+        return jsonify({"success": True, "message": f"Товар «{title}» сохранён"})
+
+    if action == "item_delete":
+        try:
+            item_id = int(data.get("id"))
+        except (TypeError, ValueError):
+            return fail("id обязателен")
+        db.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+        db.commit()
+        log_action("shop_item_delete", admin, str(item_id))
+        return jsonify({"success": True, "message": "Товар удалён"})
+
+    if action in ("purchase_retry", "purchase_refund"):
+        try:
+            pid = int(data.get("id"))
+        except (TypeError, ValueError):
+            return fail("id обязателен")
+        row = db.execute("SELECT * FROM shop_purchases WHERE id = ?", (pid,)).fetchone()
+        if not row:
+            return fail("Покупка не найдена", 404)
+        if action == "purchase_retry":
+            if row["status"] not in ("failed", "applied"):
+                return fail("Повторить можно выданную или неудавшуюся покупку")
+            db.execute("UPDATE shop_purchases SET status = 'pending', error = NULL WHERE id = ?", (pid,))
+            db.commit()
+            applied = _shop_apply_pending()
+            return jsonify({"success": True, "message": "Выдача отправлена" if applied else
+                            "Поставлено в очередь: выдача пройдёт, когда сервер запущен и LuckPerms загружен"})
+        if row["status"] not in ("pending", "failed"):
+            return fail("Вернуть монеты можно только за невыданную покупку")
+        with _shop_lock:
+            cur = db.execute("UPDATE shop_purchases SET status = 'refunded' WHERE id = ? AND status IN ('pending','failed')", (pid,))
+            if cur.rowcount:
+                db.execute("UPDATE profiles SET coins = coins + ? WHERE nickname = ?", (row["price"], row["nickname"]))
+            db.commit()
+        if not cur.rowcount:
+            return fail("Покупка уже обработана")
+        log_action("shop_refund", admin, f"{row['nickname']}: +{row['price']:g} монет")
+        return jsonify({"success": True, "message": f"Возвращено {row['price']:g} монет игроку {row['nickname']}"})
+
+    return fail("Неизвестное действие", 404)
+
+
+SHOP_ADMIN_TEMPLATE = """
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Mafin Launcher — Магазин привилегий</title>
+<style>
+* {box-sizing:border-box}
+body{background:#1a1d23;color:#e1e4e8;font-family:'Segoe UI',Arial,sans-serif;margin:0}
+header{background:#242830;padding:16px 28px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2d323c}
+header h1{font-size:18px;margin:0;color:#43b581}
+header a{color:#7a8599;text-decoration:none;font-size:13px;margin-left:14px}
+header a:hover{color:#fff}
+main{padding:24px 28px;max-width:1100px;margin:0 auto}
+section{background:#242830;border-radius:10px;padding:20px;margin-bottom:20px}
+section h2{margin-top:0;font-size:15px;color:#43b581}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px}
+label{font-size:12px;color:#7a8599;display:flex;flex-direction:column;gap:4px}
+input[type=text],input[type=number]{padding:8px;border-radius:6px;border:1px solid #2d323c;background:#2d323c;color:#fff;font-size:13px}
+button{background:#2d323c;color:#e1e4e8;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{background:#3a3f4a}
+button.primary{background:#43b581;color:#fff;font-weight:bold}
+button.danger:hover{background:#f04747}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #2d323c}
+th{color:#7a8599;font-weight:normal;font-size:12px}
+.ok{color:#43b581}.bad{color:#f04747}.warn{color:#faa61a}.muted{color:#7a8599;font-size:12px}
+#msg{margin-top:12px;font-size:13px;min-height:18px}
+</style></head>
+<body>
+<header><h1>🛒 Магазин привилегий</h1>
+<div><a href="/admin/minecraft">🖥 Сервер</a><a href="/admin/dashboard">← Панель</a><a href="/admin/logout">Выйти</a></div></header>
+<main>
+<section>
+  <h2>Состояние</h2>
+  <div id="state" class="muted">Загрузка…</div>
+  <p class="muted">Покупка списывает монеты и выдаёт группу командой LuckPerms через консоль сервера. Если сервер выключен, выдача ждёт его запуска. Группа должна уже существовать в LuckPerms (<code>/lp creategroup имя</code>).</p>
+  <div id="msg"></div>
+</section>
+<section>
+  <h2 id="formTitle">Новый товар</h2>
+  <div class="row">
+    <label>Название<input type="text" id="f_title" maxlength="40" style="width:200px"></label>
+    <label>Группа LuckPerms<input type="text" id="f_group" maxlength="32" style="width:150px" placeholder="vip"></label>
+    <label>Срок, дней (0 = навсегда)<input type="number" id="f_days" value="30" min="0" max="3650" style="width:130px"></label>
+    <label>Цена, монет<input type="number" id="f_price" value="100" min="0" step="any" style="width:100px"></label>
+    <label>Порядок<input type="number" id="f_order" value="0" style="width:70px"></label>
+    <label style="flex-direction:row;align-items:center;gap:6px;padding-bottom:8px"><input type="checkbox" id="f_enabled" checked> в продаже</label>
+  </div>
+  <div class="row">
+    <label style="flex:1">Описание (что получает игрок)<input type="text" id="f_desc" maxlength="200" style="width:100%"></label>
+    <button class="primary" onclick="saveItem()">💾 Сохранить</button>
+    <button onclick="resetForm()">Очистить</button>
+  </div>
+</section>
+<section>
+  <h2>Товары</h2>
+  <table><thead><tr><th>Название</th><th>Группа</th><th>Срок</th><th>Цена</th><th>Статус</th><th></th></tr></thead>
+  <tbody id="items"></tbody></table>
+</section>
+<section>
+  <h2>Последние покупки</h2>
+  <table><thead><tr><th>Когда</th><th>Аккаунт</th><th>Игрок</th><th>Товар</th><th>Цена</th><th>Статус</th><th></th></tr></thead>
+  <tbody id="purchases"></tbody></table>
+</section>
+</main>
+<script>
+let editId=null,itemsById={};
+function esc(t){const d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML}
+function esc2(t){return esc(t).split('"').join('&quot;')}
+function val(id){return document.getElementById(id).value.trim()}
+function setMsg(t,ok){const m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'bad'}
+async function call(action,body){
+  const r=await fetch('/admin/shop/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  let d={};try{d=await r.json()}catch(e){}
+  return d;
+}
+async function act(action,body){
+  const d=await call(action,body);
+  setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);
+  load();
+  return d;
+}
+function resetForm(){
+  editId=null;document.getElementById('formTitle').textContent='Новый товар';
+  ['f_title','f_group','f_desc'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('f_days').value=30;document.getElementById('f_price').value=100;
+  document.getElementById('f_order').value=0;document.getElementById('f_enabled').checked=true;
+}
+function saveItem(){
+  act('item_save',{id:editId,title:val('f_title'),group_name:val('f_group'),duration_days:val('f_days'),
+    price:val('f_price'),sort_order:val('f_order'),description:val('f_desc'),enabled:document.getElementById('f_enabled').checked})
+  .then(d=>{if(d.success)resetForm()});
+}
+function editItem(id){
+  const it=itemsById[id];if(!it)return;
+  editId=id;document.getElementById('formTitle').textContent='Изменить товар';
+  document.getElementById('f_title').value=it.title;document.getElementById('f_group').value=it.group_name;
+  document.getElementById('f_days').value=it.duration_days;document.getElementById('f_price').value=it.price;
+  document.getElementById('f_order').value=it.sort_order;document.getElementById('f_desc').value=it.description||'';
+  document.getElementById('f_enabled').checked=!!it.enabled;window.scrollTo(0,0);
+}
+const ST={pending:'<span class="warn">⏳ ждёт выдачи</span>',applied:'<span class="ok">✅ выдано</span>',failed:'<span class="bad">❌ ошибка</span>',refunded:'<span class="muted">↩ возврат</span>'};
+function dur(d){return d>0?d+' дн.':'навсегда'}
+async function load(){
+  let d={};try{d=await (await fetch('/admin/shop/data')).json()}catch(e){return}
+  document.getElementById('state').innerHTML='Сервер: '+(d.server_running?'<span class="ok">запущен</span>':'<span class="warn">остановлен</span>')+' · LuckPerms: '+(d.luckperms?'<span class="ok">установлен</span>':'<span class="bad">не установлен (поставь на странице сервера)</span>');
+  itemsById={};
+  document.getElementById('items').innerHTML=d.items.map(it=>{itemsById[it.id]=it;
+    return '<tr><td>'+esc(it.title)+'<div class="muted">'+esc(it.description)+'</div></td><td><code>'+esc(it.group_name)+'</code></td><td>'+dur(it.duration_days)+'</td><td>'+esc(it.price)+' 🪙</td><td>'+(it.enabled?'<span class="ok">в продаже</span>':'<span class="muted">скрыт</span>')+'</td><td><button data-edit="'+it.id+'">Изменить</button> <button class="danger" data-delitem="'+it.id+'">Удалить</button></td></tr>'}).join('')||'<tr><td colspan="6" class="muted">Товаров пока нет</td></tr>';
+  document.getElementById('purchases').innerHTML=d.purchases.map(p=>
+    '<tr><td class="muted">'+esc((p.created_at||'').replace('T',' ').slice(0,16))+'</td><td>'+esc(p.nickname)+'</td><td>'+esc(p.game_name)+'</td><td>'+esc(p.item_title)+' <span class="muted">('+dur(p.duration_days)+')</span></td><td>'+esc(p.price)+'</td><td>'+(ST[p.status]||esc(p.status))+(p.error?'<div class="muted">'+esc(p.error)+'</div>':'')+'</td><td>'+
+    (p.status==='failed'||p.status==='applied'?'<button data-retry="'+p.id+'">Выдать ещё раз</button> ':'')+(p.status==='pending'||p.status==='failed'?'<button class="danger" data-refund="'+p.id+'">Вернуть монеты</button>':'')+'</td></tr>').join('')||'<tr><td colspan="7" class="muted">Покупок пока нет</td></tr>';
+}
+document.addEventListener('click',function(e){
+  const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.edit)editItem(Number(b.dataset.edit));
+  else if(b.dataset.delitem){if(confirm('Удалить товар? Прошлые покупки останутся.'))act('item_delete',{id:Number(b.dataset.delitem)})}
+  else if(b.dataset.retry)act('purchase_retry',{id:Number(b.dataset.retry)});
+  else if(b.dataset.refund){if(confirm('Вернуть монеты игроку?'))act('purchase_refund',{id:Number(b.dataset.refund)})}
+});
+load();setInterval(load,6000);
+</script>
+</body></html>
+"""
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == "set-password":
         _cli_set_password(sys.argv[2])
@@ -4698,6 +5419,8 @@ if __name__ == '__main__':
         sys.exit(0)
     init_db()
     _mc_guard_start()
+    _shop_start()
+    threading.Thread(target=_skin_push_loop, daemon=True).start()
     if os.environ.get("MAFIN_MC_AUTOSTART") == "1":
         try:
             print("[mc]", _mc_start())
