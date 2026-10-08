@@ -1,5 +1,5 @@
 #define MyAppName "Mafin Launcher"
-#define MyAppVersion "1.8.1"
+#define MyAppVersion "1.8.2"
 #define MyAppPublisher "Maksim Mafin"
 #define MyAppExeName "MafinLauncher.exe"
 #define JavaInstallerURL "https://api.adoptium.net/v3/installer/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse"
