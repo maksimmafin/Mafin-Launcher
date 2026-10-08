@@ -243,7 +243,7 @@ def play_achievement_sound():
 DISCORD_CLIENT_ID = "1548297015220371496"
 
 # Адрес сервера лаунчера. Задай через переменную окружения MAFIN_SERVER_URL
-SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://127.0.0.1:2062")
+SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http:/127.0.0.1:3096")
 
 AUTHLIB_INJECTOR_LATEST = "https://authlib-injector.yushi.moe/artifact/latest.json"
 AUTHLIB_INJECTOR_FALLBACK = ("https://github.com/yushijinhun/authlib-injector/releases/download/"
@@ -959,9 +959,18 @@ class ServerAPI:
             self.is_admin = bool(data.get("is_admin"))
             self.coins = data.get("coins", 0)
             self.playtime = data.get("total_playtime_minutes", 0)
-            return True, data
+            return True, data, False
+        rejected = status in (401, 403)
+        if rejected:
+            self.token = None
+        return False, data, rejected
+
+    def drop_local_session(self):
         self.token = None
-        return False, data
+        self.nickname = None
+        self.is_admin = False
+        self.coins = 0
+        self.playtime = 0
 
     def logout(self):
         if self.token:
@@ -9014,12 +9023,25 @@ class LauncherApp:
             return self.api.login_with_token(token)
 
         def done(result, error):
-            if error or not result or not result[0]:
-                self.api.logout()
+            if not error and result and result[0]:
+                self._session_restore_attempts = 0
+                self._on_server_login_success(persist=False)
+                return
+            rejected = bool(result and len(result) > 2 and result[2])
+            if rejected:
+                # Сервер сам сказал «токен недействителен/истёк» — тогда и только тогда чистим.
+                self.api.drop_local_session()
                 self.config["server_token"] = ""
                 save_json_file(CONFIG_FILE, self.config)
+                self.server_status_var.set("Сессия истекла — войдите заново")
                 return
-            self._on_server_login_success(persist=False)
+            # Сеть/сервер недоступны: токен сохраняем и пробуем позже.
+            self.api.token = None
+            self.server_status_var.set("⏳ Сервер недоступен, повторю попытку...")
+            n = getattr(self, "_session_restore_attempts", 0) + 1
+            self._session_restore_attempts = n
+            if n <= 20:
+                self.root.after(min(15000 * n, 120000), self._try_restore_server_session)
 
         self._async(work, done)
 
@@ -10241,9 +10263,21 @@ class LauncherApp:
 
     def _send_heartbeat(self):
         try:
-            self.api.heartbeat()
+            status, _data = self.api.heartbeat()
         except Exception:
-            pass
+            return
+        if status == 401:
+            def expired():
+                self._stop_heartbeat_loop()
+                self.api.drop_local_session()
+                self.config["server_token"] = ""
+                save_json_file(CONFIG_FILE, self.config)
+                self.server_status_var.set("Сессия истекла — войдите заново")
+                self.account_info_label.config(text="Вы не авторизованы на сервере.")
+            try:
+                self.root.after(0, expired)
+            except RuntimeError:
+                pass
 
     def build_admin_tab(self, frame):
         top_bar = ttk.Frame(frame)
