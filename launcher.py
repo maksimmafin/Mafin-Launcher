@@ -243,7 +243,7 @@ def play_achievement_sound():
 DISCORD_CLIENT_ID = "1548297015220371496"
 
 # Адрес сервера лаунчера. Задай через переменную окружения MAFIN_SERVER_URL
-SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://178.254.177.109:10074")
+SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://127.0.0.1:3096")
 
 AUTHLIB_INJECTOR_LATEST = "https://authlib-injector.yushi.moe/artifact/latest.json"
 AUTHLIB_INJECTOR_FALLBACK = ("https://github.com/yushijinhun/authlib-injector/releases/download/"
