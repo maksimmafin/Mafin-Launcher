@@ -47,7 +47,6 @@ def _load_secret_key():
 SECRET_KEY = _load_secret_key()
 
 ADMIN_SESSION_DAYS = 30
-LAUNCHER_SESSION_DAYS = 7  # сколько живёт сессия лаунчера (скользящее окно)
 ADMIN_CODE_TTL_SECONDS = 300
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
@@ -290,6 +289,56 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             applied_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token TEXT PRIMARY KEY,
+            nickname TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_nick ON auth_sessions(nickname);
+        -- сброс токена (бан, смена пароля, «сбросить сессию» в админке) и удаление профиля закрывают все сессии
+        CREATE TRIGGER IF NOT EXISTS trg_auth_sessions_reset AFTER UPDATE OF token ON profiles
+        WHEN NEW.token IS NULL
+        BEGIN DELETE FROM auth_sessions WHERE nickname = OLD.nickname; END;
+        CREATE TRIGGER IF NOT EXISTS trg_auth_sessions_del AFTER DELETE ON profiles
+        BEGIN DELETE FROM auth_sessions WHERE nickname = OLD.nickname; END;
+
+        CREATE TABLE IF NOT EXISTS cosmetics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            material TEXT NOT NULL DEFAULT 'CARVED_PUMPKIN',
+            texture TEXT DEFAULT '',
+            scale REAL NOT NULL DEFAULT 0.7,
+            y_offset REAL NOT NULL DEFAULT 0,
+            price REAL NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS cosmetic_owned (
+            nickname TEXT NOT NULL,
+            cosmetic_id INTEGER NOT NULL,
+            price_paid REAL NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (nickname, cosmetic_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS cosmetic_equipped (
+            nickname TEXT PRIMARY KEY,
+            cosmetic_id INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS weekly_awards (
+            week_start TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            nickname TEXT NOT NULL,
+            minutes REAL NOT NULL,
+            coins REAL NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (week_start, rank)
+        );
     """)
     
     existing_cols = [row[1] for row in db.execute("PRAGMA table_info(profiles)").fetchall()]
@@ -301,9 +350,6 @@ def init_db():
         db.commit()
     if "gifts_visible" not in existing_cols:
         db.execute("ALTER TABLE profiles ADD COLUMN gifts_visible INTEGER DEFAULT 1")
-        db.commit()
-    if "token_expires_at" not in existing_cols:
-        db.execute("ALTER TABLE profiles ADD COLUMN token_expires_at INTEGER")
         db.commit()
 
     existing_gift_cols = [row[1] for row in db.execute("PRAGMA table_info(gifts)").fetchall()]
@@ -376,9 +422,6 @@ def verify_password(password, salt, stored_hash):
 
 def generate_token():
     return secrets.token_hex(32)
-
-def new_token_expiry():
-    return int(time.time()) + LAUNCHER_SESSION_DAYS * 86400
 
 def yekb_input_to_system_naive(dt_str):
     if not dt_str:
@@ -469,6 +512,25 @@ def log_action(action, nickname=None, details=None):
     except Exception as e:
         print(f"Ошибка логирования: {e}")
 
+def _profile_by_token(db, token):
+    """Профиль по токену: сначала таблица сессий (несколько устройств), затем старый profiles.token."""
+    if not token:
+        return None
+    row = db.execute(
+        "SELECT p.* FROM auth_sessions s JOIN profiles p ON p.nickname = s.nickname WHERE s.token = ?",
+        (token,)).fetchone()
+    if row:
+        return row
+    return db.execute("SELECT * FROM profiles WHERE token = ?", (token,)).fetchone()
+
+def _add_session(db, nickname, token):
+    db.execute("INSERT OR REPLACE INTO auth_sessions (token, nickname) VALUES (?, ?)", (token, nickname))
+    # не больше 10 одновременных сессий на аккаунт
+    db.execute(
+        "DELETE FROM auth_sessions WHERE nickname = ? AND token NOT IN "
+        "(SELECT token FROM auth_sessions WHERE nickname = ? ORDER BY created_at DESC, rowid DESC LIMIT 10)",
+        (nickname, nickname))
+
 def auth_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -477,26 +539,13 @@ def auth_required(f):
             return jsonify({"error": "Требуется авторизация"}), 401
         
         db = get_db()
-        profile = db.execute("SELECT * FROM profiles WHERE token = ?", (token,)).fetchone()
+        profile = _profile_by_token(db, token)
         
         if not profile:
             return jsonify({"error": "Недействительный токен"}), 401
-
-        now_ts = int(time.time())
-        expires_at = profile['token_expires_at']
-        if expires_at is not None and expires_at < now_ts:
-            db.execute("UPDATE profiles SET token = NULL, token_expires_at = NULL WHERE id = ?", (profile['id'],))
-            db.commit()
-            return jsonify({"error": "Сессия истекла, войдите заново", "code": "session_expired"}), 401
         
         if profile['is_banned']:
             return jsonify({"error": f"Профиль заблокирован: {profile['ban_reason']}"}), 403
-
-        # Скользящее окно: продлеваем до 7 дней, но пишем в БД не чаще раза в час.
-        # Старые токены без срока получают его при первом же запросе.
-        if expires_at is None or expires_at - now_ts < LAUNCHER_SESSION_DAYS * 86400 - 3600:
-            db.execute("UPDATE profiles SET token_expires_at = ? WHERE id = ?", (new_token_expiry(), profile['id']))
-            db.commit()
         
         g.current_profile = dict(profile)
         touch_last_seen(db, profile['nickname'])
@@ -548,9 +597,10 @@ def register():
     token = generate_token()
     
     db.execute(
-        "INSERT INTO profiles (nickname, password_hash, salt, token, token_expires_at, last_login) VALUES (?, ?, ?, ?, ?, ?)",
-        (nickname, password_hash, salt, token, new_token_expiry(), datetime.now().isoformat())
+        "INSERT INTO profiles (nickname, password_hash, salt, token, last_login) VALUES (?, ?, ?, ?, ?)",
+        (nickname, password_hash, salt, token, datetime.now().isoformat())
     )
+    _add_session(db, nickname, token)
     db.commit()
     
     log_action("register", nickname)
@@ -617,25 +667,20 @@ def login():
 
     _clear_login_failures(nickname)
 
-    now_ts = int(time.time())
-    old_exp = profile['token_expires_at']
-    if profile['token'] and (old_exp is None or old_exp >= now_ts):
-        token = profile['token']
-    else:
-        token = generate_token()
-    expires_at = new_token_expiry()
+    token = generate_token()
     now_iso = datetime.now().isoformat()
     if needs_upgrade:
         new_hash = hash_password(password, profile['salt'])
         db.execute(
-            "UPDATE profiles SET token = ?, token_expires_at = ?, last_login = ?, last_seen = ?, password_hash = ? WHERE id = ?",
-            (token, expires_at, now_iso, now_iso, new_hash, profile['id'])
+            "UPDATE profiles SET token = ?, last_login = ?, last_seen = ?, password_hash = ? WHERE id = ?",
+            (token, now_iso, now_iso, new_hash, profile['id'])
         )
     else:
         db.execute(
-            "UPDATE profiles SET token = ?, token_expires_at = ?, last_login = ?, last_seen = ? WHERE id = ?",
-            (token, expires_at, now_iso, now_iso, profile['id'])
+            "UPDATE profiles SET token = ?, last_login = ?, last_seen = ? WHERE id = ?",
+            (token, now_iso, now_iso, profile['id'])
         )
+    _add_session(db, profile['nickname'], token)
     db.commit()
     
     log_action("login", nickname)
@@ -671,7 +716,7 @@ def get_profile(nickname):
     token = request.headers.get('Authorization', '').replace('Bearer ', '')
     viewer = None
     if token:
-        viewer_row = db.execute("SELECT nickname FROM profiles WHERE token = ?", (token,)).fetchone()
+        viewer_row = _profile_by_token(db, token)
         if viewer_row:
             viewer = viewer_row["nickname"]
     if viewer and viewer != nickname:
@@ -770,9 +815,16 @@ def get_me():
 def logout():
     db = get_db()
     nickname = g.current_profile['nickname']
+    cur_token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    # закрываем только текущую сессию: вход/выход в кабинете не должен выкидывать лаунчер и наоборот
+    db.execute("DELETE FROM auth_sessions WHERE token = ?", (cur_token,))
+    remaining = db.execute(
+        "SELECT token FROM auth_sessions WHERE nickname = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (nickname,)).fetchone()
     db.execute(
-        "UPDATE profiles SET token = NULL, last_seen = NULL WHERE id = ?",
-        (g.current_profile['id'],)
+        "UPDATE profiles SET token = ?, last_seen = CASE WHEN ? IS NULL THEN NULL ELSE last_seen END WHERE id = ?",
+        (remaining['token'] if remaining else None, remaining['token'] if remaining else None,
+         g.current_profile['id'])
     )
     db.commit()
     log_action("logout", nickname)
@@ -785,7 +837,10 @@ def heartbeat():
     touch_last_seen(db, g.current_profile['nickname'])
     return jsonify({"success": True})
 
+# ===== Авторизация игроков на Minecraft-сервере (плагин MafinAuth) =====
 def _load_mc_secret():
+    """Секрет для плагина MafinAuth: из MAFIN_MC_SECRET или из файла .mc_secret.
+    Если ни того ни другого нет, создаётся случайный и сохраняется в .mc_secret."""
     env = os.environ.get("MAFIN_MC_SECRET", "").strip()
     if env:
         return env
@@ -819,6 +874,7 @@ def _normalize_ip(ip):
 @app.route('/api/mc/session', methods=['POST'])
 @auth_required
 def mc_register_session():
+    """Лаунчер сообщает, под каким игровым ником аккаунт собирается играть."""
     data = request.get_json(silent=True) or {}
     game_name = str(data.get('game_name', '')).strip()
     if not (3 <= len(game_name) <= 16) or not game_name.isascii() or not game_name.replace('_', '').isalnum():
@@ -841,6 +897,7 @@ def mc_register_session():
     return jsonify({"success": True})
 
 def _mc_access(db, name, ip):
+    """Единая проверка входа на сервер. Возвращает (разрешено, причина)."""
     with _mc_sessions_lock:
         sess = _mc_sessions.get(str(name).strip().lower())
     if not sess:
@@ -860,6 +917,7 @@ def _mc_access(db, name, ip):
 
 @app.route('/api/mc/check', methods=['POST'])
 def mc_check():
+    """Вызывается плагином MafinAuth при входе игрока на Minecraft-сервер."""
     if not MC_SECRET:
         return jsonify({"allowed": False, "reason": "disabled"}), 503
     given = request.headers.get('X-Mc-Secret', '')
@@ -1622,7 +1680,7 @@ tr:hover{background:#2d323c}
 <body>
 <header>
   <h1>🛡️ Mafin Launcher — Админ-панель</h1>
-  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/minecraft">🖥 Сервер</a> &nbsp;|&nbsp; <a href="/admin/shop">🛒 Магазин</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
+  <div>Вы вошли как <b>{{ me.nickname }}</b> &nbsp;|&nbsp; <a href="/admin/quests">📋 Задания</a> &nbsp;|&nbsp; <a href="/admin/gifts">🎁 Подарки</a> &nbsp;|&nbsp; <a href="/admin/news">📰 Новости</a> &nbsp;|&nbsp; <a href="/admin/minecraft">🖥 Сервер</a> &nbsp;|&nbsp; <a href="/admin/shop">🛒 Магазин</a> &nbsp;|&nbsp; <a href="/admin/cosmetics">🎩 Косметика</a> &nbsp;|&nbsp; <a href="/admin/modpack">🧩 Сборка</a> &nbsp;|&nbsp; <a href="/admin/logout">Выйти</a></div>
 </header>
 <main>
   <div class="stats">
@@ -1909,6 +1967,10 @@ def web_admin_required(f):
     return decorated
 
 
+# ===== Minecraft-сервер (Paper) под управлением app.py =====
+# Всё лежит в папке MAFIN_MC_DIR (по умолчанию mcserver/ рядом с app.py).
+# Процесс запускается отдельной группой и переживает перезапуск app.py;
+# команды в консоль идут через именованный канал (только Linux).
 MC_DIR = os.path.abspath(os.environ.get("MAFIN_MC_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcserver")))
 MC_VERSION = os.environ.get("MAFIN_MC_VERSION", "26.2")
 MC_JAVA = os.environ.get("MAFIN_MC_JAVA", "java")
@@ -1935,6 +1997,7 @@ def _mc_find_jar():
     jars = [os.path.join(MC_DIR, n) for n in os.listdir(MC_DIR)
             if n.lower().startswith("paper") and n.lower().endswith(".jar")]
     if not jars:
+        # запасной вариант: в папке лежит ровно один .jar с version.json внутри
         for n in os.listdir(MC_DIR):
             p = os.path.join(MC_DIR, n)
             if n.lower().endswith(".jar") and _mc_jar_info(p)["id"]:
@@ -1943,6 +2006,7 @@ def _mc_find_jar():
 
 
 def _mc_jar_info(jar):
+    """Версия Minecraft и нужная Java из version.json внутри paper.jar."""
     try:
         with zipfile.ZipFile(jar) as z:
             data = json.loads(z.read("version.json").decode("utf-8"))
@@ -1962,6 +2026,7 @@ def _mc_java_major():
 
 
 def _mc_port():
+    """Порт, настроенный в server.properties (или MAFIN_MC_PORT по умолчанию)."""
     v = _mc_read_props().get("server-port", "")
     return int(v) if v.isdigit() and 1 <= int(v) <= 65535 else MC_PORT
 
@@ -1972,6 +2037,7 @@ def _mc_max_players():
 
 
 def _mc_run_port():
+    """Порт, на котором сервер был запущен (если он сейчас работает)."""
     if not _mc_pid():
         return None
     try:
@@ -2043,6 +2109,7 @@ def _mc_set_props(updates):
 
 
 def _mc_write_plugin_config():
+    """Кладёт настройки для плагина MafinAuth, чтобы не вписывать секрет руками."""
     if not MC_SECRET:
         return
     cfg_dir = _mc_path("plugins", "MafinAuth")
@@ -2052,8 +2119,15 @@ def _mc_write_plugin_config():
         f.write(f'api_url: "http://127.0.0.1:{api_port}"\n')
         f.write(f"secret: {json.dumps(MC_SECRET)}\n")
         f.write("timeout_ms: 5000\n")
+    # MafinCosmetics читает адрес и секрет отсюда; свои настройки плагина лежат в config.yml и не перезаписываются
+    cos_dir = _mc_path("plugins", "MafinCosmetics")
+    os.makedirs(cos_dir, exist_ok=True)
+    with open(os.path.join(cos_dir, "connection.yml"), "w", encoding="utf-8") as f:
+        f.write(f'api_url: "http://127.0.0.1:{api_port}"\n')
+        f.write(f"secret: {json.dumps(MC_SECRET)}\n")
 
 
+# ----- оперативная память сервера -----
 MC_MIN_MEMORY_MB = 512
 
 
@@ -2066,6 +2140,7 @@ def _mc_fmt_mb(mb):
 
 
 def _mc_parse_memory(amount, unit):
+    """Переводит введённое число и единицу (G или M) в мегабайты. Бросает ValueError с понятным текстом."""
     text = str(amount if amount is not None else "").strip().replace(",", ".")
     try:
         value = float(text)
@@ -2086,6 +2161,7 @@ def _mc_parse_memory(amount, unit):
 
 
 def _mc_system_ram_mb():
+    """Сколько оперативной памяти в системе (МБ) или None, если узнать не удалось."""
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -2106,6 +2182,7 @@ def _mc_default_memory_mb():
 
 
 def _mc_get_memory_mb():
+    """Память, выбранная в панели (launcher_memory.json), иначе MAFIN_MC_MEMORY, иначе 4 ГБ."""
     try:
         with open(_mc_path("launcher_memory.json"), encoding="utf-8") as f:
             mb = json.load(f).get("memory_mb")
@@ -2128,6 +2205,7 @@ def _mc_save_memory(amount, unit):
 
 
 def _mc_pid():
+    """PID запущенного сервера или None."""
     global _mc_proc
     try:
         with open(_mc_path("server.pid")) as f:
@@ -2158,6 +2236,10 @@ def _mc_send(command):
         os.close(fd)
 
 
+# ----- вторая линия защиты: проверка при заходе игрока -----
+# Плагин MafinAuth проверяет игрока ещё до входа (AsyncPlayerPreLoginEvent). Если по какой-то причине
+# проверку удалось обойти (например, зашли через ViaVersion со старой версии), эта служба читает
+# консоль сервера, видит строку «Ник[/IP:порт] logged in», проверяет игрока тем же правилом и кикает.
 _MC_JOIN_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16})\[/([0-9A-Fa-f:.]+):\d+\] logged in with entity id")
 _MC_KICK_TEXT = {
     "not_logged_in": "Войди в Mafin Launcher и запусти игру из него.",
@@ -2169,6 +2251,7 @@ _mc_guard_started = False
 
 
 def _mc_guard_handle(name, ip):
+    """Проверяет зашедшего игрока и кикает, если ему нельзя. Возвращает причину кика или None."""
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     try:
@@ -2204,7 +2287,7 @@ def _mc_guard_loop():
             pos = None
             continue
         if pos is None or size < pos:
-            pos = size if pos is None else 0
+            pos = size if pos is None else 0  # при первом чтении старое не разбираем
             buf = b""
             if pos == size:
                 continue
@@ -2260,6 +2343,7 @@ def _mc_start():
         if total and mem_mb > total:
             raise RuntimeError(f"Выделено {_mc_fmt_mb(mem_mb)} памяти, а в системе всего {_mc_fmt_mb(total)}. Уменьши объём в настройках")
         port = _mc_port()
+        # Вход защищает MafinAuth (плюс проверка при заходе в app.py), поэтому online-mode всегда false
         _mc_set_props({"online-mode": "false", "server-port": str(port)})
         _mc_write_plugin_config()
         fifo = _mc_path("console.fifo")
@@ -2303,6 +2387,7 @@ def _mc_stop(timeout=45):
 
 
 def _mc_ping(host="127.0.0.1", port=None, timeout=1.5):
+    """Server List Ping: сервер уже принимает подключения? Сколько игроков?"""
     port = port or _mc_run_port() or _mc_port()
 
     def varint(n):
@@ -2425,6 +2510,7 @@ def _mc_download_paper(version):
     return f"Paper {version} build {data.get('id', '?')} ({data.get('channel', '?')}) скачан"
 
 
+# ----- название сервера и версии для игроков -----
 def _mc_branding():
     data = {"name": MC_NAME, "version_min": "", "version_max": ""}
     try:
@@ -2459,6 +2545,7 @@ def _mc_save_branding(name, vmin, vmax):
     return f"Сохранено: «{name}»" + (f", версии {vmin or '…'} – {vmax or '…'}" if (vmin or vmax) else "")
 
 
+# ----- плагины из Modrinth -----
 MODRINTH_API = os.environ.get("MAFIN_MODRINTH_API", "https://api.modrinth.com/v2").rstrip("/")
 _MODRINTH_OVERRIDDEN = "MAFIN_MODRINTH_API" in os.environ
 MC_PLUGIN_LOADERS = ["paper", "spigot", "bukkit", "folia", "purpur"]
@@ -2583,6 +2670,7 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
         new_name = _mc_plugin_yml_name(tmp)
         if new_name is None:
             raise _McPluginError("Это не плагин для Paper (внутри нет plugin.yml)")
+        # заменяем старые копии того же плагина (обновление или ручная установка)
         for old in _mc_list_plugins():
             if old["name"].lower() == new_name.lower() and old["file"] != filename:
                 if old["protected"]:
@@ -2600,6 +2688,7 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
     return messages
 
 
+# Плагин входа через лаунчер, собранный под Paper 26.2 (исходники в репозитории: mc-auth-plugin)
 MAFINAUTH_JAR_B64 = (
     "UEsDBAoAAAgAAGCARV0AAAAAAAAAAAAAAAAJAAQATUVUQS1JTkYv/soAAFBLAwQUAAgICABggEVdAAAAAAAAAAAAAAAAFAAA"
     "AE1FVEEtSU5GL01BTklGRVNULk1G803My0xLLS7RDUstKs7Mz7NSMNQz4OVyLkpNLElN0XWqtFIwMtUz0DPRM1TQcE3OySwo"
@@ -2700,6 +2789,7 @@ def _mc_delete_plugin(filename):
     return f"{filename} удалён. Перезапусти сервер, чтобы изменения вступили в силу"
 
 
+# ===== Миры и описание сервера (MOTD) =====
 MC_ZIP_MAX_ENTRIES = 60000
 MC_WORLD_MAX_BYTES = 8 * 1024 ** 3
 MC_RESERVED_WORLD_NAMES = {
@@ -2715,7 +2805,10 @@ def _mc_rm(path):
         pass
 
 
+# ----- безопасные пути и распаковка -----
 def _mc_safe_rel(rel, root):
+    """Нормализует путь из архива. Возвращает (чистый_путь, полный_путь) или None,
+    если путь пытается выйти за пределы папки."""
     raw = str(rel or "").replace("\\", "/")
     if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or "\x00" in raw:
         return None
@@ -2729,6 +2822,7 @@ def _mc_safe_rel(rel, root):
 
 
 def _mc_extract_zip(zf, prefix, dest_root, limit):
+    """Распаковывает записи с префиксом prefix в dest_root. Возвращает (список файлов, пропущено)."""
     written, total, skipped = [], 0, 0
     for info in zf.infolist():
         name = info.filename.replace("\\", "/")
@@ -2759,6 +2853,7 @@ def _mc_extract_zip(zf, prefix, dest_root, limit):
     return written, skipped
 
 
+# ----- миры -----
 def _mc_active_world():
     return _mc_read_props().get("level-name") or "world"
 
@@ -2797,6 +2892,7 @@ def _mc_world_delete(name):
 
 
 def _mc_world_import(zip_path, wanted_name, fallback_name):
+    """Ставит мир из zip-архива как отдельную папку (существующие миры не перезаписываются)."""
     stage = _mc_path(".world_stage")
     shutil.rmtree(stage, ignore_errors=True)
     try:
@@ -2836,6 +2932,7 @@ def _mc_world_import(zip_path, wanted_name, fallback_name):
         shutil.rmtree(stage, ignore_errors=True)
 
 
+# ----- описание сервера (MOTD) -----
 def _mc_props_unescape(s):
     def repl(m):
         t = m.group(1)
@@ -2867,6 +2964,7 @@ def _mc_props_escape(s):
 
 
 def _mc_get_motd():
+    """Описание для редактирования: цветовые коды показываются как &a, &6 и т.д."""
     raw = _mc_read_props().get("motd")
     return _mc_props_unescape(raw).replace("\u00a7", "&") if raw is not None else ""
 
@@ -2924,7 +3022,7 @@ def mc_public_status():
         "players_online": st["players_online"], "players_max": st["players_max"],
         "version": st["minecraft_version"], "address": f"{host}:{st['run_port'] or st['port']}",
         "description": _mc_motd_plain(), "core": "paper",
-        "modpack": None,
+        "modpack": _modpack_summary(),
     })
 
 
@@ -2951,6 +3049,7 @@ def admin_minecraft_plugin_search():
 
 
 def _mc_system_stats():
+    """Нагрузка VDS: load average, занятость и «кража» процессора соседями, свободная память."""
     stats = {"cpus": os.cpu_count()}
     try:
         stats["load"] = [round(x, 2) for x in os.getloadavg()]
@@ -2984,6 +3083,7 @@ def _mc_system_stats():
 
 
 def _mc_diagnose():
+    """Спрашивает у сервера TPS, время тика и пинг игроков (spark) и собирает вывод из лога."""
     if not _mc_pid():
         raise ValueError("Сервер не запущен")
     log_path = _mc_path("logs", "latest.log")
@@ -4822,6 +4922,307 @@ def _cli_set_password(nickname):
     db.close()
     print("Пароль изменён, старые токены лаунчера сброшены (нужно залогиниться заново).")
 
+# ===== Сайт: главная со скачиванием, личный кабинет, условия и политика =====
+# Положите файл лаунчера (.exe/.zip) в папку downloads/ рядом с app.py — кнопка «Скачать» отдаст самый новый файл.
+# Если папка пуста, отдаётся активная версия из админки (раздел обновлений).
+# Настройки через переменные окружения: SITE_NAME, SITE_CONTACT (ссылка/почта для связи), SITE_DISCORD.
+import html as _html
+
+DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+SITE_NAME = os.environ.get("SITE_NAME", "Mafin Launcher")
+SITE_CONTACT = os.environ.get("SITE_CONTACT", "mafinstudio.help@gmail.com")
+SITE_DISCORD = os.environ.get("SITE_DISCORD", "")
+SITE_TELEGRAM = os.environ.get("SITE_TELEGRAM", "https://t.me/mafinlauncher")
+
+SITE_CSS = """
+:root{--bg:#0f1218;--card:#181d27;--card2:#1f2533;--line:#2a3142;--text:#e8ecf4;--mut:#8b95a9;--acc:#5b8cff;--acc2:#7c5cff;--ok:#3ecf8e;--bad:#ff6b6b}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--card2:#eef1f8;--line:#dde2ee;--text:#1b2233;--mut:#667089}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;font:16px/1.6 -apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{max-width:980px;margin:0 auto;padding:0 20px}
+header.top{border-bottom:1px solid var(--line);background:var(--card)}
+header.top .wrap{display:flex;align-items:center;gap:22px;height:60px}
+.logo{font-weight:800;font-size:19px;color:var(--text)}.logo:hover{text-decoration:none}
+nav{display:flex;flex-wrap:wrap;gap:6px 18px;margin-left:auto}header.top .wrap{flex-wrap:wrap;min-height:60px;padding-top:8px;padding-bottom:8px}nav a{color:var(--mut);font-size:15px}nav a:hover{color:var(--text);text-decoration:none}
+.hero{padding:70px 0 40px;text-align:center}
+.hero h1{font-size:44px;line-height:1.15;margin:0 0 14px}
+.hero p{color:var(--mut);font-size:18px;max-width:600px;margin:0 auto 28px}
+.btn{display:inline-block;border:0;cursor:pointer;font:inherit;font-weight:700;color:#fff;padding:13px 26px;border-radius:12px;background:linear-gradient(135deg,var(--acc),var(--acc2))}
+.btn:hover{filter:brightness(1.1);text-decoration:none}.btn.sm{padding:8px 16px;font-size:14px;border-radius:9px}
+.btn.ghost{background:var(--card2);color:var(--text);border:1px solid var(--line)}
+.btn.red{background:var(--bad)}.btn[disabled]{opacity:.5;cursor:default}
+.meta{color:var(--mut);font-size:14px;margin-top:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin:30px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px}
+.card h3{margin:0 0 8px;font-size:18px}.card p{margin:0;color:var(--mut);font-size:15px}
+.steps{counter-reset:s;list-style:none;padding:0;margin:0}
+.steps li{counter-increment:s;position:relative;padding:10px 0 10px 46px;color:var(--mut)}
+.steps li:before{content:counter(s);position:absolute;left:0;top:8px;width:32px;height:32px;border-radius:50%;background:var(--card2);border:1px solid var(--line);text-align:center;line-height:30px;color:var(--text);font-weight:700}
+h2{margin:40px 0 6px;font-size:26px}
+footer{border-top:1px solid var(--line);margin-top:60px;padding:26px 0;color:var(--mut);font-size:14px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:8px 22px}
+.doc{padding:40px 0}.doc h1{font-size:34px;margin:0 0 6px}.doc h2{font-size:21px;margin:30px 0 8px}
+.doc p,.doc li{color:var(--text);opacity:.9}.doc ul{padding-left:22px}.upd{color:var(--mut);font-size:14px}
+input,select{width:100%;padding:11px 13px;border-radius:10px;border:1px solid var(--line);background:var(--card2);color:var(--text);font:inherit}
+label{display:block;font-size:14px;color:var(--mut);margin:12px 0 5px}
+.tabs{display:flex;gap:8px;margin-bottom:6px}.tabs button{flex:1}
+.err{color:var(--bad);font-size:14px;min-height:20px;margin-top:10px}.okmsg{color:var(--ok)}
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0}
+.stat div{background:var(--card2);border-radius:12px;padding:14px}.stat b{display:block;font-size:24px}.stat span{color:var(--mut);font-size:13px}
+.item{display:flex;align-items:center;gap:14px;padding:14px 0;border-top:1px solid var(--line)}
+.item:first-child{border-top:0}.item .t{flex:1}.item .t small{display:block;color:var(--mut)}
+.price{font-weight:800;white-space:nowrap}
+table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:8px 6px;border-top:1px solid var(--line)}th{color:var(--mut);font-weight:600;border-top:0}
+.skinprev{image-rendering:pixelated;width:128px;height:128px;background:var(--card2);border-radius:10px;border:1px solid var(--line)}
+.row{display:flex;gap:16px;flex-wrap:wrap}.row>*{flex:1;min-width:200px}
+"""
+
+
+def _site_page(title, body, head_extra=""):
+    contact = ""
+    if SITE_DISCORD:
+        contact += f'<a href="{_html.escape(SITE_DISCORD)}" target="_blank" rel="noopener">Discord</a>'
+    if SITE_TELEGRAM:
+        contact += f'<a href="{_html.escape(SITE_TELEGRAM)}" target="_blank" rel="noopener">Telegram</a>'
+    footer = (f'<footer><div class="wrap"><span>© {datetime.now().year} {_html.escape(SITE_NAME)}</span>'
+              f'<a href="/terms">Условия использования</a><a href="/privacy">Политика конфиденциальности</a>'
+              f'{contact}<span>Не является официальным продуктом Minecraft и не связан с Mojang или Microsoft.</span>'
+              f'</div></footer>')
+    page = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_html.escape(title)} — {_html.escape(SITE_NAME)}</title><style>{SITE_CSS}</style>{head_extra}</head><body>
+<header class="top"><div class="wrap"><a class="logo" href="/">⛏ {_html.escape(SITE_NAME)}</a>
+<nav><a href="/">Главная</a><a href="/cabinet">Личный кабинет</a><a href="/terms">Условия использования</a><a href="/privacy">Политика конфиденциальности</a><a href="/download" class="dl">Скачать</a></nav></div></header>
+{body}{footer}</body></html>"""
+    resp = app.response_class(page, mimetype="text/html")
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+def _site_latest_download():
+    """(папка, имя файла, версия) самого свежего файла для скачивания или None."""
+    try:
+        files = [f for f in os.listdir(DOWNLOADS_DIR)
+                 if not f.startswith(".") and os.path.isfile(os.path.join(DOWNLOADS_DIR, f))]
+    except OSError:
+        files = []
+    if files:
+        files.sort(key=lambda f: os.path.getmtime(os.path.join(DOWNLOADS_DIR, f)), reverse=True)
+        return DOWNLOADS_DIR, files[0], None
+    row = get_db().execute(
+        "SELECT filename, version FROM updates WHERE is_active = 1 ORDER BY uploaded_at DESC LIMIT 1").fetchone()
+    if row:
+        name = os.path.basename(row["filename"])
+        if os.path.isfile(os.path.join(UPDATES_DIR, name)):
+            return UPDATES_DIR, name, row["version"]
+    return None
+
+
+def _fmt_size(n):
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.0f} {unit}" if unit == "Б" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+@app.route('/download', methods=['GET'])
+def site_download():
+    found = _site_latest_download()
+    if not found:
+        return _site_page("Скачать", '<div class="wrap doc"><h1>Файл пока недоступен</h1>'
+                          '<p>Лаунчер ещё не загружен. Загляните позже.</p></div>'), 404
+    folder, name, _ = found
+    return send_from_directory(folder, name, as_attachment=True)
+
+
+@app.route('/', methods=['GET'])
+def site_index():
+    found = _site_latest_download()
+    if found:
+        folder, name, version = found
+        size = _fmt_size(os.path.getsize(os.path.join(folder, name)))
+        ver = f" · версия {_html.escape(str(version))}" if version else ""
+        btn = '<a class="btn" href="/download">⬇ Скачать лаунчер</a>'
+        meta = f'<div class="meta">{_html.escape(name)} · {size}{ver} · Windows</div>'
+    else:
+        btn = '<span class="btn" style="opacity:.5">Скоро</span>'
+        meta = '<div class="meta">Файл лаунчера ещё не загружен</div>'
+    body = f"""<div class="wrap"><section class="hero"><h1>Играйте в Minecraft<br>с {_html.escape(SITE_NAME)}</h1>
+<p>Свой лаунчер с друзьями, чатом, достижениями, скинами и привилегиями на нашем сервере.</p>{btn}{meta}</section>
+<div class="grid">
+<div class="card"><h3>🧑 Свои скины</h3><p>Загрузите скин в лаунчере или в личном кабинете — его увидят игроки лаунчера.</p></div>
+<div class="card"><h3>👑 Привилегии</h3><p>Покупайте привилегии на сервере за монеты, которые вы зарабатываете игрой и заданиями.</p></div>
+<div class="card"><h3>👥 Друзья и чат</h3><p>Список друзей, личные сообщения, подарки и таблица лидеров по времени в игре.</p></div></div>
+<h2>Как начать</h2><ol class="steps">
+<li>Нажмите «Скачать лаунчер» и запустите файл.</li>
+<li>Зарегистрируйтесь в лаунчере или здесь, в <a href="/cabinet">личном кабинете</a>.</li>
+<li>Выберите версию Minecraft и нажмите «Играть».</li></ol></div>"""
+    return _site_page("Главная", body)
+
+
+def _contact_html():
+    parts = []
+    if SITE_CONTACT:
+        c = _html.escape(SITE_CONTACT)
+        parts.append(f'<a href="{c}">{c}</a>' if SITE_CONTACT.startswith("http") else
+                     f'<a href="mailto:{c}">{c}</a>' if "@" in SITE_CONTACT else c)
+    if SITE_DISCORD:
+        d = _html.escape(SITE_DISCORD)
+        parts.append(f'Discord: <a href="{d}" target="_blank" rel="noopener">{d}</a>')
+    if SITE_TELEGRAM:
+        t = _html.escape(SITE_TELEGRAM)
+        parts.append(f'Telegram: <a href="{t}" target="_blank" rel="noopener">{t}</a>')
+    return " · ".join(parts) if parts else "через сообщество проекта (ссылка на Discord указана на этом сайте)"
+
+
+@app.route('/terms', methods=['GET'])
+def site_terms():
+    n = _html.escape(SITE_NAME)
+    body = f"""<div class="wrap doc"><h1>Условия использования</h1><p class="upd">Редакция от {datetime.now().strftime('%d.%m.%Y')}</p>
+<p>Используя лаунчер {n}, сайт и связанные сервисы (далее — «Сервис»), вы соглашаетесь с этими условиями. Если вы не согласны, не пользуйтесь Сервисом.</p>
+<h2>1. Что такое Сервис</h2><p>{n} — неофициальный лаунчер для Minecraft с аккаунтами, друзьями, чатом, достижениями, скинами и магазином виртуальных привилегий для нашего игрового сервера. Сервис не связан с Mojang Studios и Microsoft; Minecraft является товарным знаком Mojang Studios.</p>
+<h2>2. Аккаунт</h2><ul><li>Вы отвечаете за сохранность пароля и за действия под своим аккаунтом.</li>
+<li>Нельзя выдавать себя за других людей, занимать чужие ники и создавать аккаунты для обхода блокировки.</li>
+<li>Мы можем заблокировать или удалить аккаунт за нарушение этих условий и правил игрового сервера.</li></ul>
+<h2>3. Правила поведения</h2><p>Запрещено: читерство и использование эксплойтов, оскорбления и травля в чате, спам, распространение вредоносных файлов, попытки взлома Сервиса, загрузка скинов и другого контента с оскорбительным, непристойным или нарушающим чужие права содержанием.</p>
+<h2>4. Скины и пользовательский контент</h2><p>Загружая скин, вы подтверждаете, что имеете право его использовать. Скин становится виден другим игрокам лаунчера. Мы вправе удалить любой контент без объяснения причин.</p>
+<h2>5. Монеты и привилегии</h2><ul><li>Монеты — внутренняя игровая валюта, она не является деньгами, не имеет денежной стоимости, не обменивается на деньги и не передаётся вне Сервиса.</li>
+<li>Привилегии — виртуальные цифровые услуги на ограниченный срок, который указан в магазине. После выдачи привилегии возврат монет не производится, кроме случаев технической ошибки Сервиса.</li>
+<li>При блокировке аккаунта за нарушения монеты и привилегии не компенсируются.</li></ul>
+<h2>6. Отказ от гарантий</h2><p>Сервис предоставляется «как есть». Мы стараемся обеспечить стабильную работу, но не гарантируем отсутствие сбоев, потери данных и непрерывную доступность. Вы пользуетесь Сервисом на свой риск, ответственность Сервиса ограничена в пределах, допускаемых законом.</p>
+<h2>7. Изменения</h2><p>Мы можем изменять эти условия и работу Сервиса. Актуальная редакция всегда опубликована на этой странице; продолжая пользоваться Сервисом, вы принимаете изменения.</p>
+<h2>8. Контакты</h2><p>По вопросам, жалобам и удалению аккаунта: {_contact_html()}.</p></div>"""
+    return _site_page("Условия использования", body)
+
+
+@app.route('/privacy', methods=['GET'])
+def site_privacy():
+    n = _html.escape(SITE_NAME)
+    body = f"""<div class="wrap doc"><h1>Политика конфиденциальности</h1><p class="upd">Редакция от {datetime.now().strftime('%d.%m.%Y')}</p>
+<p>Здесь описано, какие данные собирает {n} (лаунчер, сайт и игровой сервер) и как они используются.</p>
+<h2>1. Какие данные мы храним</h2><ul>
+<li><b>Аккаунт:</b> ник, хэш пароля (сам пароль не хранится), дата регистрации, время последнего входа и последней активности.</li>
+<li><b>Игровая статистика:</b> время в игре, число запусков, версии Minecraft, достижения, задания, монеты, покупки привилегий, подарки.</li>
+<li><b>Социальные функции:</b> список друзей и заявки, личные сообщения между пользователями, отправленные подарки.</li>
+<li><b>Скины:</b> загруженный вами PNG-файл скина и игровой ник, к которому он привязан.</li>
+<li><b>Технические данные:</b> IP-адрес при обращении к серверу (в журналах и для связи игровой сессии с аккаунтом), записи о действиях (вход, покупка, действия администраторов).</li></ul>
+<h2>2. Зачем мы это используем</h2><p>Для работы аккаунта и функций лаунчера, показа скинов, выдачи купленных привилегий на игровом сервере, защиты от мошенничества и злоупотреблений, а также для расследования нарушений.</p>
+<h2>3. Передача третьим лицам</h2><p>Мы не продаём и не передаём ваши данные рекламным сетям. Игровой ник и купленная привилегия передаются нашему игровому серверу. Для загрузки лаунчер может скачивать файлы Minecraft с серверов Mojang/Microsoft и модуль скинов с GitHub — при этом эти сервисы видят ваш IP-адрес по своим правилам.</p>
+<h2>4. Discord</h2><p>Если в лаунчере включён Discord Rich Presence, статус игры отображается через локальное приложение Discord на вашем компьютере. Лаунчер не получает доступ к вашей переписке и учётной записи Discord и не отправляет ваш пароль или токен Discord на наш сервер.</p>
+<h2>5. Хранение и защита</h2><p>Пароли хранятся в виде хэшей. Данные находятся на нашем сервере; доступ к ним имеют только администраторы проекта. Аккаунт хранится, пока вы им пользуетесь или пока не запросите удаление.</p>
+<h2>6. Ваши права</h2><p>Вы можете в любой момент запросить копию своих данных, их исправление или удаление аккаунта вместе со связанными данными (друзья, сообщения, скины, статистика). Напишите нам: {_contact_html()}. Мы удалим данные в разумный срок, кроме тех, которые обязаны хранить по закону или для защиты от нарушителей.</p>
+<h2>7. Дети</h2><p>Сервисом могут пользоваться только лица, достигшие возраста, с которого они вправе самостоятельно принимать такие условия, либо с согласия родителей.</p>
+<h2>8. Изменения</h2><p>Мы можем обновлять эту политику; актуальная редакция всегда на этой странице.</p></div>"""
+    return _site_page("Политика конфиденциальности", body)
+
+
+CABINET_JS = r"""
+const $=s=>document.querySelector(s);
+const el=(t,a={},...k)=>{const e=document.createElement(t);for(const[x,v]of Object.entries(a)){if(x==='class')e.className=v;else if(x.startsWith('on'))e.addEventListener(x.slice(2),v);else e.setAttribute(x,v)}for(const c of k)e.append(c);return e};
+let token=localStorage.getItem('mafin_token')||'';
+async function api(path,opt={}){
+  const r=await fetch(path,{method:opt.body?'POST':'GET',headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:opt.body?JSON.stringify(opt.body):undefined});
+  let d={};try{d=await r.json()}catch(e){}
+  if(r.status===401&&token){logout(true)}
+  if(!r.ok)throw new Error(d.error||('Ошибка '+r.status));
+  return d}
+function logout(silent){if(!silent&&token)api('/api/logout',{body:{}}).catch(()=>{});token='';localStorage.removeItem('mafin_token');render()}
+function fmtTime(m){m=Math.round(m||0);return Math.floor(m/60)+' ч '+(m%60)+' мин'}
+function authView(){
+  let mode='login';
+  const err=el('div',{class:'err'});
+  const nick=el('input',{autocomplete:'username',maxlength:20}),pass=el('input',{type:'password',autocomplete:'current-password'});
+  const go=el('button',{class:'btn',style:'width:100%;margin-top:14px'},'Войти');
+  const tl=el('button',{class:'btn sm',type:'button'},'Вход'),tr=el('button',{class:'btn sm ghost',type:'button'},'Регистрация');
+  const setMode=m=>{mode=m;go.textContent=m==='login'?'Войти':'Создать аккаунт';tl.className='btn sm'+(m==='login'?'':' ghost');tr.className='btn sm'+(m==='login'?' ghost':'');err.textContent=''};
+  tl.onclick=()=>setMode('login');tr.onclick=()=>setMode('register');
+  const submit=async()=>{err.textContent='';go.disabled=true;
+    try{const d=await api(mode==='login'?'/api/login':'/api/register',{body:{nickname:nick.value.trim(),password:pass.value}});
+      token=d.token;localStorage.setItem('mafin_token',token);render()}
+    catch(e){err.textContent=e.message}finally{go.disabled=false}};
+  go.onclick=submit;pass.addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
+  return el('div',{class:'card',style:'max-width:420px;margin:40px auto'},
+    el('h3',{},'Личный кабинет'),el('p',{},'Войдите тем же ником и паролем, что и в лаунчере.'),
+    el('div',{class:'tabs',style:'margin-top:14px'},tl,tr),
+    el('label',{},'Ник'),nick,el('label',{},'Пароль'),pass,go,err)}
+async function cabinetView(){
+  const me=await api('/api/me');
+  const root=el('div',{});
+  const out=el('button',{class:'btn sm ghost',onclick:()=>logout()},'Выйти');
+  root.append(el('div',{style:'display:flex;align-items:center;gap:12px;margin:30px 0 0'},el('h2',{style:'margin:0;flex:1'},'👤 '+me.nickname),out));
+  const stats=el('div',{class:'stat'});
+  const st=(v,l)=>el('div',{},el('b',{},String(v)),el('span',{},l));
+  stats.append(st(Math.floor(me.coins||0),'монет'),st(fmtTime(me.total_playtime_minutes),'в игре'),st(me.total_launches||0,'запусков'),st((me.created_at||'').slice(0,10),'регистрация'));
+  root.append(stats);
+  // магазин
+  const shop=el('div',{class:'card',style:'margin-bottom:16px'});
+  shop.append(el('h3',{},'👑 Привилегии'));
+  const gname=el('input',{value:me.nickname.replace(/[^A-Za-z0-9_]/g,'').slice(0,16),maxlength:16});
+  shop.append(el('label',{},'Игровой ник на сервере'),gname);
+  const msg=el('div',{class:'err'});
+  const list=el('div',{style:'margin-top:8px'});
+  shop.append(list,msg);
+  root.append(shop);
+  async function loadShop(){
+    const d=await api('/api/shop/items');
+    list.replaceChildren();
+    if(!d.items.length)list.append(el('p',{style:'color:var(--mut)'},'Сейчас в магазине нет товаров.'));
+    for(const it of d.items){
+      const b=el('button',{class:'btn sm'},'Купить');
+      b.onclick=async()=>{
+        if(!confirm('Купить «'+it.title+'» за '+it.price+' монет для ника '+gname.value+'?'))return;
+        b.disabled=true;msg.className='err';msg.textContent='';
+        try{const r=await api('/api/shop/buy',{body:{item_id:it.id,game_name:gname.value.trim()}});
+          msg.className='err okmsg';msg.textContent='Куплено! Осталось монет: '+Math.floor(r.total_coins)+(r.status==='pending'?' (привилегия выдастся, когда сервер будет в сети)':'');
+          loadShop();me.coins=r.total_coins;stats.firstChild.firstChild.textContent=Math.floor(r.total_coins)}
+        catch(e){msg.textContent=e.message}finally{b.disabled=false}};
+      list.append(el('div',{class:'item'},el('div',{class:'t'},it.title,el('small',{},(it.description||'')+(it.duration_days?' · '+it.duration_days+' дн.':''))),el('div',{class:'price'},it.price+' 🪙'),b))}
+    if(d.purchases.length){
+      const tb=el('table',{},el('tr',{},...['Товар','Ник','Цена','Статус'].map(h=>el('th',{},h))));
+      for(const p of d.purchases)tb.append(el('tr',{},el('td',{},p.item_title),el('td',{},p.game_name),el('td',{},String(p.price)),el('td',{},p.status)));
+      list.append(el('h3',{style:'margin-top:22px'},'Мои покупки'),tb)}}
+  await loadShop();
+  // скин
+  const sk=el('div',{class:'card'});
+  sk.append(el('h3',{},'🧑 Скин'),el('p',{},'PNG 64×64 или 64×32. Виден игрокам, которые играют через лаунчер.'));
+  const sname=el('input',{value:gname.value,maxlength:16}),model=el('select',{},el('option',{value:'default'},'Классические руки (Steve)'),el('option',{value:'slim'},'Тонкие руки (Alex)'));
+  const file=el('input',{type:'file',accept:'image/png'});
+  const prev=el('img',{class:'skinprev',alt:''});prev.style.display='none';
+  const smsg=el('div',{class:'err'});
+  let b64='';
+  file.onchange=()=>{smsg.className='err';smsg.textContent='';b64='';prev.style.display='none';const f=file.files[0];if(!f)return;
+    if(f.size>256*1024){smsg.textContent='Файл больше 256 КБ';return}
+    const fr=new FileReader();fr.onload=()=>{const img=new Image();img.onload=()=>{
+      if(!((img.width===64&&img.height===64)||(img.width===64&&img.height===32))){smsg.textContent='Нужен PNG 64×64 или 64×32, а у вас '+img.width+'×'+img.height;return}
+      b64=fr.result.split(',')[1];prev.src=fr.result;prev.style.display='block'};img.onerror=()=>{smsg.textContent='Это не PNG-картинка'};img.src=fr.result};fr.readAsDataURL(f)};
+  const up=el('button',{class:'btn sm',style:'margin-top:14px'},'Загрузить скин'),del=el('button',{class:'btn sm red',style:'margin:14px 0 0 8px'},'Удалить скин');
+  up.onclick=async()=>{smsg.className='err';smsg.textContent='';if(!b64){smsg.textContent='Сначала выберите PNG-файл';return}
+    try{await api('/api/skin/upload',{body:{game_name:sname.value.trim(),png_b64:b64,model:model.value}});smsg.className='err okmsg';smsg.textContent='Скин загружен!'}catch(e){smsg.textContent=e.message}};
+  del.onclick=async()=>{if(!confirm('Удалить скин для ника '+sname.value+'?'))return;try{await api('/api/skin/delete',{body:{game_name:sname.value.trim()}});smsg.className='err okmsg';smsg.textContent='Скин удалён'}catch(e){smsg.textContent=e.message}};
+  sk.append(el('div',{class:'row'},el('div',{},el('label',{},'Игровой ник'),sname,el('label',{},'Руки'),model,el('label',{},'Файл'),file),el('div',{},prev)),up,del,smsg);
+  root.append(sk);
+  return root}
+async function render(){
+  const box=$('#app');box.replaceChildren();
+  if(!token){box.append(authView());return}
+  try{box.append(await cabinetView())}catch(e){if(token){box.append(el('div',{class:'card'},'Не удалось загрузить кабинет: '+e.message))}else render()}}
+render();
+"""
+
+
+@app.route('/cabinet', methods=['GET'])
+def site_cabinet():
+    body = '<div class="wrap"><div id="app"></div></div><script>' + CABINET_JS + '</script>'
+    resp = _site_page("Личный кабинет", body)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ===== Скины для любых серверов (Yggdrasil-совместимый API под authlib-injector) =====
+# Клиент с authlib-injector спрашивает скины игроков по UUID у этого сервера, поэтому скины видны
+# и на нашем сервере, и на любых пиратских (offline-mode) серверах у всех, кто играет через лаунчер.
 SKIN_MAX_BYTES = 256 * 1024
 SKIN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 SKIN_KEY_PATH = os.environ.get("MAFIN_SKIN_KEY", os.path.join(BASE_DIR, "skin_signing_key.pem"))
@@ -4830,6 +5231,7 @@ _skin_key_cache = {}
 
 
 def _skin_signing_key():
+    """RSA-ключ для подписи текстур (нужен пакет cryptography). Без него отдаём неподписанные текстуры."""
     with _skin_key_lock:
         if "key" in _skin_key_cache:
             return _skin_key_cache["key"]
@@ -5054,17 +5456,20 @@ def ygg_texture(texture_hash):
     return resp
 
 
+# ===== Магазин привилегий за монеты (выдача групп через LuckPerms) =====
 SHOP_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 SHOP_GROUP_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
 _shop_lock = threading.Lock()
 
 
 def _offline_uuid(name):
+    """UUID игрока на сервере с online-mode=false (так его считает Minecraft)."""
     import uuid
     return str(uuid.UUID(bytes=hashlib.md5(("OfflinePlayer:" + name).encode("utf-8")).digest(), version=3))
 
 
 def _shop_command(purchase):
+    """Команда LuckPerms для консоли. Все части проверяются, лишних символов в ней быть не может."""
     name, group = str(purchase["game_name"]), str(purchase["group_name"])
     days = int(purchase["duration_days"])
     if not SHOP_NAME_RE.fullmatch(name) or not SHOP_GROUP_RE.fullmatch(group) or not 0 <= days <= 3650:
@@ -5080,6 +5485,7 @@ def _shop_luckperms_installed():
 
 
 def _shop_apply_pending():
+    """Выдаёт оплаченные привилегии, пока сервер работает и LuckPerms загружен. Возвращает число выданных."""
     with _shop_lock:
         db = sqlite3.connect(DB_PATH)
         db.row_factory = sqlite3.Row
@@ -5314,7 +5720,7 @@ th{color:#7a8599;font-weight:normal;font-size:12px}
 </style></head>
 <body>
 <header><h1>🛒 Магазин привилегий</h1>
-<div><a href="/admin/minecraft">🖥 Сервер</a><a href="/admin/dashboard">← Панель</a><a href="/admin/logout">Выйти</a></div></header>
+<div><a href="/admin/cosmetics">🎩 Косметика</a><a href="/admin/modpack">🧩 Сборка</a><a href="/admin/minecraft">🖥 Сервер</a><a href="/admin/dashboard">← Панель</a><a href="/admin/logout">Выйти</a></div></header>
 <main>
 <section>
   <h2>Состояние</h2>
@@ -5410,6 +5816,911 @@ load();setInterval(load,6000);
 """
 
 
+# ===== Сборка сервера, косметика (шапки) и недельный топ =====
+
+# ----- сборка для сервера: рекомендуемый набор модов, ресурспаков и конфигов для клиента -----
+MODPACK_DIR = os.path.join(BASE_DIR, "server_modpack")
+MODPACK_FILES_DIR = os.path.join(MODPACK_DIR, "files")
+MODPACK_MANIFEST_PATH = os.path.join(MODPACK_DIR, "manifest.json")
+MODPACK_ROOTS = ("mods", "resourcepacks", "shaderpacks", "config")
+MODPACK_LOADERS = ("vanilla", "fabric", "forge", "neoforge", "quilt")
+MODPACK_UPLOAD_MAX = 200 * 1024 * 1024
+MODPACK_MAX_FILES = 400
+MODPACK_UPLOAD_EXT = {
+    "mods": (".jar",), "resourcepacks": (".zip",), "shaderpacks": (".zip",),
+    "config": (".toml", ".json", ".json5", ".cfg", ".properties", ".txt", ".yml", ".yaml", ".conf"),
+}
+_MODPACK_NAME_RE = re.compile(r"^[A-Za-z0-9._+\-() \[\]]{1,120}$")
+_MODPACK_VERSION_RE = re.compile(r"^\d{1,2}\.\d{1,2}(\.\d{1,2})?$")
+_MODRINTH_ROOTS = {"mod": "mods", "resourcepack": "resourcepacks", "shader": "shaderpacks"}
+_MODRINTH_LOADER_FILTER = {"fabric": ["fabric"], "quilt": ["quilt", "fabric"],
+                           "forge": ["forge"], "neoforge": ["neoforge"]}
+_modpack_lock = threading.Lock()
+os.makedirs(MODPACK_FILES_DIR, exist_ok=True)
+
+
+def _modpack_empty():
+    return {"name": "", "mc_version": "", "loader": "vanilla", "loader_version": "",
+            "revision": 0, "updated_at": "", "files": []}
+
+
+def _modpack_load():
+    try:
+        with open(MODPACK_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        if isinstance(m, dict) and isinstance(m.get("files"), list):
+            base = _modpack_empty()
+            base.update(m)
+            return base
+    except (OSError, ValueError):
+        pass
+    return _modpack_empty()
+
+
+def _modpack_save(m):
+    m["revision"] = int(m.get("revision", 0)) + 1
+    m["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    tmp = MODPACK_MANIFEST_PATH + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, MODPACK_MANIFEST_PATH)
+
+
+def _modpack_summary():
+    """Краткая сводка для публичного статуса сервера (None, если сборка не настроена)."""
+    m = _modpack_load()
+    if not m["files"]:
+        return None
+    return {"name": m["name"] or "Сборка сервера", "revision": m["revision"],
+            "mc_version": m["mc_version"], "loader": m["loader"],
+            "loader_version": m["loader_version"], "files": len(m["files"]),
+            "size": sum(int(f.get("size") or 0) for f in m["files"])}
+
+
+def _modpack_clean_name(name):
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    base = re.sub(r"[^A-Za-z0-9._+\-() \[\]]", "_", base).strip(" .")
+    return base[:120]
+
+
+def _modpack_path_ok(path):
+    parts = str(path).split("/")
+    if not 2 <= len(parts) <= 5 or parts[0] not in MODPACK_ROOTS:
+        return False
+    return all(_MODPACK_NAME_RE.fullmatch(p) and not p.startswith(".") for p in parts[1:])
+
+
+def _modpack_modrinth_pick(project_id, root, mc, loader):
+    params = {"game_versions": json.dumps([mc])}
+    if root == "mods":
+        params["loaders"] = json.dumps(_MODRINTH_LOADER_FILTER[loader])
+    versions = _modrinth_get(f"/project/{urllib.parse.quote(project_id, safe='')}/version", params) or []
+    for kind in ("release", "beta", "alpha"):
+        for v in versions:
+            if v.get("version_type") == kind and v.get("files"):
+                return v
+    return None
+
+
+def _modpack_modrinth_entry(project, ver, root, optional):
+    files = ver.get("files") or []
+    fobj = next((x for x in files if x.get("primary")), files[0] if files else None)
+    if not fobj:
+        raise _McPluginError("У версии нет файлов")
+    fname = _modpack_clean_name(fobj.get("filename"))
+    hashes = fobj.get("hashes") or {}
+    url = fobj.get("url") or ""
+    pu = urlparse(url)
+    if pu.scheme != "https" or (pu.hostname or "").lower() != "cdn.modrinth.com":
+        raise _McPluginError("Modrinth отдал неожиданную ссылку на файл")
+    if not hashes.get("sha512"):
+        raise _McPluginError("У файла на Modrinth нет контрольной суммы")
+    path = f"{root}/{fname}"
+    if not fname or not _modpack_path_ok(path):
+        raise _McPluginError(f"Недопустимое имя файла: {fobj.get('filename')}")
+    return {"id": secrets.token_hex(16), "path": path, "title": project.get("title") or fname,
+            "size": int(fobj.get("size") or 0), "sha512": hashes["sha512"].lower(),
+            "sha1": (hashes.get("sha1") or "").lower(), "url": url, "source": "modrinth",
+            "optional": bool(optional), "project_id": project.get("id"),
+            "version_id": ver.get("id"), "version": ver.get("version_number") or ""}
+
+
+def _modpack_add_modrinth(m, query, optional, with_deps):
+    q = (query or "").strip()
+    mt = re.search(r"modrinth\.com/(?:mod|resourcepack|shader|plugin|datapack|modpack)/([A-Za-z0-9_\-]+)", q)
+    slug = mt.group(1) if mt else q
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{2,64}", slug):
+        raise _McPluginError("Укажи ссылку на проект Modrinth или его slug")
+    mc, loader = m["mc_version"], m["loader"]
+    if not mc:
+        raise _McPluginError("Сначала укажи версию Minecraft в настройках сборки")
+    added, skipped, queue_, seen = [], [], [(slug, 0, optional)], set()
+    known = {f.get("project_id") for f in m["files"] if f.get("project_id")}
+    while queue_:
+        ident, depth, opt = queue_.pop(0)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        project = _modrinth_get(f"/project/{urllib.parse.quote(ident, safe='')}")
+        if not project:
+            raise _McPluginError("Проект не найден на Modrinth")
+        title, pid = project.get("title") or ident, project.get("id")
+        if pid in known:
+            skipped.append(title)
+            continue
+        root = _MODRINTH_ROOTS.get(project.get("project_type"))
+        if not root:
+            raise _McPluginError(f"«{title}»: тип «{project.get('project_type')}» не подходит "
+                                 f"(нужны моды, ресурспаки или шейдеры)")
+        if root == "mods" and loader not in _MODRINTH_LOADER_FILTER:
+            raise _McPluginError("Для сборки без загрузчика моды добавлять нельзя: "
+                                 "выбери Fabric, Forge, NeoForge или Quilt")
+        ver = _modpack_modrinth_pick(pid, root, mc, loader)
+        if not ver:
+            if depth == 0:
+                raise _McPluginError(f"У «{title}» нет файла под Minecraft {mc}"
+                                     + (f" и {loader}" if root == "mods" else ""))
+            skipped.append(f"{title} (нет версии под {mc})")
+            continue
+        entry = _modpack_modrinth_entry(project, ver, root, opt)
+        m["files"] = [f for f in m["files"] if f["path"] != entry["path"]]
+        m["files"].append(entry)
+        known.add(pid)
+        added.append(entry["title"])
+        if with_deps and depth < 4:
+            for dep in ver.get("dependencies") or []:
+                if dep.get("dependency_type") == "required" and dep.get("project_id") \
+                        and dep["project_id"] not in seen:
+                    queue_.append((dep["project_id"], depth + 1, False))
+    if len(m["files"]) > MODPACK_MAX_FILES:
+        raise _McPluginError(f"В сборке не может быть больше {MODPACK_MAX_FILES} файлов")
+    return added, skipped
+
+
+def _modpack_unlink_uploads(m, removed_entries):
+    still = {f.get("id") for f in m["files"]}
+    for f in removed_entries:
+        if f.get("source") == "upload" and f.get("id") not in still and re.fullmatch(r"[0-9a-f]{32}", f.get("id", "")):
+            try:
+                os.remove(os.path.join(MODPACK_FILES_DIR, f["id"] + ".bin"))
+            except OSError:
+                pass
+
+
+@app.route('/api/modpack', methods=['GET'])
+@auth_required
+def modpack_manifest():
+    m = _modpack_load()
+    return jsonify({"success": True, "modpack": m if m["files"] else None})
+
+
+@app.route('/api/modpack/file/<fid>', methods=['GET'])
+@auth_required
+def modpack_file(fid):
+    if not re.fullmatch(r"[0-9a-f]{32}", fid):
+        return jsonify({"error": "Не найдено"}), 404
+    entry = next((f for f in _modpack_load()["files"] if f.get("id") == fid and f.get("source") == "upload"), None)
+    if not entry:
+        return jsonify({"error": "Не найдено"}), 404
+    return send_from_directory(MODPACK_FILES_DIR, fid + ".bin", as_attachment=True,
+                               download_name=os.path.basename(entry["path"]))
+
+
+@app.route('/admin/modpack', methods=['GET'])
+@web_admin_required
+def admin_modpack_page():
+    return app.response_class(MODPACK_ADMIN_TEMPLATE, mimetype="text/html")
+
+
+@app.route('/admin/modpack/data', methods=['GET'])
+@web_admin_required
+def admin_modpack_data():
+    return jsonify(_modpack_load())
+
+
+@app.route('/admin/modpack/<action>', methods=['POST'])
+@web_admin_required
+def admin_modpack_action(action):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Ожидается JSON"}), 400
+    data = request.get_json(silent=True) or {}
+    admin = g.web_admin['nickname']
+
+    def fail(msg, code=400):
+        return jsonify({"success": False, "error": msg}), code
+
+    with _modpack_lock:
+        m = _modpack_load()
+        if action == "settings":
+            name = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("name", ""))).strip()
+            mc = str(data.get("mc_version", "")).strip()
+            loader = str(data.get("loader", "vanilla")).strip().lower()
+            lv = str(data.get("loader_version", "")).strip()
+            if not 1 <= len(name) <= 40:
+                return fail("Название: от 1 до 40 символов")
+            if not _MODPACK_VERSION_RE.fullmatch(mc):
+                return fail("Версия Minecraft вида 1.21.1")
+            if loader not in MODPACK_LOADERS:
+                return fail("Неизвестный загрузчик")
+            if loader != "vanilla" and not re.fullmatch(r"[A-Za-z0-9._+\-]{1,64}", lv):
+                return fail("Укажи версию загрузчика (например, 0.16.10 для Fabric)")
+            if loader == "vanilla":
+                lv = ""
+            changed = (m["mc_version"], m["loader"]) != (mc, loader) and bool(m["files"])
+            m.update(name=name, mc_version=mc, loader=loader, loader_version=lv)
+            _modpack_save(m)
+            log_action("modpack_settings", admin, f"{name} {mc} {loader} {lv}")
+            msg = "Настройки сохранены"
+            if changed:
+                msg += ". Файлы с Modrinth подобраны под прежние версию и загрузчик: удали и добавь их заново"
+            return jsonify({"success": True, "message": msg})
+
+        if action == "add_modrinth":
+            try:
+                added, skipped = _modpack_add_modrinth(
+                    m, data.get("query"), bool(data.get("optional")), bool(data.get("with_deps", True)))
+            except _McPluginError as e:
+                return fail(str(e))
+            if added:
+                _modpack_save(m)
+                log_action("modpack_add", admin, ", ".join(added)[:300])
+            parts = []
+            if added:
+                parts.append("Добавлено: " + ", ".join(added))
+            if skipped:
+                parts.append("Пропущено: " + ", ".join(skipped))
+            return jsonify({"success": True, "message": ". ".join(parts) or "Ничего не добавлено"})
+
+        if action in ("remove", "set_optional"):
+            fid = str(data.get("id", ""))
+            entry = next((f for f in m["files"] if f.get("id") == fid), None)
+            if not entry:
+                return fail("Файл не найден", 404)
+            if action == "remove":
+                m["files"] = [f for f in m["files"] if f is not entry]
+                _modpack_save(m)
+                _modpack_unlink_uploads(m, [entry])
+                log_action("modpack_remove", admin, entry["path"])
+                return jsonify({"success": True, "message": f"{entry['path']} удалён из сборки"})
+            entry["optional"] = bool(data.get("optional"))
+            _modpack_save(m)
+            return jsonify({"success": True, "message": "Сохранено"})
+
+        if action == "clear":
+            removed = list(m["files"])
+            m["files"] = []
+            _modpack_save(m)
+            _modpack_unlink_uploads(m, removed)
+            log_action("modpack_clear", admin, f"{len(removed)} файлов")
+            return jsonify({"success": True, "message": "Сборка очищена"})
+    return fail("Неизвестное действие", 404)
+
+
+@app.route('/admin/modpack_upload', methods=['POST'])
+@web_admin_required
+def admin_modpack_upload():
+    f = request.files.get('file')
+    root = str(request.form.get('root', 'mods'))
+    optional = request.form.get('optional') in ('1', 'true', 'on')
+    if root not in MODPACK_ROOTS or not f or not f.filename:
+        return jsonify({"success": False, "error": "Выбери файл и папку назначения"}), 400
+    fname = _modpack_clean_name(f.filename)
+    path = f"{root}/{fname}"
+    if not fname or not _modpack_path_ok(path) or not fname.lower().endswith(MODPACK_UPLOAD_EXT[root]):
+        return jsonify({"success": False, "error": "Недопустимое имя или расширение файла для этой папки: "
+                        + ", ".join(MODPACK_UPLOAD_EXT[root])}), 400
+    fid = secrets.token_hex(16)
+    dest = os.path.join(MODPACK_FILES_DIR, fid + ".bin")
+    tmp = dest + ".part"
+    try:
+        f.save(tmp)
+        size = os.path.getsize(tmp)
+        if size == 0 or size > MODPACK_UPLOAD_MAX:
+            raise ValueError("Файл пустой или больше 200 МБ")
+        if fname.lower().endswith((".jar", ".zip")) and not zipfile.is_zipfile(tmp):
+            raise ValueError("Файл повреждён: это не zip/jar-архив")
+        h = hashlib.sha256()
+        with open(tmp, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                h.update(chunk)
+        with _modpack_lock:
+            m = _modpack_load()
+            if len(m["files"]) >= MODPACK_MAX_FILES:
+                raise ValueError(f"В сборке не может быть больше {MODPACK_MAX_FILES} файлов")
+            os.replace(tmp, dest)
+            old = [x for x in m["files"] if x["path"] == path]
+            m["files"] = [x for x in m["files"] if x["path"] != path]
+            m["files"].append({"id": fid, "path": path, "title": fname, "size": size,
+                               "sha256": h.hexdigest(), "url": f"/api/modpack/file/{fid}",
+                               "source": "upload", "optional": optional})
+            _modpack_save(m)
+            _modpack_unlink_uploads(m, old)
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    log_action("modpack_upload", g.web_admin['nickname'], path)
+    return jsonify({"success": True, "message": f"{path} загружен ({size / 1048576:.1f} МБ)"})
+
+
+# ----- косметика: шапки за монеты, видны на сервере через плагин MafinCosmetics -----
+COSMETIC_SEED = (
+    ("Тыква", "Классическая тыква на голове", "CARVED_PUMPKIN", 0.75, 0.0, 100),
+    ("Торт", "Праздничный торт", "CAKE", 0.8, 0.0, 200),
+    ("Светокамень", "Светится даже днём", "GLOWSTONE", 0.7, 0.0, 300),
+    ("Алмазный блок", "Для тех, кто не бедствует", "DIAMOND_BLOCK", 0.7, 0.0, 500),
+    ("Маяк", "Маячок над головой", "BEACON", 0.7, 0.0, 800),
+    ("Яйцо дракона", "Редкая реликвия", "DRAGON_EGG", 0.75, 0.0, 1500),
+)
+_COSMETIC_MATERIAL_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+_COSMETIC_TEX_URL_RE = re.compile(r"^https?://textures\.minecraft\.net/texture/([0-9a-f]{16,128})$")
+_cosmetic_lock = threading.Lock()
+
+
+def _cosmetic_normalize_texture(raw):
+    """Приводит текстуру головы к ссылке textures.minecraft.net. Принимает ссылку, хэш или base64-значение."""
+    import base64
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{16,128}", raw):
+        return f"http://textures.minecraft.net/texture/{raw}"
+    m = _COSMETIC_TEX_URL_RE.match(raw)
+    if m:
+        return f"http://textures.minecraft.net/texture/{m.group(1)}"
+    try:
+        pad = raw + "=" * (-len(raw) % 4)
+        url = json.loads(base64.b64decode(pad).decode("utf-8"))["textures"]["SKIN"]["url"]
+    except Exception:
+        raise ValueError("Текстура: нужна ссылка textures.minecraft.net, хэш текстуры или base64-значение с minecraft-heads")
+    m = _COSMETIC_TEX_URL_RE.match(str(url))
+    if not m:
+        raise ValueError("Текстура должна лежать на textures.minecraft.net")
+    return f"http://textures.minecraft.net/texture/{m.group(1)}"
+
+
+def _cosmetic_server_lines():
+    """Строки для плагина: ник|материал|текстура|масштаб|сдвиг. Только игроки, которые сейчас в сессии."""
+    with _mc_sessions_lock:
+        sessions = dict(_mc_sessions)
+    if not sessions:
+        return []
+    db = get_db()
+    rows = db.execute(
+        "SELECT e.nickname, c.material, c.texture, c.scale, c.y_offset FROM cosmetic_equipped e "
+        "JOIN cosmetics c ON c.id = e.cosmetic_id "
+        "JOIN cosmetic_owned o ON o.nickname = e.nickname AND o.cosmetic_id = e.cosmetic_id").fetchall()
+    by_nick = {r["nickname"]: r for r in rows}
+    lines = []
+    for game_lower, sess in sessions.items():
+        r = by_nick.get(sess["nick"])
+        if not r or not SKIN_NAME_RE.fullmatch(game_lower):
+            continue
+        lines.append("hat|%s|%s|%s|%.3f|%.3f" % (game_lower, r["material"], r["texture"] or "-",
+                                                 r["scale"], r["y_offset"]))
+    return lines
+
+
+@app.route('/api/cosmetics/server', methods=['GET'])
+def cosmetics_server():
+    """Опрашивается плагином MafinCosmetics. Тот же секрет, что у MafinAuth."""
+    if not MC_SECRET:
+        return jsonify({"error": "disabled"}), 503
+    given = request.headers.get('X-Mc-Secret', '')
+    if not secrets.compare_digest(given.encode('utf-8'), MC_SECRET.encode('utf-8')):
+        return jsonify({"error": "forbidden"}), 403
+    lines = _cosmetic_server_lines()
+    return app.response_class("v1\n" + "".join(l + "\n" for l in lines), mimetype="text/plain")
+
+
+@app.route('/api/cosmetics', methods=['GET'])
+@auth_required
+def cosmetics_list():
+    db = get_db()
+    me = g.current_profile['nickname']
+    items = db.execute("SELECT id, title, description, price, enabled FROM cosmetics ORDER BY sort_order, id").fetchall()
+    owned = {r["cosmetic_id"] for r in db.execute(
+        "SELECT cosmetic_id FROM cosmetic_owned WHERE nickname = ?", (me,)).fetchall()}
+    eq = db.execute("SELECT cosmetic_id FROM cosmetic_equipped WHERE nickname = ?", (me,)).fetchone()
+    eq_id = eq["cosmetic_id"] if eq else None
+    out = []
+    for r in items:
+        has = r["id"] in owned
+        if not r["enabled"] and not has:
+            continue
+        out.append({"id": r["id"], "title": r["title"], "description": r["description"] or "",
+                    "price": r["price"], "owned": has, "equipped": has and r["id"] == eq_id})
+    return jsonify({"success": True, "coins": g.current_profile['coins'], "items": out,
+                    "equipped_id": eq_id if eq_id in owned else None})
+
+
+@app.route('/api/cosmetics/buy', methods=['POST'])
+@auth_required
+def cosmetics_buy():
+    data = request.get_json(silent=True) or {}
+    try:
+        cid = int(data.get('id'))
+    except (TypeError, ValueError):
+        return jsonify({"error": "id обязателен"}), 400
+    db = get_db()
+    me = g.current_profile['nickname']
+    item = db.execute("SELECT * FROM cosmetics WHERE id = ? AND enabled = 1", (cid,)).fetchone()
+    if not item:
+        return jsonify({"error": "Товар не найден или снят с продажи"}), 404
+    price = float(item['price'])
+    with _cosmetic_lock:
+        try:
+            db.execute("INSERT INTO cosmetic_owned (nickname, cosmetic_id, price_paid) VALUES (?, ?, ?)",
+                       (me, cid, price))
+        except sqlite3.IntegrityError:
+            db.rollback()
+            return jsonify({"error": "Это уже куплено"}), 409
+        cur = db.execute("UPDATE profiles SET coins = coins - ? WHERE id = ? AND coins >= ?",
+                         (price, g.current_profile['id'], price))
+        if cur.rowcount == 0:
+            db.rollback()
+            return jsonify({"error": "Недостаточно монет"}), 402
+        db.commit()
+    log_action("cosmetic_buy", me, f"{item['title']} (-{price:g} монет)")
+    coins = db.execute("SELECT coins FROM profiles WHERE id = ?", (g.current_profile['id'],)).fetchone()['coins']
+    return jsonify({"success": True, "total_coins": coins})
+
+
+@app.route('/api/cosmetics/equip', methods=['POST'])
+@auth_required
+def cosmetics_equip():
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    me = g.current_profile['nickname']
+    cid = data.get('id')
+    if cid is None:
+        db.execute("DELETE FROM cosmetic_equipped WHERE nickname = ?", (me,))
+        db.commit()
+        return jsonify({"success": True, "equipped_id": None})
+    try:
+        cid = int(cid)
+    except (TypeError, ValueError):
+        return jsonify({"error": "id обязателен"}), 400
+    if not db.execute("SELECT 1 FROM cosmetic_owned WHERE nickname = ? AND cosmetic_id = ?", (me, cid)).fetchone():
+        return jsonify({"error": "Сначала купи эту шапку"}), 403
+    db.execute("INSERT OR REPLACE INTO cosmetic_equipped (nickname, cosmetic_id) VALUES (?, ?)", (me, cid))
+    db.commit()
+    return jsonify({"success": True, "equipped_id": cid})
+
+
+@app.route('/admin/cosmetics', methods=['GET'])
+@web_admin_required
+def admin_cosmetics_page():
+    return app.response_class(COSMETICS_ADMIN_TEMPLATE, mimetype="text/html")
+
+
+@app.route('/admin/cosmetics/data', methods=['GET'])
+@web_admin_required
+def admin_cosmetics_data():
+    db = get_db()
+    items = db.execute(
+        "SELECT c.*, (SELECT COUNT(*) FROM cosmetic_owned o WHERE o.cosmetic_id = c.id) AS owners "
+        "FROM cosmetics c ORDER BY c.sort_order, c.id").fetchall()
+    plugin = any(p["name"].lower() == "mafincosmetics" for p in _mc_list_plugins())
+    return jsonify({"items": [dict(r) for r in items], "plugin": plugin, "server_running": bool(_mc_pid())})
+
+
+@app.route('/admin/cosmetics/<action>', methods=['POST'])
+@web_admin_required
+def admin_cosmetics_action(action):
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Ожидается JSON"}), 400
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    admin = g.web_admin['nickname']
+
+    def fail(msg, code=400):
+        return jsonify({"success": False, "error": msg}), code
+
+    if action == "item_save":
+        title = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("title", ""))).strip()
+        desc = re.sub(r"[\x00-\x1f\x7f]", " ", str(data.get("description", ""))).strip()
+        material = str(data.get("material", "")).strip().upper()
+        try:
+            price = float(data.get("price"))
+            scale = float(data.get("scale", 0.7))
+            y_off = float(data.get("y_offset", 0))
+            order = int(data.get("sort_order", 0))
+            texture = _cosmetic_normalize_texture(data.get("texture", ""))
+        except ValueError as e:
+            return fail(str(e) if "Текстур" in str(e) else "Цена, масштаб, сдвиг и порядок должны быть числами")
+        except TypeError:
+            return fail("Цена, масштаб, сдвиг и порядок должны быть числами")
+        if not 1 <= len(title) <= 40:
+            return fail("Название: от 1 до 40 символов")
+        if len(desc) > 200:
+            return fail("Описание: не больше 200 символов")
+        if not _COSMETIC_MATERIAL_RE.fullmatch(material):
+            return fail("Материал: имя из Bukkit Material, например CARVED_PUMPKIN или PLAYER_HEAD")
+        if material == "PLAYER_HEAD" and not texture:
+            return fail("Для PLAYER_HEAD нужна текстура головы")
+        if not 0 < price <= 1000000:
+            return fail("Цена должна быть больше 0")
+        if not 0.1 <= scale <= 3.0:
+            return fail("Масштаб: от 0.1 до 3")
+        if not -2.0 <= y_off <= 3.0:
+            return fail("Сдвиг по высоте: от -2 до 3")
+        enabled = 1 if data.get("enabled", True) else 0
+        item_id = data.get("id")
+        if item_id:
+            cur = db.execute(
+                "UPDATE cosmetics SET title=?, description=?, material=?, texture=?, scale=?, y_offset=?, "
+                "price=?, enabled=?, sort_order=? WHERE id=?",
+                (title, desc, material, texture, scale, y_off, price, enabled, order, int(item_id)))
+            if cur.rowcount == 0:
+                return fail("Товар не найден", 404)
+        else:
+            db.execute(
+                "INSERT INTO cosmetics (title, description, material, texture, scale, y_offset, price, enabled, sort_order) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", (title, desc, material, texture, scale, y_off, price, enabled, order))
+        db.commit()
+        log_action("cosmetic_save", admin, title)
+        return jsonify({"success": True, "message": "Сохранено"})
+
+    if action == "item_delete":
+        try:
+            item_id = int(data.get("id"))
+        except (TypeError, ValueError):
+            return fail("id обязателен")
+        owners = db.execute("SELECT COUNT(*) AS n FROM cosmetic_owned WHERE cosmetic_id = ?", (item_id,)).fetchone()["n"]
+        if owners:
+            return fail(f"У этой шапки есть владельцы ({owners}). Сними её с продажи, а не удаляй")
+        db.execute("DELETE FROM cosmetics WHERE id = ?", (item_id,))
+        db.commit()
+        log_action("cosmetic_delete", admin, str(item_id))
+        return jsonify({"success": True, "message": "Удалено"})
+
+    if action == "seed":
+        have = {r["title"] for r in db.execute("SELECT title FROM cosmetics").fetchall()}
+        added = 0
+        for i, (title, desc, material, scale, y_off, price) in enumerate(COSMETIC_SEED):
+            if title in have:
+                continue
+            db.execute("INSERT INTO cosmetics (title, description, material, texture, scale, y_offset, price, enabled, sort_order) "
+                       "VALUES (?,?,?,?,?,?,?,1,?)", (title, desc, material, "", scale, y_off, price, i))
+            added += 1
+        db.commit()
+        return jsonify({"success": True, "message": f"Добавлено примеров: {added}"})
+
+    return fail("Неизвестное действие", 404)
+
+
+# ----- недельный топ по времени в игре -----
+def _parse_weekly_rewards():
+    raw = os.environ.get("MAFIN_WEEKLY_REWARDS", "500,300,150")
+    out = []
+    for part in raw.split(","):
+        try:
+            v = float(part.strip())
+        except ValueError:
+            continue
+        if v > 0:
+            out.append(v)
+    return out[:10]
+
+
+WEEKLY_REWARDS = _parse_weekly_rewards()
+try:
+    WEEKLY_MIN_MINUTES = float(os.environ.get("MAFIN_WEEKLY_MIN_MINUTES", "30"))
+except ValueError:
+    WEEKLY_MIN_MINUTES = 30.0
+_weekly_lock = threading.Lock()
+
+
+def _week_start(dt=None):
+    dt = dt or datetime.now()
+    monday = dt - timedelta(days=dt.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _weekly_ranking(db, start, end, limit):
+    return db.execute(
+        "SELECT s.nickname AS nickname, SUM(s.duration_minutes) AS minutes, SUM(s.coins_earned) AS coins, "
+        "p.last_seen AS last_seen FROM play_sessions s JOIN profiles p ON p.nickname = s.nickname "
+        "WHERE s.start_time >= ? AND s.start_time < ? AND p.is_banned = 0 "
+        "GROUP BY s.nickname HAVING SUM(s.duration_minutes) > 0 "
+        "ORDER BY minutes DESC, s.nickname ASC LIMIT ?",
+        (start.isoformat(), end.isoformat(), limit)).fetchall()
+
+
+def _weekly_settle(now=None):
+    """Выплачивает награды за закончившиеся недели. Безопасно вызывать сколько угодно раз."""
+    now = now or datetime.now()
+    prev_start = _week_start(now) - timedelta(days=7)
+    paid_total = 0
+    with _weekly_lock:
+        db = sqlite3.connect(DB_PATH)
+        db.row_factory = sqlite3.Row
+        try:
+            last = db.execute("SELECT MAX(week_start) AS w FROM weekly_awards").fetchone()["w"]
+            if last is None:
+                # первый запуск: прошлые недели не оплачиваем, считаем отсчёт с ближайшей
+                db.execute("INSERT OR IGNORE INTO weekly_awards (week_start, rank, nickname, minutes, coins) "
+                           "VALUES (?, 0, '', 0, 0)", (prev_start.date().isoformat(),))
+                db.commit()
+                return 0
+            week = datetime.fromisoformat(last) + timedelta(days=7)
+            while week <= prev_start:
+                key = week.date().isoformat()
+                rows = _weekly_ranking(db, week, week + timedelta(days=7), len(WEEKLY_REWARDS))
+                try:
+                    db.execute("INSERT INTO weekly_awards (week_start, rank, nickname, minutes, coins) "
+                               "VALUES (?, 0, '', 0, 0)", (key,))
+                    rank = 0
+                    for r in rows:
+                        if r["minutes"] < WEEKLY_MIN_MINUTES:
+                            break
+                        reward = WEEKLY_REWARDS[rank]
+                        rank += 1
+                        db.execute("INSERT INTO weekly_awards (week_start, rank, nickname, minutes, coins) "
+                                   "VALUES (?, ?, ?, ?, ?)", (key, rank, r["nickname"], r["minutes"], reward))
+                        db.execute("UPDATE profiles SET coins = coins + ? WHERE nickname = ?", (reward, r["nickname"]))
+                        db.execute("INSERT INTO server_logs (action, nickname, details) VALUES (?, ?, ?)",
+                                   ("weekly_award", r["nickname"], f"неделя {key}: место {rank}, +{reward:g} монет"))
+                        paid_total += 1
+                    db.commit()
+                except sqlite3.IntegrityError:
+                    db.rollback()
+                week += timedelta(days=7)
+        finally:
+            db.close()
+    return paid_total
+
+
+def _weekly_loop():
+    while True:
+        try:
+            _weekly_settle()
+        except Exception as e:
+            print(f"[weekly] ошибка выплаты наград: {e}")
+        time.sleep(3600)
+
+
+@app.route('/api/top/weekly', methods=['GET'])
+def get_top_weekly():
+    limit = min(max(request.args.get('limit', 10, type=int), 1), 50)
+    try:
+        _weekly_settle()
+    except Exception as e:
+        print(f"[weekly] ошибка выплаты наград: {e}")
+    now = datetime.now()
+    start = _week_start(now)
+    end = start + timedelta(days=7)
+    db = get_db()
+    rows = _weekly_ranking(db, start, end, limit)
+    top = [{"rank": i, "nickname": r["nickname"], "minutes": round(r["minutes"], 1),
+            "coins": round(r["coins"] or 0, 1), "is_online": is_online(r["last_seen"])}
+           for i, r in enumerate(rows, 1)]
+    last = db.execute("SELECT MAX(week_start) AS w FROM weekly_awards WHERE rank > 0").fetchone()["w"]
+    last_week = None
+    if last:
+        winners = db.execute("SELECT rank, nickname, minutes, coins FROM weekly_awards "
+                             "WHERE week_start = ? AND rank > 0 ORDER BY rank", (last,)).fetchall()
+        last_week = {"week_start": last, "winners": [dict(w) for w in winners]}
+    return jsonify({"success": True, "week_start": start.date().isoformat(),
+                    "seconds_left": max(0, int((end - now).total_seconds())),
+                    "rewards": WEEKLY_REWARDS, "min_minutes": WEEKLY_MIN_MINUTES,
+                    "top": top, "last_week": last_week})
+
+
+_ADMIN_EXTRA_CSS = """
+* {box-sizing:border-box}
+body{background:#1a1d23;color:#e1e4e8;font-family:'Segoe UI',Arial,sans-serif;margin:0}
+header{background:#242830;padding:16px 28px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #2d323c}
+header h1{font-size:18px;margin:0;color:#43b581}
+header a{color:#7a8599;text-decoration:none;font-size:13px;margin-left:14px}
+header a:hover{color:#fff}
+main{padding:24px 28px;max-width:1100px;margin:0 auto}
+section{background:#242830;border-radius:10px;padding:20px;margin-bottom:20px}
+section h2{margin-top:0;font-size:15px;color:#43b581}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px}
+label{font-size:12px;color:#7a8599;display:flex;flex-direction:column;gap:4px}
+input[type=text],input[type=number],select{padding:8px;border-radius:6px;border:1px solid #2d323c;background:#2d323c;color:#fff;font-size:13px}
+button{background:#2d323c;color:#e1e4e8;border:none;padding:8px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+button:hover{background:#3a3f4a}
+button.primary{background:#43b581;color:#fff;font-weight:bold}
+button.danger:hover{background:#f04747}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #2d323c}
+th{color:#7a8599;font-weight:normal;font-size:12px}
+.ok{color:#43b581}.bad{color:#f04747}.warn{color:#faa61a}.muted{color:#7a8599;font-size:12px}
+#msg{margin-top:12px;font-size:13px;min-height:18px}
+"""
+
+_ADMIN_EXTRA_JS = """
+function esc(t){const d=document.createElement('div');d.textContent=t==null?'':String(t);return d.innerHTML}
+function val(id){return document.getElementById(id).value.trim()}
+function setMsg(t,ok){const m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'bad'}
+"""
+
+COSMETICS_ADMIN_TEMPLATE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Mafin Launcher — Косметика</title>
+<style>""" + _ADMIN_EXTRA_CSS + """</style></head>
+<body>
+<header><h1>🎩 Косметика (шапки)</h1>
+<div><a href="/admin/shop">🛒 Магазин</a><a href="/admin/minecraft">🖥 Сервер</a><a href="/admin/dashboard">← Панель</a><a href="/admin/logout">Выйти</a></div></header>
+<main>
+<section>
+  <h2>Состояние</h2>
+  <div id="state" class="muted">Загрузка…</div>
+  <p class="muted">Игрок покупает шапку в лаунчере за монеты и надевает её. Плагин <b>MafinCosmetics</b> на сервере раз в несколько секунд
+  спрашивает у этого сервера, у кого что надето, и показывает шапку над головой всем игрокам. Плагин нужно собрать из папки
+  <code>mafin-cosmetics</code> и загрузить на странице сервера (его секрет и адрес пропишутся автоматически при запуске сервера).</p>
+  <p class="muted"><b>Материал</b> — имя из Bukkit Material (<code>CARVED_PUMPKIN</code>, <code>CAKE</code>, <code>BEACON</code>…).
+  Для своей формы возьми <code>PLAYER_HEAD</code> и вставь текстуру с minecraft-heads.com (поле «Value», ссылка или хэш).
+  Масштаб и сдвиг подбираются глазами: в плагине есть команда <code>/mafinhat preview МАТЕРИАЛ масштаб сдвиг</code> для оператора.</p>
+  <div class="row"><button onclick="act('seed',{})">➕ Добавить примеры</button></div>
+  <div id="msg"></div>
+</section>
+<section>
+  <h2 id="formTitle">Новая шапка</h2>
+  <div class="row">
+    <label>Название<input type="text" id="f_title" maxlength="40" style="width:180px"></label>
+    <label>Материал<input type="text" id="f_material" maxlength="64" style="width:180px" placeholder="CARVED_PUMPKIN"></label>
+    <label>Цена, монет<input type="number" id="f_price" value="200" min="0" step="any" style="width:100px"></label>
+    <label>Масштаб<input type="number" id="f_scale" value="0.7" min="0.1" max="3" step="0.05" style="width:80px"></label>
+    <label>Сдвиг по высоте<input type="number" id="f_y" value="0" min="-2" max="3" step="0.05" style="width:100px"></label>
+    <label>Порядок<input type="number" id="f_order" value="0" style="width:70px"></label>
+    <label style="flex-direction:row;align-items:center;gap:6px;padding-bottom:8px"><input type="checkbox" id="f_enabled" checked> в продаже</label>
+  </div>
+  <div class="row">
+    <label style="flex:1">Текстура головы (для PLAYER_HEAD)<input type="text" id="f_texture" style="width:100%"></label>
+  </div>
+  <div class="row">
+    <label style="flex:1">Описание<input type="text" id="f_desc" maxlength="200" style="width:100%"></label>
+    <button class="primary" onclick="saveItem()">💾 Сохранить</button>
+    <button onclick="resetForm()">Очистить</button>
+  </div>
+</section>
+<section>
+  <h2>Шапки</h2>
+  <table><thead><tr><th>Название</th><th>Материал</th><th>Цена</th><th>Владельцев</th><th>Статус</th><th></th></tr></thead>
+  <tbody id="items"></tbody></table>
+</section>
+</main>
+<script>""" + _ADMIN_EXTRA_JS + """
+let editId=null,byId={};
+async function call(action,body){
+  const r=await fetch('/admin/cosmetics/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  let d={};try{d=await r.json()}catch(e){}
+  return d;
+}
+async function act(action,body){const d=await call(action,body);setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);load();return d}
+function resetForm(){
+  editId=null;document.getElementById('formTitle').textContent='Новая шапка';
+  ['f_title','f_material','f_texture','f_desc'].forEach(i=>document.getElementById(i).value='');
+  document.getElementById('f_price').value=200;document.getElementById('f_scale').value=0.7;
+  document.getElementById('f_y').value=0;document.getElementById('f_order').value=0;document.getElementById('f_enabled').checked=true;
+}
+function saveItem(){
+  act('item_save',{id:editId,title:val('f_title'),material:val('f_material'),texture:val('f_texture'),price:val('f_price'),
+    scale:val('f_scale'),y_offset:val('f_y'),sort_order:val('f_order'),description:val('f_desc'),
+    enabled:document.getElementById('f_enabled').checked}).then(d=>{if(d.success)resetForm()});
+}
+function editItem(id){
+  const it=byId[id];if(!it)return;
+  editId=id;document.getElementById('formTitle').textContent='Изменить шапку';
+  document.getElementById('f_title').value=it.title;document.getElementById('f_material').value=it.material;
+  document.getElementById('f_texture').value=it.texture||'';document.getElementById('f_price').value=it.price;
+  document.getElementById('f_scale').value=it.scale;document.getElementById('f_y').value=it.y_offset;
+  document.getElementById('f_order').value=it.sort_order;document.getElementById('f_desc').value=it.description||'';
+  document.getElementById('f_enabled').checked=!!it.enabled;window.scrollTo(0,0);
+}
+async function load(){
+  let d={};try{d=await (await fetch('/admin/cosmetics/data')).json()}catch(e){return}
+  document.getElementById('state').innerHTML='Сервер: '+(d.server_running?'<span class="ok">запущен</span>':'<span class="warn">остановлен</span>')+
+    ' · Плагин MafinCosmetics: '+(d.plugin?'<span class="ok">установлен</span>':'<span class="bad">не установлен — шапки не будут видны в игре</span>');
+  byId={};
+  document.getElementById('items').innerHTML=d.items.map(it=>{byId[it.id]=it;
+    return '<tr><td>'+esc(it.title)+'<div class="muted">'+esc(it.description)+'</div></td><td><code>'+esc(it.material)+'</code></td><td>'+esc(it.price)+' 🪙</td><td>'+it.owners+'</td><td>'+
+    (it.enabled?'<span class="ok">в продаже</span>':'<span class="muted">скрыта</span>')+'</td><td><button data-edit="'+it.id+'">Изменить</button> <button class="danger" data-del="'+it.id+'">Удалить</button></td></tr>'}).join('')||
+    '<tr><td colspan="6" class="muted">Шапок пока нет. Нажми «Добавить примеры» или создай свою.</td></tr>';
+}
+document.addEventListener('click',function(e){
+  const b=e.target.closest('button');if(!b)return;
+  if(b.dataset.edit)editItem(Number(b.dataset.edit));
+  else if(b.dataset.del){if(confirm('Удалить шапку?'))act('item_delete',{id:Number(b.dataset.del)})}
+});
+load();setInterval(load,8000);
+</script>
+</body></html>
+"""
+
+MODPACK_ADMIN_TEMPLATE = """<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>Mafin Launcher — Сборка сервера</title>
+<style>""" + _ADMIN_EXTRA_CSS + """</style></head>
+<body>
+<header><h1>🧩 Сборка сервера</h1>
+<div><a href="/admin/minecraft">🖥 Сервер</a><a href="/admin/dashboard">← Панель</a><a href="/admin/logout">Выйти</a></div></header>
+<main>
+<section>
+  <h2>Что это</h2>
+  <p class="muted">Рекомендуемый набор для клиента: загрузчик, моды, ресурспаки, шейдеры и конфиги. Игрок нажимает одну кнопку в лаунчере,
+  и у него появляется сборка с этими файлами; при каждом изменении здесь лаунчер предложит обновиться. Файлы с Modrinth игроки качают
+  напрямую оттуда (с проверкой хэша), свои файлы отдаёт этот сервер. Сам Paper-сервер модов не использует: сборка нужна клиентам.</p>
+  <div id="msg"></div>
+</section>
+<section>
+  <h2>Настройки <span class="muted" id="rev"></span></h2>
+  <div class="row">
+    <label>Название<input type="text" id="s_name" maxlength="40" style="width:200px"></label>
+    <label>Версия Minecraft<input type="text" id="s_mc" style="width:110px" placeholder="1.21.1"></label>
+    <label>Загрузчик<select id="s_loader"><option>vanilla</option><option>fabric</option><option>forge</option><option>neoforge</option><option>quilt</option></select></label>
+    <label>Версия загрузчика<input type="text" id="s_lv" style="width:140px" placeholder="0.16.10"></label>
+    <button class="primary" onclick="saveSettings()">💾 Сохранить</button>
+  </div>
+</section>
+<section>
+  <h2>Добавить с Modrinth</h2>
+  <div class="row">
+    <label style="flex:1">Ссылка или slug<input type="text" id="m_q" style="width:100%" placeholder="https://modrinth.com/mod/sodium"></label>
+    <label style="flex-direction:row;align-items:center;gap:6px;padding-bottom:8px"><input type="checkbox" id="m_deps" checked> с зависимостями</label>
+    <label style="flex-direction:row;align-items:center;gap:6px;padding-bottom:8px"><input type="checkbox" id="m_opt"> необязательный</label>
+    <button class="primary" onclick="addModrinth()">➕ Добавить</button>
+  </div>
+  <p class="muted">Подбирается свежий релиз под версию и загрузчик из настроек. Моды, ресурспаки и шейдеры определяются автоматически.</p>
+</section>
+<section>
+  <h2>Загрузить свой файл</h2>
+  <div class="row">
+    <label>Папка<select id="u_root"><option value="mods">mods</option><option value="resourcepacks">resourcepacks</option><option value="shaderpacks">shaderpacks</option><option value="config">config</option></select></label>
+    <label>Файл<input type="file" id="u_file"></label>
+    <label style="flex-direction:row;align-items:center;gap:6px;padding-bottom:8px"><input type="checkbox" id="u_opt"> необязательный</label>
+    <button class="primary" onclick="upload()">⬆ Загрузить</button>
+  </div>
+</section>
+<section>
+  <h2>Файлы сборки <span class="muted" id="count"></span></h2>
+  <div class="row" style="margin:0 0 10px"><button class="danger" onclick="if(confirm('Убрать все файлы из сборки?'))act('clear',{})">Очистить сборку</button></div>
+  <table><thead><tr><th>Путь</th><th>Название</th><th>Источник</th><th>Размер</th><th>Необязательный</th><th></th></tr></thead>
+  <tbody id="files"></tbody></table>
+</section>
+</main>
+<script>""" + _ADMIN_EXTRA_JS + """
+async function call(action,body){
+  const r=await fetch('/admin/modpack/'+action,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
+  let d={};try{d=await r.json()}catch(e){}
+  return d;
+}
+async function act(action,body){setMsg('Работаю…',true);const d=await call(action,body);setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);load();return d}
+function saveSettings(){act('settings',{name:val('s_name'),mc_version:val('s_mc'),loader:val('s_loader'),loader_version:val('s_lv')})}
+function addModrinth(){act('add_modrinth',{query:val('m_q'),with_deps:document.getElementById('m_deps').checked,optional:document.getElementById('m_opt').checked}).then(d=>{if(d.success)document.getElementById('m_q').value=''})}
+async function upload(){
+  const f=document.getElementById('u_file').files[0];if(!f){setMsg('Выбери файл',false);return}
+  const fd=new FormData();fd.append('file',f);fd.append('root',val('u_root'));fd.append('optional',document.getElementById('u_opt').checked?'1':'0');
+  setMsg('Загружаю…',true);
+  const r=await fetch('/admin/modpack_upload',{method:'POST',body:fd});let d={};try{d=await r.json()}catch(e){}
+  setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);if(d.success)document.getElementById('u_file').value='';load();
+}
+let first=true;
+async function load(){
+  let d={};try{d=await (await fetch('/admin/modpack/data')).json()}catch(e){return}
+  document.getElementById('rev').textContent=d.revision?('· ревизия '+d.revision+(d.updated_at?', '+d.updated_at.replace('T',' ').slice(0,16):'')):'';
+  if(first||document.activeElement===document.body){
+    document.getElementById('s_name').value=d.name||'';document.getElementById('s_mc').value=d.mc_version||'';
+    document.getElementById('s_loader').value=d.loader||'vanilla';document.getElementById('s_lv').value=d.loader_version||'';first=false;
+  }
+  const total=d.files.reduce((a,f)=>a+(f.size||0),0);
+  document.getElementById('count').textContent='· '+d.files.length+' шт., '+(total/1048576).toFixed(1)+' МБ';
+  document.getElementById('files').innerHTML=d.files.map(f=>'<tr><td><code>'+esc(f.path)+'</code></td><td>'+esc(f.title)+(f.version?'<div class="muted">'+esc(f.version)+'</div>':'')+'</td><td>'+(f.source==='modrinth'?'Modrinth':'свой файл')+'</td><td>'+((f.size||0)/1048576).toFixed(2)+' МБ</td><td><input type="checkbox" data-opt="'+f.id+'" '+(f.optional?'checked':'')+'></td><td><button class="danger" data-rm="'+f.id+'">Убрать</button></td></tr>').join('')||'<tr><td colspan="6" class="muted">Файлов пока нет</td></tr>';
+}
+document.addEventListener('click',function(e){const b=e.target.closest('button[data-rm]');if(b&&confirm('Убрать файл из сборки?'))act('remove',{id:b.dataset.rm})});
+document.addEventListener('change',function(e){const c=e.target.closest('input[data-opt]');if(c)act('set_optional',{id:c.dataset.opt,optional:c.checked})});
+load();
+</script>
+</body></html>
+"""
+
+
+
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == "set-password":
         _cli_set_password(sys.argv[2])
@@ -5420,6 +6731,7 @@ if __name__ == '__main__':
     init_db()
     _mc_guard_start()
     _shop_start()
+    threading.Thread(target=_weekly_loop, daemon=True).start()
     threading.Thread(target=_skin_push_loop, daemon=True).start()
     if os.environ.get("MAFIN_MC_AUTOSTART") == "1":
         try:
