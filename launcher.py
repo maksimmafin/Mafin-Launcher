@@ -243,7 +243,7 @@ def play_achievement_sound():
 DISCORD_CLIENT_ID = "1548297015220371496"
 
 # Адрес сервера лаунчера. Задай через переменную окружения MAFIN_SERVER_URL
-SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http:/127.0.0.1:3096")
+SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://178.254.177.109:10074")
 
 AUTHLIB_INJECTOR_LATEST = "https://authlib-injector.yushi.moe/artifact/latest.json"
 AUTHLIB_INJECTOR_FALLBACK = ("https://github.com/yushijinhun/authlib-injector/releases/download/"
@@ -854,6 +854,8 @@ DEFAULT_CONFIG = {
     "minecraft_dir": os.path.join(os.getcwd(), GAME_DIR_NAME),
     "java_path": "java",
     "memory_mb": 2048,
+    "auto_memory": False,
+    "jvm_preset": "default",
     "last_version": "",
     "accounts": [],
     "selected_account": 0,
@@ -938,6 +940,21 @@ class ServerAPI:
         r = requests.delete(f"{self.base_url}{path}", headers=self._headers(), timeout=10)
         return r.status_code, self._safe_json(r)
 
+    def cosmetics_list(self):
+        return self._get("/api/cosmetics")
+
+    def cosmetics_buy(self, cosmetic_id):
+        return self._post("/api/cosmetics/buy", {"id": cosmetic_id})
+
+    def cosmetics_equip(self, cosmetic_id):
+        return self._post("/api/cosmetics/equip", {"id": cosmetic_id})
+
+    def top_weekly(self, limit=20):
+        return self._get("/api/top/weekly", params={"limit": limit})
+
+    def modpack_manifest(self):
+        return self._get("/api/modpack", timeout=20)
+
     def register(self, nickname, password):
         return self._post("/api/register", {"nickname": nickname, "password": password})
 
@@ -959,13 +976,16 @@ class ServerAPI:
             self.is_admin = bool(data.get("is_admin"))
             self.coins = data.get("coins", 0)
             self.playtime = data.get("total_playtime_minutes", 0)
-            return True, data, False
-        rejected = status in (401, 403)
-        if rejected:
+            return True, data
+        if status in (401, 403):
+            # токен реально отвергнут сервером
             self.token = None
-        return False, data, rejected
+            return False, data
+        # сервер временно недоступен / 5xx / 429 — токен не трогаем
+        return False, {"_transient": True, "status": status, "error": data.get("error") if isinstance(data, dict) else None}
 
-    def drop_local_session(self):
+    def drop_local(self):
+        """Сбросить сессию только локально, не трогая токен на сервере."""
         self.token = None
         self.nickname = None
         self.is_admin = False
@@ -1686,6 +1706,7 @@ class StatsManager:
     def get_summary(self):
         launches = self.stats.get("total_launches", 0)
         minutes = self.stats.get("total_play_time_minutes", 0)
+        minutes = int(round(minutes))
         hours = minutes // 60
         mins = minutes % 60
         last = self.stats.get("last_launch", "Никогда")
@@ -2792,6 +2813,7 @@ class LauncherCore:
         self.memory = config.get("memory_mb", 2048)
         self.pack_java = None
         self.pack_memory = None
+        self.jvm_preset = config.get("jvm_preset", "default")
         self.accounts = config.get("accounts", [])
         self.selected_account = config.get("selected_account", 0)
 
@@ -3459,6 +3481,7 @@ class LauncherCore:
             "userType": "legacy",
             "jvmArguments": [f"-Xmx{self.effective_memory()}M", f"-Xms{self.effective_memory() // 2}M"],
         }
+        options["jvmArguments"] += jvm_preset_flags(getattr(self, "jvm_preset", "default"), self.effective_memory())
         skin_url = getattr(self, "skin_server_url", "")
         if skin_url:
             options["jvmArguments"] += skin_agent_jvm_args(skin_url, status_callback)
@@ -4813,6 +4836,784 @@ def find_mod_updates(client, mods_dir, loaders, game_version):
     return updates, len(files), len(by_hash) - len(current)
 
 
+import hashlib
+
+# ===== Автоподбор ОЗУ и JVM-флагов =====
+def get_system_memory_mb():
+    """(всего МБ, свободно МБ) или (None, None), если узнать не удалось."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = _MemStatus()
+            st.dwLength = ctypes.sizeof(_MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys // 1048576), int(st.ullAvailPhys // 1048576)
+        elif sys.platform == "darwin":
+            total = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, timeout=3).strip()) // 1048576
+            free = None
+            try:
+                out = subprocess.check_output(["vm_stat"], text=True, timeout=3)
+                page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+                pages = sum(int(m.group(1)) for m in re.finditer(r"Pages (?:free|inactive|speculative):\s+(\d+)", out))
+                free = pages * page // 1048576
+            except Exception:
+                pass
+            return total, free
+        else:
+            vals = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    vals[k] = int(v.split()[0])
+            total = vals.get("MemTotal")
+            free = vals.get("MemAvailable", vals.get("MemFree"))
+            if total:
+                return total // 1024, (free // 1024 if free else None)
+    except Exception:
+        pass
+    return None, None
+
+
+def count_enabled_mods(mods_dir):
+    try:
+        return sum(1 for f in os.listdir(mods_dir) if f.lower().endswith((".jar", ".litemod")))
+    except OSError:
+        return 0
+
+
+def recommend_memory(total_mb, free_mb, mods_count, loader, mc_version):
+    """Подбирает ОЗУ под машину и сборку. Возвращает {'mb', 'reason', 'capped'}."""
+    m = re.match(r"(\d+)\.(\d+)", str(mc_version or ""))
+    key = (int(m.group(1)), int(m.group(2))) if m else None
+    old = key is not None and key < (1, 13)
+    modded = bool(loader) and loader != "vanilla"
+    if modded:
+        want = 3072 + 32 * max(0, int(mods_count))
+        if old:
+            want = int(want * 0.8)
+        want = min(want, 10240)
+    else:
+        want = 3072 if (key is None or key >= (1, 17)) else 2048
+    capped = False
+    if total_mb:
+        limit = total_mb - max(2048, total_mb // 4)
+        if free_mb:
+            limit = min(limit, max(free_mb - 512, 1024))
+        limit = max(limit, 1024)
+        if want > limit:
+            want, capped = limit, True
+    mb = max(1024, int(want) // 256 * 256)
+    parts = []
+    if total_mb:
+        parts.append(f"ОЗУ компьютера: {total_mb / 1024:.1f} ГБ" + (f", свободно сейчас: {free_mb / 1024:.1f} ГБ" if free_mb else ""))
+    else:
+        parts.append("объём ОЗУ компьютера определить не удалось")
+    parts.append(f"модов: {mods_count}" if modded else "без модов")
+    reason = "; ".join(parts) + f" → {mb / 1024:.2g} ГБ ({mb} МБ)"
+    if capped:
+        reason += ". Ограничено, чтобы системе осталась память"
+    return {"mb": mb, "reason": reason, "capped": capped}
+
+
+_JVM_MOJANG = ["-XX:+UnlockExperimentalVMOptions", "-XX:+UseG1GC", "-XX:G1NewSizePercent=20",
+               "-XX:G1ReservePercent=20", "-XX:MaxGCPauseMillis=50", "-XX:G1HeapRegionSize=32M"]
+_JVM_OPTIMIZED = ["-XX:+UseG1GC", "-XX:+ParallelRefProcEnabled", "-XX:MaxGCPauseMillis=200",
+                  "-XX:+UnlockExperimentalVMOptions", "-XX:G1NewSizePercent=30", "-XX:G1MaxNewSizePercent=40",
+                  "-XX:G1HeapRegionSize=8M", "-XX:G1ReservePercent=20", "-XX:G1HeapWastePercent=5",
+                  "-XX:G1MixedGCCountTarget=4", "-XX:InitiatingHeapOccupancyPercent=15",
+                  "-XX:G1MixedGCLiveThresholdPercent=90", "-XX:G1RSetUpdatingPauseTimePercent=5",
+                  "-XX:SurvivorRatio=32", "-XX:+PerfDisableSharedMem", "-XX:MaxTenuringThreshold=1"]
+JVM_PRESET_TITLES = {"default": "Без доп. флагов", "auto": "Автоматически (по объёму ОЗУ)",
+                     "mojang": "Как в лаунчере Mojang (G1GC)", "optimized": "Оптимизированный G1GC (для сборок с модами)"}
+
+
+def resolve_jvm_preset(preset, mem_mb):
+    if preset == "auto":
+        return "optimized" if int(mem_mb or 0) >= 4096 else "mojang"
+    return preset if preset in ("mojang", "optimized") else "default"
+
+
+def jvm_preset_flags(preset, mem_mb):
+    name = resolve_jvm_preset(preset, mem_mb)
+    return list({"mojang": _JVM_MOJANG, "optimized": _JVM_OPTIMIZED}.get(name, []))
+
+
+# ===== Сборка сервера: синхронизация файлов =====
+SERVER_PACK_STATE_FILE = ".mafin_server_pack.json"
+SERVER_PACK_ROOTS = ("mods", "resourcepacks", "shaderpacks", "config")
+
+
+def _sp_hash_spec(f):
+    for algo in ("sha512", "sha256", "sha1"):
+        v = str(f.get(algo) or "").lower()
+        if v:
+            return algo, v
+    return None, None
+
+
+def _sp_file_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def serverpack_load_state(pack_dir):
+    try:
+        with open(os.path.join(pack_dir, SERVER_PACK_STATE_FILE), "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("files", {})
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"revision": 0, "files": {}}
+
+
+def serverpack_save_state(pack_dir, state):
+    os.makedirs(pack_dir, exist_ok=True)
+    path = os.path.join(pack_dir, SERVER_PACK_STATE_FILE)
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def serverpack_plan(manifest, pack_dir, state, optional_choice):
+    """Что скачать, что оставить и что удалить. Ничего не меняет на диске."""
+    files_state = state.get("files") or {}
+    wanted = [f for f in manifest.get("files", []) if not f.get("optional") or optional_choice.get(f.get("path"))]
+    download, keep, bad = [], [], []
+    for f in wanted:
+        path = str(f.get("path") or "")
+        target = _mrpack_safe_path(pack_dir, path)
+        algo, want = _sp_hash_spec(f)
+        if not target or path.split("/")[0] not in SERVER_PACK_ROOTS or not algo:
+            bad.append(path)
+            continue
+        root = path.split("/")[0]
+        recorded = files_state.get(path) or {}
+        exists = os.path.isfile(target)
+        if not exists and root == "mods" and os.path.isfile(target + ".disabled"):
+            keep.append(f)  # игрок сам отключил мод: не возвращаем его
+            continue
+        if not exists:
+            download.append(f)
+            continue
+        if root == "config" and recorded.get("hash") == want:
+            keep.append(f)  # конфиг не менялся на сервере: правки игрока не трогаем
+            continue
+        st = os.stat(target)
+        if recorded.get("hash") == want and recorded.get("size") == st.st_size and recorded.get("mtime") == int(st.st_mtime):
+            keep.append(f)
+            continue
+        size = int(f.get("size") or 0)
+        if (not size or st.st_size == size) and _sp_file_hash(target, algo) == want:
+            keep.append(f)
+        else:
+            download.append(f)
+    wanted_paths = {str(f.get("path")) for f in wanted}
+    remove = sorted(p for p in files_state if p not in wanted_paths)
+    return {"download": download, "keep": keep, "remove": remove, "bad": bad,
+            "download_bytes": sum(int(f.get("size") or 0) for f in download)}
+
+
+def serverpack_apply(manifest, pack_dir, plan, state, download, progress=None, workers=4):
+    """Скачивает файлы плана (download(f, tmp_path) пишет файл), проверяет хэши, удаляет лишнее.
+    Возвращает (новое состояние, список ошибок)."""
+    from concurrent.futures import ThreadPoolExecutor
+    files_state = dict(state.get("files") or {})
+    failed, lock, done = [], threading.Lock(), [0]
+    total = len(plan["download"])
+
+    def job(f):
+        path = f["path"]
+        target = _mrpack_safe_path(pack_dir, path)
+        tmp = target + ".part"
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            download(f, tmp)
+            algo, want = _sp_hash_spec(f)
+            if _sp_file_hash(tmp, algo) != want:
+                raise ValueError("не совпала контрольная сумма")
+            os.replace(tmp, target)
+            st = os.stat(target)
+            with lock:
+                files_state[path] = {"hash": want, "size": st.st_size, "mtime": int(st.st_mtime)}
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            with lock:
+                failed.append(f"{os.path.basename(path)}: {e}")
+        finally:
+            with lock:
+                done[0] += 1
+                n = done[0]
+            if progress:
+                progress(n, total, os.path.basename(path))
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        list(ex.map(job, plan["download"]))
+    for f in plan["keep"]:
+        path = f["path"]
+        target = _mrpack_safe_path(pack_dir, path)
+        _algo, want = _sp_hash_spec(f)
+        if (files_state.get(path) or {}).get("hash") == want or not target:
+            continue
+        if os.path.isfile(target):
+            st = os.stat(target)
+            files_state[path] = {"hash": want, "size": st.st_size, "mtime": int(st.st_mtime)}
+    for path in plan["remove"]:
+        target = _mrpack_safe_path(pack_dir, path)
+        for cand in ((target, target + ".disabled") if target else ()):
+            try:
+                os.remove(cand)
+            except OSError:
+                pass
+        files_state.pop(path, None)
+    new_state = {"revision": 0 if failed else int(manifest.get("revision") or 0), "files": files_state,
+                 "name": manifest.get("name", "")}
+    return new_state, failed
+
+
+def serverpack_download(api, f, dest):
+    """Скачивает один файл сборки: с нашего сервера (с токеном) или только с cdn.modrinth.com."""
+    url = str(f.get("url") or "")
+    headers = {"User-Agent": f"MafinLauncher/{APP_VERSION}"}
+    if url.startswith("/api/modpack/file/"):
+        full = api.base_url + url
+        if api.token:
+            headers["Authorization"] = f"Bearer {api.token}"
+    else:
+        p = urlparse(url)
+        if p.scheme != "https" or (p.hostname or "").lower() != "cdn.modrinth.com":
+            raise ValueError("недопустимая ссылка на файл")
+        full = url
+    with requests.get(full, headers=headers, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as out:
+            for chunk in r.iter_content(256 * 1024):
+                out.write(chunk)
+
+
+# ===== Поиск виновного мода =====
+BISECT_STATE_FILE = ".mafin_bisect.json"
+
+
+def build_mod_graph(mods_dir, names, loader="", mc_version=""):
+    """{файл: множество файлов, без которых он не запустится} по метаданным модов."""
+    checker = ModChecker(mods_dir, loader, mc_version)
+    provided, needs = {}, {}
+    for fn in names:
+        try:
+            with zipfile.ZipFile(os.path.join(mods_dir, fn)) as zf:
+                info = checker._parse_zip(zf)
+        except Exception:
+            needs[fn] = set()
+            continue
+        needs[fn] = {d for m in info["mods"] for d, _p in m["depends"] if d not in ModChecker.IGNORED_DEPS}
+        for m in info["mods"] + info["nested_mods"]:
+            provided.setdefault(m["id"], fn)
+            for pid in m["provides"]:
+                provided.setdefault(pid, fn)
+    graph = {}
+    for fn in names:
+        graph[fn] = {provided[d] for d in needs.get(fn, ()) if d in provided and provided[d] != fn}
+    return graph
+
+
+def make_closure(graph):
+    def closure(files):
+        out, stack = set(), list(files)
+        while stack:
+            fn = stack.pop()
+            if fn in out or fn not in graph:
+                continue
+            out.add(fn)
+            stack.extend(graph[fn])
+        return sorted(out)
+    return closure
+
+
+def mod_bisect_gen(files, closure):
+    """Генератор: отдаёт набор файлов для проверки, получает True, если проблема воспроизвелась."""
+    def reduce(fixed, cands):
+        fixed, cands = list(fixed), list(cands)
+        while len(cands) > 1:
+            mid = len(cands) // 2
+            a, b = cands[:mid], cands[mid:]
+            if (yield closure(fixed + a)):
+                cands = a
+            elif (yield closure(fixed + b)):
+                cands = b
+            else:
+                fixed, cands = fixed + a, b
+        return fixed, cands
+
+    files = list(files)
+    if not files:
+        return {"status": "nothing", "culprits": []}
+    if (yield closure([])):
+        return {"status": "not_mods", "culprits": []}
+    fixed, cands = yield from reduce([], files)
+    culprits = fixed + cands
+    if fixed:
+        if (yield closure(cands)):
+            culprits = cands
+        else:
+            f2, c2 = yield from reduce(cands, fixed)
+            culprits = f2 + c2
+    # виноватый мог оказаться библиотекой, которую он тянет за собой: проверяем зависимости отдельно
+    chosen = set(culprits)
+    extra = [f for f in closure(culprits) if f not in chosen]
+    if extra and (yield closure(extra)):
+        f2, c2 = yield from reduce([], extra)
+        culprits = f2 + c2
+    return {"status": "found", "culprits": culprits}
+
+
+class ModBisectSession:
+    def __init__(self, files, closure):
+        self.files = list(files)
+        self.closure = closure
+        self._gen = mod_bisect_gen(self.files, closure)
+        self.tests = 0
+        self.result = None
+        self.current = None
+        try:
+            self.current = next(self._gen)
+        except StopIteration as e:
+            self.result = e.value
+
+    def estimated_total(self):
+        n = max(1, len(self.files))
+        return 1 + math.ceil(math.log2(n)) + 1
+
+    def answer(self, problem):
+        self.tests += 1
+        try:
+            self.current = self._gen.send(bool(problem))
+        except StopIteration as e:
+            self.current, self.result = None, e.value
+
+
+def bisect_state_path(mods_dir):
+    return os.path.join(os.path.dirname(os.path.normpath(mods_dir)), BISECT_STATE_FILE)
+
+
+def bisect_save_state(mods_dir, originally_enabled):
+    with open(bisect_state_path(mods_dir), "w", encoding="utf-8") as f:
+        json.dump({"mods_dir": os.path.normpath(mods_dir), "enabled": list(originally_enabled)}, f)
+
+
+def bisect_clear_state(mods_dir):
+    try:
+        os.remove(bisect_state_path(mods_dir))
+    except OSError:
+        pass
+
+
+def bisect_restore(manager, originally_enabled):
+    for name in originally_enabled:
+        try:
+            manager.set_enabled(name, True)
+        except OSError:
+            pass
+    bisect_clear_state(manager.mods_dir)
+
+
+def bisect_apply(manager, originally_enabled, enabled_set):
+    enabled_set = set(enabled_set)
+    for name in originally_enabled:
+        manager.set_enabled(name, name in enabled_set)
+
+
+
+
+class ServerPackDialog(tk.Toplevel):
+    """Установка и обновление сборки сервера: показывает, что изменится, и синхронизирует файлы."""
+
+    def __init__(self, app, auto_start=False, on_done=None, activate=False):
+        super().__init__(app.root)
+        self.app, self.on_done, self.auto_start, self.activate = app, on_done, auto_start, activate
+        self.manifest, self.opt_vars, self.busy, self._reported = None, {}, False, False
+        self.title("Сборка сервера")
+        self.geometry("660x520")
+        self.minsize(560, 420)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self.head = tk.Label(self, text="Загрузка…", anchor="w", font=("Segoe UI Semibold", 13))
+        self.head.pack(fill="x", padx=14, pady=(12, 2))
+        self.info = tk.Label(self, text="", anchor="w", justify="left", fg="#7a8599", wraplength=620)
+        self.info.pack(fill="x", padx=14)
+        self.local = tk.Label(self, text="", anchor="w", justify="left", wraplength=620)
+        self.local.pack(fill="x", padx=14, pady=(2, 6))
+        self.opt_box = ttk.LabelFrame(self, text="Необязательные файлы (отметь, что установить)")
+        self.log = tk.Text(self, height=10, state="disabled", bg="#242830", fg="#e1e4e8", font=("Consolas", 9),
+                           relief="flat", wrap="word")
+        self.log.pack(fill="both", expand=True, padx=14, pady=6)
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(fill="x", padx=14)
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=14, pady=10)
+        self.go_btn = ttk.Button(bar, text="📥 Установить", style="Accent.TButton", command=self._start, state="disabled")
+        self.go_btn.pack(side="left")
+        ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
+        app._async(self._fetch, self._loaded)
+
+    def _fetch(self):
+        status, data = self.app.api.modpack_manifest()
+        if status != 200 or not data.get("success"):
+            raise Exception(data.get("error", f"HTTP {status}"))
+        return data.get("modpack")
+
+    def _ui(self, fn):
+        try:
+            self.after(0, fn)
+        except Exception:
+            pass
+
+    def _say(self, text):
+        try:
+            self.log.config(state="normal")
+            self.log.insert("end", text + "\n")
+            self.log.see("end")
+            self.log.config(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _loaded(self, manifest, error):
+        if not self.winfo_exists():
+            return
+        if error or not manifest:
+            self.head.config(text="Сборка сервера недоступна")
+            self.info.config(text=f"Не удалось получить сборку: {error}" if error else "Администратор ещё не настроил сборку.")
+            return
+        self.manifest = manifest
+        total = sum(int(f.get("size") or 0) for f in manifest["files"])
+        loader = manifest.get("loader", "vanilla")
+        lv = f" {manifest.get('loader_version')}" if manifest.get("loader_version") else ""
+        self.head.config(text=f"🧩 {manifest.get('name') or 'Сборка сервера'}")
+        self.info.config(text=f"Minecraft {manifest.get('mc_version')} • {loader}{lv} • ревизия {manifest.get('revision')} • "
+                              f"файлов: {len(manifest['files'])} • {total / 1048576:.1f} МБ")
+        sp = self.app.config.get("server_pack") or {}
+        pk = self.app._find_modpack(sp.get("pack_name", "")) if sp.get("pack_name") else None
+        if pk:
+            have = int(serverpack_load_state(self.app._modpack_dir(pk["name"])).get("revision") or 0)
+            now = int(manifest.get("revision") or 0)
+            self.local.config(text=(f"Установлена ревизия {have}: " + ("актуальна ✅" if have >= now else f"есть обновление до {now}")),
+                              fg="#43b581" if have >= now else "#faa61a")
+            self.go_btn.config(text="🔄 Проверить и обновить")
+        else:
+            self.local.config(text="Ещё не установлена", fg="#7a8599")
+        optional = [f for f in manifest["files"] if f.get("optional")]
+        if optional:
+            self.opt_box.pack(fill="x", padx=14, pady=4, before=self.log)
+            saved = (sp.get("optional") or {})
+            for f in optional:
+                v = tk.BooleanVar(value=bool(saved.get(f["path"])))
+                self.opt_vars[f["path"]] = v
+                ttk.Checkbutton(self.opt_box, text=f"{f.get('title') or f['path']}  ({f['path']}, {int(f.get('size') or 0) / 1048576:.1f} МБ)",
+                                variable=v).pack(anchor="w", padx=8, pady=1)
+        self.go_btn.config(state="normal")
+        if self.auto_start:
+            self._start()
+
+    def _start(self):
+        if self.busy or not self.manifest:
+            return
+        self.busy = True
+        self.go_btn.config(state="disabled")
+        choice = {p: bool(v.get()) for p, v in self.opt_vars.items()}
+        sp = self.app.config.setdefault("server_pack", {})
+        sp["optional"] = choice
+        try:
+            pk = self.app._ensure_server_pack_entry(self.manifest)
+        except Exception as e:
+            self.busy = False
+            self.go_btn.config(state="normal")
+            messagebox.showerror("Сборка сервера", f"Не удалось подготовить сборку: {e}", parent=self)
+            return
+        self._say("Сравниваю файлы…")
+        threading.Thread(target=self._worker, args=(self.manifest, pk, choice), daemon=True).start()
+
+    def _worker(self, manifest, pk, choice):
+        app = self.app
+        pack_dir = app._modpack_dir(pk["name"])
+        try:
+            state = serverpack_load_state(pack_dir)
+            plan = serverpack_plan(manifest, pack_dir, state, choice)
+            self._ui(lambda: self._say(f"Скачать: {len(plan['download'])} ({plan['download_bytes'] / 1048576:.1f} МБ), "
+                                       f"оставить: {len(plan['keep'])}, убрать устаревшее: {len(plan['remove'])}"))
+            for bad in plan["bad"]:
+                self._ui(lambda b=bad: self._say(f"⚠ пропущен недопустимый путь: {b}"))
+            if (plan["download"] or plan["remove"]) and os.path.isdir(os.path.join(pack_dir, "mods")) \
+                    and app.config.get("auto_pack_backup", True) and state.get("files"):
+                try:
+                    mgr = app._pack_backup_mgr(pk)
+                    mgr.create("server-pack", auto=True)
+                    mgr.prune(int(app.config.get("pack_backup_keep", 5)))
+                    self._ui(lambda: self._say("Сделан бэкап сборки перед обновлением"))
+                except Exception as e:
+                    self._ui(lambda: self._say(f"⚠ бэкап не сделан: {e}"))
+
+            def progress(n, total, name):
+                def upd():
+                    try:
+                        self.progress.config(maximum=max(1, total), value=n)
+                    except tk.TclError:
+                        return
+                    self._say(f"[{n}/{total}] {name}")
+                self._ui(upd)
+
+            new_state, failed = serverpack_apply(manifest, pack_dir, plan, state,
+                                                 lambda f, dest: serverpack_download(app.api, f, dest), progress)
+            serverpack_save_state(pack_dir, new_state)
+            self._ui(lambda: self._finished(pk, failed))
+        except Exception as e:
+            self._ui(lambda: self._finished(pk, [str(e)]))
+
+    def _finished(self, pk, failed):
+        self.busy = False
+        try:
+            self.go_btn.config(state="normal")
+        except tk.TclError:
+            return
+        app = self.app
+        app.refresh_modpacks()
+        app.refresh_mods()
+        if failed:
+            self._say("Ошибки:\n" + "\n".join(f"  • {x}" for x in failed[:12]))
+            messagebox.showwarning("Сборка сервера", "Не всё удалось скачать:\n\n" + "\n".join(failed[:8])
+                                   + "\n\nНажми кнопку ещё раз, чтобы докачать недостающее.", parent=self)
+            self._report(False)
+            return
+        self._say("✅ Готово")
+        active = app.config.get("active_modpack", "") == pk["name"]
+        if self.activate or active or messagebox.askyesno("Сборка сервера", "Сборка установлена. Сделать её активной?", parent=self):
+            app._activate_modpack(pk["name"])
+        self._report(True)
+        self.destroy()
+
+    def _report(self, ok):
+        if not self._reported and self.on_done:
+            self._reported = True
+            self.on_done(ok)
+
+    def _close(self):
+        if self.busy and not messagebox.askyesno("Сборка сервера", "Идёт скачивание. Закрыть окно? Недокачанное можно будет докачать позже.", parent=self):
+            return
+        self._report(False)
+        self.destroy()
+
+
+class ModBisectWindow(tk.Toplevel):
+    """Ищет мод, из-за которого вылетает игра: отключает половину модов и спрашивает, осталась ли проблема."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app, self.mgr = app, app.mod_manager
+        self.title("Поиск виновного мода")
+        self.geometry("720x600")
+        self.minsize(620, 520)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.originally = [n for n, enabled in self.mgr.list_mods() if enabled]
+        self.session, self.graph, self.closure = None, None, None
+        self._await_start, self._launch_t, self._alive = False, 0.0, True
+
+        self.intro = tk.Label(self, justify="left", anchor="nw", wraplength=680, fg="#e1e4e8", text=(
+            "Как это работает:\n"
+            "1. Убедись, что проблема (вылет, баг) сейчас воспроизводится.\n"
+            "2. Лаунчер отключит часть модов и попросит запустить игру. Зависимости модов учитываются автоматически.\n"
+            "3. После каждого запуска нажми, осталась ли проблема. Вылет при старте с той же ошибкой тоже считается проблемой.\n"
+            "4. Через несколько шагов лаунчер назовёт виновника. В конце все моды вернутся на место, "
+            "а виновника можно будет отключить одной кнопкой.\n\n"
+            f"Включённых модов сейчас: {len(self.originally)}."))
+        self.intro.pack(fill="x", padx=16, pady=(14, 6))
+        self.step = tk.Label(self, text="", anchor="w", font=("Segoe UI Semibold", 12))
+        self.step.pack(fill="x", padx=16, pady=(6, 2))
+        self.desc = tk.Label(self, text="", anchor="w", justify="left", wraplength=680, fg="#7a8599")
+        self.desc.pack(fill="x", padx=16)
+        self.box = tk.Text(self, height=12, state="disabled", bg="#242830", fg="#e1e4e8", font=("Consolas", 9), relief="flat")
+        self.box.pack(fill="both", expand=True, padx=16, pady=8)
+        self.status = tk.Label(self, text="", anchor="w", fg="#faa61a")
+        self.status.pack(fill="x", padx=16)
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=16, pady=10)
+        self.start_btn = ttk.Button(bar, text="🔍 Начать поиск", style="Accent.TButton", command=self._begin)
+        self.start_btn.pack(side="left")
+        self.run_btn = ttk.Button(bar, text="▶ Запустить игру", command=self._run_game)
+        self.yes_btn = ttk.Button(bar, text="🔴 Проблема есть", command=lambda: self._answer(True))
+        self.no_btn = ttk.Button(bar, text="🟢 Проблемы нет", command=lambda: self._answer(False))
+        self.final_btn = ttk.Button(bar, text="⛔ Отключить найденное", command=self._disable_found)
+        ttk.Button(bar, text="Закрыть", command=self._close).pack(side="right")
+        self.stop_btn = ttk.Button(bar, text="⏹ Остановить", command=self._stop)
+        if not self.originally:
+            self.start_btn.config(state="disabled")
+            self.status.config(text="В этой сборке нет включённых модов.")
+
+    def _set_box(self, lines):
+        self.box.config(state="normal")
+        self.box.delete("1.0", "end")
+        self.box.insert("end", "\n".join(lines))
+        self.box.config(state="disabled")
+
+    def _begin(self):
+        app = self.app
+        if app.installing or (app.process is not None and app.process.poll() is None):
+            messagebox.showwarning("Поиск виновного мода", "Закрой запущенную игру и дождись конца установки.", parent=self)
+            return
+        self.start_btn.config(state="disabled")
+        self.status.config(text="Анализирую моды…", fg="#faa61a")
+        mc, det = detect_game_version_and_loader(app.version_var.get())
+        loader = app.modloader_var.get()
+        if loader == "vanilla":
+            loader = det.lower() if det else ""
+        mods_dir, names = self.mgr.mods_dir, list(self.originally)
+        app._async(lambda: build_mod_graph(mods_dir, names, loader, mc), self._graph_ready)
+
+    def _graph_ready(self, graph, error):
+        if not self._alive:
+            return
+        if error:
+            self.start_btn.config(state="normal")
+            self.status.config(text=f"Не удалось проанализировать моды: {error}", fg="#ed4245")
+            return
+        self.graph, self.closure = graph, make_closure(graph)
+        self.session = ModBisectSession(self.originally, self.closure)
+        try:
+            bisect_save_state(self.mgr.mods_dir, self.originally)
+        except OSError as e:
+            self.status.config(text=f"Не удалось сохранить состояние: {e}", fg="#ed4245")
+            return
+        self.intro.pack_forget()
+        self.start_btn.pack_forget()
+        for b in (self.run_btn, self.yes_btn, self.no_btn, self.stop_btn):
+            b.pack(side="left", padx=(0, 6))
+        self.status.config(text="")
+        self._apply_current()
+        self._poll()
+
+    def _apply_current(self):
+        s = self.session
+        cur = s.current or []
+        bisect_apply(self.mgr, self.originally, cur)
+        self.app.refresh_mods()
+        self.step.config(text=f"Шаг {s.tests + 1} из ~{s.estimated_total()}")
+        if not cur:
+            self.desc.config(text="Все моды отключены. Запусти игру и проверь, остаётся ли проблема без модов.")
+            self._set_box(["(ни одного мода не включено)"])
+        else:
+            self.desc.config(text=f"Включено модов: {len(cur)} из {len(self.originally)} (вместе с нужными им библиотеками). "
+                                  "Запусти игру и проверь, осталась ли проблема.")
+            self._set_box(cur)
+
+    def _run_game(self):
+        self._await_start, self._launch_t = True, time.time()
+        self.app.launch_only()
+
+    def _poll(self):
+        if not self._alive:
+            return
+        app = self.app
+        running = app.process is not None and app.process.poll() is None
+        if running:
+            self._await_start = False
+        elif self._await_start and time.time() - self._launch_t > 90 and not app.installing:
+            self._await_start = False
+        busy = running or self._await_start or app.installing
+        state = "disabled" if busy else "normal"
+        for b in (self.run_btn, self.yes_btn, self.no_btn):
+            b.config(state=state)
+        if self.session and self.session.result is None:
+            self.status.config(text="Игра запущена… ответь после её закрытия." if busy else "", fg="#faa61a")
+            self.after(1000, self._poll)
+
+    def _answer(self, problem):
+        self.session.answer(problem)
+        if self.session.result is not None:
+            self._finish()
+        else:
+            self._apply_current()
+
+    def _finish(self):
+        res = self.session.result
+        bisect_restore(self.mgr, self.originally)
+        self.app.refresh_mods()
+        for b in (self.run_btn, self.yes_btn, self.no_btn, self.stop_btn):
+            b.pack_forget()
+        self.status.config(text="")
+        self.found = res.get("culprits", [])
+        if res["status"] == "not_mods":
+            self.step.config(text="Дело не в модах")
+            self.desc.config(text="Проблема воспроизводится и совсем без модов. Причину стоит искать в Java, драйверах видеокарты, "
+                                  "настройках, ресурспаках или самой версии игры. Все моды возвращены на место.")
+            self._set_box([])
+        elif res["status"] == "found" and self.found:
+            chosen = set(self.found)
+            dependents = [f for f in self.originally if f not in chosen and chosen & set(self.closure([f]))]
+            self.dependents = dependents
+            self.step.config(text="🎯 Найден вероятный виновник")
+            self.desc.config(text="Проблема пропадает без этого набора. Все моды возвращены на место. "
+                                  "Отключи найденное и проверь игру: так ты убедишься, что дело в нём.")
+            lines = ["Виновник:"] + [f"  • {f}" for f in self.found]
+            if len(self.found) > 1:
+                lines.append("(вылет случается только когда включены вместе все эти моды)")
+            if dependents:
+                lines += ["", "От него зависят (без него не запустятся, их тоже придётся отключить):"] + [f"  • {f}" for f in dependents]
+            self._set_box(lines)
+            self.final_btn.pack(side="left")
+        else:
+            self.step.config(text="Нечего проверять")
+            self.desc.config(text="В сборке нет включённых модов.")
+            self._set_box([])
+        try:
+            bisect_clear_state(self.mgr.mods_dir)
+        except OSError:
+            pass
+
+    def _disable_found(self):
+        names = list(dict.fromkeys(self.found + getattr(self, "dependents", [])))
+        for n in names:
+            try:
+                self.mgr.set_enabled(n, False)
+            except OSError as e:
+                messagebox.showerror("Поиск виновного мода", f"Не удалось отключить {n}: {e}", parent=self)
+                break
+        self.app.refresh_mods()
+        self.final_btn.config(state="disabled")
+        self.status.config(text=f"Отключено файлов: {len(names)}. Включить обратно можно на вкладке «Моды».", fg="#43b581")
+
+    def _stop(self):
+        if self.session and self.session.result is None:
+            if not messagebox.askyesno("Поиск виновного мода", "Остановить поиск и вернуть все моды как были?", parent=self):
+                return
+            bisect_restore(self.mgr, self.originally)
+            self.app.refresh_mods()
+        self._close(force=True)
+
+    def _close(self, force=False):
+        if not force and self.session and self.session.result is None:
+            if not messagebox.askyesno("Поиск виновного мода", "Поиск не закончен. Вернуть все моды как были и закрыть окно?", parent=self):
+                return
+            bisect_restore(self.mgr, self.originally)
+            self.app.refresh_mods()
+        self._alive = False
+        self.destroy()
+
+
 class ModUpdateWindow(tk.Toplevel):
     LOADER_FILTERS = {"fabric": ["fabric"], "forge": ["forge"], "neoforge": ["neoforge"], "quilt": ["quilt", "fabric"]}
 
@@ -5332,7 +6133,8 @@ class ModCheckWindow(tk.Toplevel):
 class ModpackBackupManager:
     PARTS = ("mods", "config")
     REASONS = {"manual": "вручную", "modrinth": "перед установкой с Modrinth",
-               "delete-mod": "перед удалением мода", "update-mods": "перед обновлением модов", "before-restore": "перед откатом"}
+               "delete-mod": "перед удалением мода", "update-mods": "перед обновлением модов", "before-restore": "перед откатом",
+               "server-pack": "перед обновлением сборки сервера"}
 
     def __init__(self, pack_dir, backup_dir):
         self.pack_dir, self.backup_dir = pack_dir, backup_dir
@@ -5835,6 +6637,7 @@ class LauncherApp:
         self.achievements = AchievementManager(self.stats, self.config)
 
         self.api = ServerAPI(SERVER_URL)
+        self._pending_sync_lock = threading.Lock()
         self.server_nick_var = tk.StringVar(value=self.config.get("server_nickname", ""))
         self.server_pass_var = tk.StringVar()
         self.server_status_var = tk.StringVar(value="Не авторизован")
@@ -5844,6 +6647,7 @@ class LauncherApp:
         self.version_var = tk.StringVar()
         self.player_var = tk.StringVar()
         self.mem_var = tk.StringVar(value=str(self.core.memory))
+        self.auto_mem_var = tk.BooleanVar(value=bool(self.config.get("auto_memory", False)))
         self.dir_var = tk.StringVar(value=self.core.minecraft_dir)
         self.modloader_var = tk.StringVar(value="vanilla")
         self.forge_var = tk.StringVar(value="Без Forge")
@@ -5937,6 +6741,7 @@ class LauncherApp:
         self.config["minecraft_dir"] = self.dir_var.get().strip()
         mem_str = self.mem_var.get().strip()
         self.config["memory_mb"] = int(mem_str) if mem_str.isdigit() else 2048
+        self.config["auto_memory"] = bool(self.auto_mem_var.get())
         self.config["java_path"] = self.core.java_path
         self.config["last_version"] = self.version_var.get().strip()
         self.config["accounts"] = self.core.accounts
@@ -6313,6 +7118,7 @@ class LauncherApp:
             ("🖼️ Скриншоты", self.build_screenshots_tab),
             ("📋 Логи", self.build_logs_tab),
             ("🏆 Ачивки", self.build_achievements_tab),
+            ("🏅 Топ недели", self.build_top_tab),
             ("🖥️ Аккаунт", self.build_account_tab),
             ("👥 Друзья", self.build_friends_tab),
             ("🎁 Подарки", self.build_gifts_tab),
@@ -6742,6 +7548,10 @@ class LauncherApp:
         ttk.Label(left, text="ОЗУ (МБ):").grid(row=6, column=0, sticky="w", pady=5)
         self.mem_entry = ttk.Entry(left, textvariable=self.mem_var, width=30)
         self.mem_entry.grid(row=6, column=1, pady=5, padx=5)
+        auto_frame = ttk.Frame(left)
+        auto_frame.grid(row=6, column=2, sticky="w", padx=5)
+        ttk.Button(auto_frame, text="🤖 Авто", width=8, command=self.auto_memory_now).pack(side="left")
+        ttk.Checkbutton(auto_frame, text="при запуске", variable=self.auto_mem_var).pack(side="left", padx=4)
 
         btn_frame = ttk.Frame(left)
         btn_frame.grid(row=7, column=0, columnspan=3, pady=20)
@@ -8032,9 +8842,11 @@ class LauncherApp:
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.delete_mod).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="⬆ Обновить моды", command=lambda: ModUpdateWindow(self)).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="🔍 Проверить моды", command=lambda: ModCheckWindow(self)).pack(pady=4, fill="x")
+        ttk.Button(btn_frame, text="🎯 Найти виновного", command=lambda: ModBisectWindow(self)).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="🔄 Обновить", command=self.refresh_mods).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="📂 Открыть папку", command=self._open_mods_folder).pack(pady=4, fill="x")
         self.refresh_mods()
+        self.root.after(1500, self._bisect_check_leftover)
 
     def _open_mods_folder(self):
         self._open_folder(self.mod_manager.mods_dir)
@@ -8544,6 +9356,7 @@ class LauncherApp:
         ttk.Button(btn_frame, text="✏ Изменить", command=self.edit_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.remove_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="📶 Проверить", command=self.ping_server).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="🧩 Сборка сервера", command=self.open_server_pack).pack(side="left", padx=5)
         self.server_listbox.bind("<Double-Button-1>", lambda e: self.play_selected_server())
         self._pinned_server = None
         self.refresh_servers_ui()
@@ -8561,7 +9374,8 @@ class LauncherApp:
         ver = format_server_versions({"version_from": p.get("version_min") or p.get("version"),
                                       "version_to": p.get("version_max") or p.get("version")})
         ver = f"  [{ver}]" if ver else ""
-        return f"  ⭐ {p.get('name') or 'Mafin Server'}  ({p['address']})  {state}{ver}"
+        pack = "  🧩" if p.get("modpack") else ""
+        return f"  ⭐ {p.get('name') or 'Mafin Server'}  ({p['address']})  {state}{ver}{pack}"
 
     def _config_server_index(self, row):
         """Номер строки списка -> номер в config['servers'] (None для закреплённого сервера)."""
@@ -8642,7 +9456,14 @@ class LauncherApp:
         if self.installing or (self.process is not None and self.process.poll() is None):
             messagebox.showwarning("Серверы", "Дождись окончания установки или закрой запущенную игру.")
             return
+        if idx is None and self._pinned_server.get("modpack") \
+                and self._server_pack_gate(self._pinned_server["modpack"], lambda: self._play_server_go(server)):
+            return
+        self._play_server_go(server)
 
+    def _play_server_go(self, server):
+        if self.installing or (self.process is not None and self.process.poll() is None):
+            return
         lo, hi = server_version_range(server)
         current = mc_game_version(self.version_var.get())
         version, keep = pick_server_launch_version(lo, hi, current)
@@ -9023,25 +9844,24 @@ class LauncherApp:
             return self.api.login_with_token(token)
 
         def done(result, error):
-            if not error and result and result[0]:
-                self._session_restore_attempts = 0
-                self._on_server_login_success(persist=False)
+            transient = bool(error) or not result or (
+                not result[0] and isinstance(result[1], dict) and result[1].get("_transient"))
+            if transient:
+                # сеть/сервер недоступны — НЕ разлогиниваем (раньше тут вызывался api.logout(),
+                # который стирал токен на сервере и «кикал» пользователя)
+                tries = getattr(self, "_restore_tries", 0) + 1
+                self._restore_tries = tries
+                if tries <= 10:
+                    self.root.after(min(5000 * tries, 30000), self._try_restore_server_session)
                 return
-            rejected = bool(result and len(result) > 2 and result[2])
-            if rejected:
-                # Сервер сам сказал «токен недействителен/истёк» — тогда и только тогда чистим.
-                self.api.drop_local_session()
+            if not result[0]:
+                # токен отвергнут сервером (401/403): чистим только локально
+                self.api.drop_local()
                 self.config["server_token"] = ""
                 save_json_file(CONFIG_FILE, self.config)
-                self.server_status_var.set("Сессия истекла — войдите заново")
                 return
-            # Сеть/сервер недоступны: токен сохраняем и пробуем позже.
-            self.api.token = None
-            self.server_status_var.set("⏳ Сервер недоступен, повторю попытку...")
-            n = getattr(self, "_session_restore_attempts", 0) + 1
-            self._session_restore_attempts = n
-            if n <= 20:
-                self.root.after(min(15000 * n, 120000), self._try_restore_server_session)
+            self._restore_tries = 0
+            self._on_server_login_success(persist=False)
 
         self._async(work, done)
 
@@ -9073,6 +9893,7 @@ class LauncherApp:
         if hasattr(self, "news_text"):
             self.refresh_news(show_errors=False)
         self._start_heartbeat_loop()
+        threading.Thread(target=self._flush_pending_sync, daemon=True).start()
 
     def _rebuild_friends_tab(self):
         frame = getattr(self, "friends_tab_frame", None)
@@ -9091,6 +9912,302 @@ class LauncherApp:
         for child in frame.winfo_children():
             child.destroy()
         self.build_quests_tab(frame)
+
+    # ===== Автоподбор ОЗУ =====
+    def _recommend_memory_now(self):
+        total, free = get_system_memory_mb()
+        mods = count_enabled_mods(self.mod_manager.mods_dir) if getattr(self, "mod_manager", None) else 0
+        return recommend_memory(total, free, mods, self.modloader_var.get() or "vanilla",
+                                mc_game_version(self.version_var.get()))
+
+    def auto_memory_now(self):
+        rec = self._recommend_memory_now()
+        self.mem_var.set(str(rec["mb"]))
+        preset = resolve_jvm_preset(self.config.get("jvm_preset", "default"), rec["mb"])
+        extra = f"\n\nJVM-флаги: {JVM_PRESET_TITLES.get(preset, preset)}." if self.config.get("jvm_preset", "default") != "default" else ""
+        if self.core.pack_memory:
+            extra += f"\n\nУ активной сборки задано своё ОЗУ ({self.core.pack_memory} МБ), оно важнее."
+        messagebox.showinfo("Автоподбор ОЗУ", rec["reason"] + extra)
+
+    def _apply_auto_memory(self):
+        if not self.auto_mem_var.get() or self.core.pack_memory:
+            return
+        try:
+            self.mem_var.set(str(self._recommend_memory_now()["mb"]))
+        except Exception:
+            pass
+
+    # ===== Поиск виновного мода =====
+    def _bisect_check_leftover(self):
+        try:
+            with open(bisect_state_path(self.mod_manager.mods_dir), "r", encoding="utf-8") as f:
+                names = [n for n in json.load(f).get("enabled", []) if isinstance(n, str) and os.path.basename(n) == n]
+        except Exception:
+            return
+        bisect_restore(self.mod_manager, names)
+        self.refresh_mods()
+        messagebox.showinfo("Поиск виновного мода", "Прошлый поиск был прерван. Все моды возвращены в прежнее состояние.")
+
+    # ===== Сборка сервера =====
+    def _ensure_server_pack_entry(self, manifest):
+        sp = self.config.setdefault("server_pack", {})
+        pk = self._find_modpack(sp.get("pack_name", "")) if sp.get("pack_name") else None
+        loader = manifest.get("loader") or "vanilla"
+        if not pk:
+            pk = {"name": self._unique_pack_name(manifest.get("name") or "Сборка сервера"), "mc_version": manifest.get("mc_version", ""),
+                  "loader": loader, "loader_version": manifest.get("loader_version", ""), "memory_mb": 0}
+            self.config.setdefault("modpacks", []).append(pk)
+            sp["pack_name"] = pk["name"]
+        else:
+            pk.update({"mc_version": manifest.get("mc_version", ""), "loader": loader,
+                       "loader_version": manifest.get("loader_version", "")})
+        os.makedirs(os.path.join(self._modpack_dir(pk["name"]), "mods"), exist_ok=True)
+        self.save_config()
+        self.refresh_modpacks()
+        return pk
+
+    def _server_pack_status(self, summary):
+        sp = self.config.get("server_pack") or {}
+        pk = self._find_modpack(sp.get("pack_name", "")) if sp.get("pack_name") else None
+        if not pk:
+            return "none", None
+        have = int(serverpack_load_state(self._modpack_dir(pk["name"])).get("revision") or 0)
+        return ("ok" if have >= int(summary.get("revision") or 0) else "outdated"), pk
+
+    def _server_pack_gate(self, summary, resume):
+        """True, если дальше ведёт диалог сборки (или игрок отменил запуск); False — запускать сразу."""
+        status, pk = self._server_pack_status(summary)
+        name = summary.get("name") or "Сборка сервера"
+        if status != "ok":
+            verb = "Установить" if status == "none" else "Обновить"
+            ans = messagebox.askyesnocancel(
+                "Сборка сервера",
+                f"Для этого сервера есть сборка «{name}» (ревизия {summary.get('revision')}, файлов: {summary.get('files')}).\n\n"
+                f"{verb} её перед игрой?\n\nДа: {verb.lower()} и играть с ней\nНет: играть как есть\nОтмена: вернуться")
+            if ans is None:
+                return True
+            if ans:
+                ServerPackDialog(self, auto_start=True, activate=True, on_done=lambda ok: resume() if ok else None)
+                return True
+            return False
+        if pk and self.config.get("active_modpack", "") != pk["name"]:
+            if messagebox.askyesno("Сборка сервера", f"Сборка сервера «{pk['name']}» уже установлена, но активна другая. Переключиться на неё?"):
+                self._activate_modpack(pk["name"])
+        return False
+
+    def open_server_pack(self):
+        if not self.api.is_logged_in():
+            messagebox.showwarning("Сборка сервера", "Войди в аккаунт лаунчера на вкладке «Аккаунт».")
+            return
+        ServerPackDialog(self)
+
+    # ===== Косметика (шапки) =====
+    def _priv_mode(self, mode):
+        for page in (self._priv_page, self._cos_page):
+            page.pack_forget()
+        if mode == "cos":
+            self._cos_page.pack(fill="both", expand=True)
+            self._load_cosmetics()
+        else:
+            self._priv_page.pack(fill="both", expand=True)
+            self._load_privileges()
+
+    def _build_cosmetics_page(self, page):
+        top = ttk.Frame(page)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Button(top, text="🔄 Обновить", command=self._load_cosmetics).pack(side="left")
+        self._cos_balance = ttk.Label(top, text="🪙 …", font=("Segoe UI Semibold", 11))
+        self._cos_balance.pack(side="left", padx=12)
+        ttk.Label(top, text="Шапку видят все игроки на нашем сервере", foreground="#7a8599").pack(side="left")
+        self._cos_tree = ttk.Treeview(page, columns=("title", "price", "state"), show="headings", height=9, selectmode="browse")
+        for col, text, width in (("title", "Шапка", 260), ("price", "Цена, 🪙", 90), ("state", "Статус", 150)):
+            self._cos_tree.heading(col, text=text)
+            self._cos_tree.column(col, width=width, anchor="w")
+        self._cos_tree.tag_configure("worn", foreground="#43b581")
+        self._cos_tree.pack(fill="x", padx=8, pady=4)
+        self._cos_tree.bind("<<TreeviewSelect>>", lambda e: self._cos_show_description())
+        self._cos_desc = ttk.Label(page, text="", foreground="#7a8599", wraplength=560, justify="left")
+        self._cos_desc.pack(anchor="w", padx=10)
+        btns = ttk.Frame(page)
+        btns.pack(fill="x", padx=8, pady=6)
+        ttk.Button(btns, text="🪙 Купить", style="Accent.TButton", command=self._cos_buy).pack(side="left")
+        ttk.Button(btns, text="🎩 Надеть", command=self._cos_equip).pack(side="left", padx=6)
+        ttk.Button(btns, text="Снять", command=lambda: self._cos_set_equipped(None)).pack(side="left")
+        self._cos_status = ttk.Label(btns, text="", foreground="#7a8599")
+        self._cos_status.pack(side="left", padx=10)
+        ttk.Label(page, text="Шапка появляется над головой через несколько секунд после входа на сервер или смены. "
+                             "Она привязана к нику, под которым ты сейчас играешь.",
+                  foreground="#7a8599", wraplength=560, justify="left").pack(anchor="w", padx=10, pady=(8, 0))
+        self._cos_items, self._cos_loading = {}, False
+
+    def _load_cosmetics(self):
+        if getattr(self, "_cos_loading", False):
+            return
+        self._cos_loading = True
+        self._async(lambda: self.api.cosmetics_list(), self._apply_cosmetics)
+
+    def _apply_cosmetics(self, result, error):
+        self._cos_loading = False
+        if not self._cos_tree.winfo_exists():
+            return
+        status, data = result if result else (0, {"error": str(error)})
+        if status != 200 or not data.get("success"):
+            self._cos_status.config(text=f"Не удалось загрузить: {data.get('error', 'нет связи с сервером')}")
+            return
+        self.api.coins = data.get("coins", self.api.coins)
+        self._cos_balance.config(text=f"🪙 {data.get('coins', 0):g}")
+        keep = self._cos_tree.selection()
+        self._cos_tree.delete(*self._cos_tree.get_children())
+        self._cos_items = {}
+        for it in data.get("items", []):
+            iid = str(it["id"])
+            self._cos_items[iid] = it
+            state = "✅ надета" if it["equipped"] else ("есть" if it["owned"] else "")
+            self._cos_tree.insert("", "end", iid=iid, tags=("worn",) if it["equipped"] else (),
+                                  values=(it["title"], "" if it["owned"] else f"{it['price']:g}", state))
+        if keep and keep[0] in self._cos_items:
+            self._cos_tree.selection_set(keep[0])
+        self._cos_status.config(text="" if self._cos_items else "Шапок пока нет в продаже")
+        self._cos_show_description()
+
+    def _cos_selected(self):
+        sel = self._cos_tree.selection()
+        return self._cos_items.get(sel[0]) if sel else None
+
+    def _cos_show_description(self):
+        it = self._cos_selected()
+        self._cos_desc.config(text=(it.get("description") or "") if it else "")
+
+    def _cos_buy(self):
+        it = self._cos_selected()
+        if not it:
+            messagebox.showinfo("Шапки", "Выбери шапку в списке.")
+            return
+        if it["owned"]:
+            messagebox.showinfo("Шапки", "Эта шапка у тебя уже есть: нажми «Надеть».")
+            return
+        if not messagebox.askyesno("Покупка", f"Купить «{it['title']}» за {it['price']:g} монет?"):
+            return
+        self._cos_status.config(text="Покупаю…")
+
+        def done(result, error):
+            status, data = result if result else (0, {"error": str(error)})
+            if status == 200 and data.get("success"):
+                self.api.coins = data.get("total_coins", self.api.coins)
+                self._cos_status.config(text=f"✅ Куплено: {it['title']}")
+                self._cos_set_equipped(it["id"])
+            else:
+                self._cos_status.config(text="")
+                messagebox.showerror("Шапки", data.get("error", "Не удалось купить"))
+                self._load_cosmetics()
+        self._async(lambda: self.api.cosmetics_buy(it["id"]), done)
+
+    def _cos_equip(self):
+        it = self._cos_selected()
+        if not it:
+            messagebox.showinfo("Шапки", "Выбери шапку в списке.")
+        elif not it["owned"]:
+            messagebox.showinfo("Шапки", "Сначала купи эту шапку.")
+        else:
+            self._cos_set_equipped(it["id"])
+
+    def _cos_set_equipped(self, cid):
+        def done(result, error):
+            status, data = result if result else (0, {"error": str(error)})
+            if status != 200 or not data.get("success"):
+                messagebox.showerror("Шапки", data.get("error", "Не удалось сменить шапку"))
+            else:
+                self._cos_status.config(text="Шапка снята" if cid is None else "Шапка надета: появится в игре через несколько секунд")
+            self._cos_loading = False
+            self._load_cosmetics()
+        self._async(lambda: self.api.cosmetics_equip(cid), done)
+
+    # ===== Недельный топ =====
+    def build_top_tab(self, frame):
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Button(top, text="🔄 Обновить", command=lambda: self._top_load(force=True)).pack(side="left")
+        self._top_timer = ttk.Label(top, text="", font=("Segoe UI Semibold", 10))
+        self._top_timer.pack(side="left", padx=12)
+        self._top_rewards = ttk.Label(top, text="", foreground="#7a8599")
+        self._top_rewards.pack(side="left")
+        self._top_tree = ttk.Treeview(frame, columns=("rank", "nick", "time", "coins", "online"), show="headings",
+                                      height=14, selectmode="browse")
+        for col, text, width, anchor in (("rank", "#", 50, "center"), ("nick", "Игрок", 200, "w"),
+                                         ("time", "Время за неделю", 140, "w"), ("coins", "Заработано, 🪙", 120, "w"),
+                                         ("online", "Статус", 90, "w")):
+            self._top_tree.heading(col, text=text)
+            self._top_tree.column(col, width=width, anchor=anchor)
+        self._top_tree.tag_configure("me", foreground="#43b581")
+        self._top_tree.pack(fill="both", expand=True, padx=8, pady=4)
+        self._top_tree.bind("<Double-1>", lambda e: self._top_open_profile())
+        self._top_last = ttk.Label(frame, text="", foreground="#7a8599", wraplength=620, justify="left")
+        self._top_last.pack(anchor="w", padx=10, pady=(2, 0))
+        self._top_status = ttk.Label(frame, text="Двойной клик по игроку открывает его профиль.", foreground="#7a8599")
+        self._top_status.pack(anchor="w", padx=10, pady=(0, 8))
+        self._top_end_ts, self._top_loading, self._top_loaded_at = None, False, 0.0
+        frame.bind("<Map>", lambda e: self._top_load())
+        self._top_tick()
+        self._top_load(force=True)
+
+    @staticmethod
+    def _fmt_minutes(minutes):
+        m = int(round(minutes))
+        return f"{m // 60} ч {m % 60:02d} мин" if m >= 60 else f"{m} мин"
+
+    def _top_tick(self):
+        try:
+            if not self._top_tree.winfo_exists():
+                return
+            if self._top_end_ts:
+                left = max(0, int(self._top_end_ts - time.time()))
+                d, rem = divmod(left, 86400)
+                h, rem = divmod(rem, 3600)
+                self._top_timer.config(text=f"⏳ До конца недели: {d} д {h} ч {rem // 60} мин")
+            self.root.after(1000, self._top_tick)
+        except Exception:
+            pass
+
+    def _top_load(self, force=False):
+        if self._top_loading or (not force and time.time() - self._top_loaded_at < 20):
+            return
+        self._top_loading = True
+        self._async(lambda: self.api.top_weekly(20), self._top_apply)
+
+    def _top_apply(self, result, error):
+        self._top_loading = False
+        if not self._top_tree.winfo_exists():
+            return
+        status, data = result if result else (0, {"error": str(error)})
+        if status != 200 or not data.get("success"):
+            self._top_status.config(text=f"Не удалось загрузить: {data.get('error', 'нет связи с сервером')}")
+            return
+        self._top_loaded_at = time.time()
+        self._top_end_ts = time.time() + int(data.get("seconds_left", 0))
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        rewards = data.get("rewards") or []
+        if rewards:
+            self._top_rewards.config(text="Награда: " + " · ".join(f"{medals.get(i + 1, str(i + 1) + '.')} {r:g}" for i, r in enumerate(rewards))
+                                     + f" 🪙 (от {self._fmt_minutes(data.get('min_minutes', 0))})")
+        self._top_tree.delete(*self._top_tree.get_children())
+        me = (self.api.nickname or "").lower()
+        for r in data.get("top", []):
+            self._top_tree.insert("", "end", iid=f"p{r['rank']}", tags=("me",) if r["nickname"].lower() == me else (),
+                                  values=(medals.get(r["rank"], r["rank"]), r["nickname"], self._fmt_minutes(r["minutes"]),
+                                          f"{r['coins']:g}", "🟢 онлайн" if r.get("is_online") else ""))
+        last = data.get("last_week")
+        if last and last.get("winners"):
+            self._top_last.config(text="Прошлая неделя: " + " · ".join(
+                f"{medals.get(w['rank'], w['rank'])} {w['nickname']} (+{w['coins']:g} 🪙)" for w in last["winners"]))
+        else:
+            self._top_last.config(text="Награды за прошлую неделю ещё не выдавались.")
+        self._top_status.config(text="" if data.get("top") else "На этой неделе ещё никто не играл.")
+
+    def _top_open_profile(self):
+        sel = self._top_tree.selection()
+        if sel:
+            nick = self._top_tree.item(sel[0], "values")[1]
+            ProfileWindow(self.root, self.api, str(nick))
 
     def build_privileges_tab(self, frame):
         if not self.api.is_logged_in():
@@ -9111,6 +10228,15 @@ class LauncherApp:
         self.build_privileges_tab(frame)
 
     def _build_privileges_tab(self, frame):
+        root_frame = frame
+        mode_bar = ttk.Frame(root_frame)
+        mode_bar.pack(fill="x", padx=8, pady=(6, 0))
+        frame = ttk.Frame(root_frame)
+        self._priv_page, self._cos_page = frame, ttk.Frame(root_frame)
+        ttk.Button(mode_bar, text="👑 Привилегии", command=lambda: self._priv_mode("priv")).pack(side="left")
+        ttk.Button(mode_bar, text="🎩 Шапки", command=lambda: self._priv_mode("cos")).pack(side="left", padx=6)
+        frame.pack(fill="both", expand=True)
+        self._build_cosmetics_page(self._cos_page)
         top = ttk.Frame(frame)
         top.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(top, text="🔄 Обновить", command=self._load_privileges).pack(side="left")
@@ -10263,21 +11389,26 @@ class LauncherApp:
 
     def _send_heartbeat(self):
         try:
-            status, _data = self.api.heartbeat()
+            status, _ = self.api.heartbeat()
+            if status in (401, 403):
+                self.root.after(0, self._on_session_rejected)
+            else:
+                self._flush_pending_sync()
         except Exception:
+            pass
+
+    def _on_session_rejected(self):
+        if not self.api.is_logged_in():
             return
-        if status == 401:
-            def expired():
-                self._stop_heartbeat_loop()
-                self.api.drop_local_session()
-                self.config["server_token"] = ""
-                save_json_file(CONFIG_FILE, self.config)
-                self.server_status_var.set("Сессия истекла — войдите заново")
-                self.account_info_label.config(text="Вы не авторизованы на сервере.")
-            try:
-                self.root.after(0, expired)
-            except RuntimeError:
-                pass
+        self._stop_heartbeat_loop()
+        self.api.drop_local()
+        self.config["server_token"] = ""
+        save_json_file(CONFIG_FILE, self.config)
+        try:
+            self.server_status_var.set("Сессия истекла — войдите заново")
+            self.account_info_label.config(text="Сессия истекла — войдите заново.")
+        except Exception:
+            pass
 
     def build_admin_tab(self, frame):
         top_bar = ttk.Frame(frame)
@@ -10507,6 +11638,12 @@ class LauncherApp:
         ttk.Button(frame, text="Обзор", command=self.browse_dir).grid(row=row, column=2, padx=5)
 
         row += 1
+        ttk.Label(frame, text="JVM-флаги:").grid(row=row, column=0, sticky="w", pady=5, padx=10)
+        self.jvm_preset_var = tk.StringVar(value=JVM_PRESET_TITLES.get(self.config.get("jvm_preset", "default"), JVM_PRESET_TITLES["default"]))
+        ttk.Combobox(frame, textvariable=self.jvm_preset_var, values=list(JVM_PRESET_TITLES.values()),
+                     state="readonly", width=42).grid(row=row, column=1, pady=5, padx=5)
+
+        row += 1
         ttk.Label(frame, text="ОЗУ (МБ):").grid(row=row, column=0, sticky="w", pady=5, padx=10)
         self.mem_settings_entry = ttk.Entry(frame, textvariable=self.mem_var, width=45)
         self.mem_settings_entry.grid(row=row, column=1, pady=5, padx=5)
@@ -10672,6 +11809,8 @@ class LauncherApp:
         self.config["java_path"] = self.core.java_path
         self.config["minecraft_dir"] = self.core.minecraft_dir
         self.config["memory_mb"] = self.core.memory
+        self.config["jvm_preset"] = {v: k for k, v in JVM_PRESET_TITLES.items()}.get(self.jvm_preset_var.get(), "default")
+        self.core.jvm_preset = self.config["jvm_preset"]
         self.config["auto_clean_logs"] = self.auto_clean_var.get()
         if HAS_PIL:
             self.config["skin_auto_download"] = self.skin_auto_var.get()
@@ -10980,6 +12119,7 @@ class LauncherApp:
     def install_and_launch(self):
         if self.installing:
             return
+        self._apply_auto_memory()
         self.installing = True
         self.install_btn.config(state="disabled")
         self.launch_btn.config(state="disabled")
@@ -11130,6 +12270,7 @@ class LauncherApp:
         if not player:
             messagebox.showerror("Ошибка", "Профиль не выбран. Зарегистрируйтесь и войдите в аккаунт на вкладке «Аккаунт».")
             return
+        self._apply_auto_memory()
         try:
             mem = int(self.mem_var.get().strip())
         except ValueError:
@@ -11285,26 +12426,22 @@ class LauncherApp:
                     "Игра закрыта" if rc in (0, None) else f"Игра завершилась с ошибкой (код {rc})"))
                 if self._launch_start_time:
                     elapsed_seconds = time.time() - self._launch_start_time
-                    elapsed_minutes = int(elapsed_seconds // 60)
+                    elapsed_minutes = round(elapsed_seconds / 60.0, 2)
                     self.stats.add_play_time(elapsed_minutes)
                     self.root.after(0, self._update_stats_label)
-                    if elapsed_minutes > 0 and self.api.is_logged_in():
-                        session["thread"].join(timeout=35)
+                    nick = self.api.nickname or self.config.get("server_nickname") or ""
+                    if nick and self.config.get("server_token"):
+                        try:
+                            session["thread"].join(timeout=35)
+                        except Exception:
+                            pass
                         session["abandon"] = True
-                        launch_counted = session["reported"]
-
-                        def report_work():
-                            return self.api.report_playtime(
-                                elapsed_minutes, version, launch_counted=launch_counted)
-
-                        def report_done(result, error):
-                            if error or not result:
-                                return
-                            status, data = result
-                            if status == 200:
-                                self._refresh_account_info_label()
-
-                        self._async(report_work, report_done)
+                        self._enqueue_pending_sync({
+                            "nick": nick, "version": version,
+                            "minutes": elapsed_minutes if elapsed_minutes >= 0.1 else 0,
+                            "launch_counted": bool(session["reported"]),
+                        })
+                        threading.Thread(target=self._flush_pending_sync, daemon=True).start()
                 self._active_game_version = None
                 self._active_game_player = None
                 if self.discord.connected:
@@ -11322,6 +12459,61 @@ class LauncherApp:
             self.root.after(0, lambda: self.install_btn.config(state="normal"))
             self.root.after(0, lambda: self.launch_btn.config(state="normal"))
             self.root.after(0, lambda: self.status_var.set("Готов"))
+
+    # ===== Очередь синхронизации времени игры и запусков =====
+    def _enqueue_pending_sync(self, entry):
+        if entry.get("launch_counted") and not entry.get("minutes"):
+            return  # нечего отправлять
+        with self._pending_sync_lock:
+            q = list(self.config.get("pending_sync", []))
+            q.append(entry)
+            self.config["pending_sync"] = q[-200:]
+            save_json_file(CONFIG_FILE, self.config)
+
+    def _flush_pending_sync(self):
+        if not self.api.is_logged_in() or not self._pending_sync_lock.acquire(blocking=False):
+            return
+        try:
+            nick = (self.api.nickname or "").lower()
+            q = list(self.config.get("pending_sync", []))
+            if not q:
+                return
+            left, changed, stop = [], False, False
+            for e in q:
+                if stop or str(e.get("nick", "")).lower() != nick:
+                    left.append(e)
+                    continue
+                try:
+                    minutes = float(e.get("minutes") or 0)
+                    if minutes > 0:
+                        status, data = self.api.report_playtime(
+                            minutes, e.get("version", "unknown"), launch_counted=bool(e.get("launch_counted")))
+                    elif not e.get("launch_counted"):
+                        status, data = self.api.report_launch(e.get("version", "unknown"))
+                    else:
+                        changed = True
+                        continue
+                except Exception as ex:
+                    print(f"Синхронизация отложена: {ex}")
+                    left.append(e)
+                    stop = True
+                    continue
+                if status == 200:
+                    changed = True
+                    if isinstance(data, dict):
+                        self.stats.adopt_server_totals(data.get("total_launches"), data.get("total_playtime"))
+                elif status in (401, 403) or status >= 500 or status == 429:
+                    left.append(e)
+                    stop = True
+                else:
+                    changed = True  # 400 и т.п. — запись некорректна, выбрасываем
+            if changed:
+                self.config["pending_sync"] = left
+                save_json_file(CONFIG_FILE, self.config)
+                self.root.after(0, self._update_stats_label)
+                self.root.after(0, self._refresh_account_info_label)
+        finally:
+            self._pending_sync_lock.release()
 
     def _report_launch_to_server(self, version):
         session = {"reported": False, "abandon": False, "thread": None}
