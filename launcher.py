@@ -182,9 +182,21 @@ def animate_image_on_label(label, image_bytes, max_px=96, circular=False):
     label.after(durations[0], step)
 
 
-CONFIG_FILE = "launcher_config.json"
+def _resolve_config_path():
+    name = "launcher_config.json"
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    p_base = os.path.join(base, name)
+    p_cwd = os.path.abspath(name)
+    if os.path.exists(p_base):
+        return p_base
+    if os.path.exists(p_cwd):
+        return p_cwd
+    return p_base if os.access(base, os.W_OK) else p_cwd
 
-APP_VERSION = "1.8.2"
+
+CONFIG_FILE = _resolve_config_path()
+
+APP_VERSION = "1.8.1"
 
 
 def _sha256_file(path):
@@ -242,8 +254,7 @@ def play_achievement_sound():
 
 DISCORD_CLIENT_ID = "1548297015220371496"
 
-# Адрес сервера лаунчера. Задай через переменную окружения MAFIN_SERVER_URL
-SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://127.0.0.1:3096")
+SERVER_URL = os.environ.get("MAFIN_SERVER_URL", "http://121.0.0.1:3096")
 
 AUTHLIB_INJECTOR_LATEST = "https://authlib-injector.yushi.moe/artifact/latest.json"
 AUTHLIB_INJECTOR_FALLBACK = ("https://github.com/yushijinhun/authlib-injector/releases/download/"
@@ -876,27 +887,61 @@ DEFAULT_CONFIG = {
 }
 
 
+_JSON_IO_LOCK = threading.RLock()
+
+
 def load_json_file(path, default):
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(default, dict):
-                for k, v in default.items():
-                    if k not in data:
-                        data[k] = v
-            return data
-        except Exception:
-            pass
+    with _JSON_IO_LOCK:
+        for candidate in (path, path + ".bak"):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(default, dict):
+                    if not isinstance(data, dict):
+                        continue
+                    for k, v in default.items():
+                        if k not in data:
+                            data[k] = v
+                return data
+            except Exception:
+                continue
     return default.copy() if isinstance(default, dict) else default
 
 
 def save_json_file(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"Ошибка сохранения {path}: {e}")
+    """Атомарная запись: tmp + fsync + replace, чтобы токен не терялся при сбое/гонке потоков."""
+    with _JSON_IO_LOCK:
+        try:
+            text = None
+            for _ in range(3):
+                try:
+                    text = json.dumps(data, indent=4, ensure_ascii=False)
+                    break
+                except RuntimeError:
+                    time.sleep(0.01)
+            if text is None:
+                return
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        json.load(f)
+                    shutil.copyfile(path, path + ".bak")
+                except Exception:
+                    pass
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"Ошибка сохранения {path}: {e}")
+
+
+class SessionError(Exception):
+    pass
 
 
 class ServerAPI:
@@ -946,6 +991,22 @@ class ServerAPI:
     def cosmetics_buy(self, cosmetic_id):
         return self._post("/api/cosmetics/buy", {"id": cosmetic_id})
 
+    def fetch_bytes(self, path):
+        r = requests.get(f"{self.base_url}{path}", headers=self._headers(), timeout=10)
+        return r.status_code, (r.content if r.status_code == 200 else b"")
+
+    def skin_mine(self, game_name):
+        return self._get("/api/skin/mine", {"game_name": game_name})
+
+    def tg_status(self):
+        return self._get("/api/tg/status")
+
+    def tg_unlink(self, bot):
+        return self._post("/api/tg/unlink", {"bot": bot})
+
+    def cosmetics_adjust(self, y_adj, scale_adj):
+        return self._post("/api/cosmetics/adjust", {"y_adj": y_adj, "scale_adj": scale_adj})
+
     def cosmetics_equip(self, cosmetic_id):
         return self._post("/api/cosmetics/equip", {"id": cosmetic_id})
 
@@ -978,10 +1039,8 @@ class ServerAPI:
             self.playtime = data.get("total_playtime_minutes", 0)
             return True, data
         if status in (401, 403):
-            # токен реально отвергнут сервером
             self.token = None
             return False, data
-        # сервер временно недоступен / 5xx / 429 — токен не трогаем
         return False, {"_transient": True, "status": status, "error": data.get("error") if isinstance(data, dict) else None}
 
     def drop_local(self):
@@ -3946,7 +4005,6 @@ def server_join_args(mc_version, address):
     return ["--server", host, "--port", port or "25565"]
 
 
-# ----- сервер лаунчера в списке «Сетевая игра» (servers.dat) -----
 LAUNCHER_SERVER_MIN_VERSION = (1, 20, 4)
 
 
@@ -4000,7 +4058,7 @@ def servers_dat_add(game_dir, name, address):
         if len(buf) < 4 or buf[0] != 10:
             raise ValueError("servers.dat повреждён или не в формате NBT")
         pos = 1
-        _, pos = _nbt_read_string(buf, pos)  # имя корневого тега
+        _, pos = _nbt_read_string(buf, pos)
         list_start = None
         while True:
             t = buf[pos]
@@ -4028,9 +4086,9 @@ def servers_dat_add(game_dir, name, address):
                 raw = buf[p:end]
                 p = end
                 if (ip or "").lower() == address.lower():
-                    return False  # уже есть
+                    return False
                 if nm == name:
-                    continue  # устаревшая запись нашего сервера
+                    continue
                 kept.append(raw)
             kept.append(new_entry)
             new_list = (b"\x0a" + struct.pack(">i", len(kept)) + b"".join(kept))
@@ -4838,7 +4896,6 @@ def find_mod_updates(client, mods_dir, loaders, game_version):
 
 import hashlib
 
-# ===== Автоподбор ОЗУ и JVM-флагов =====
 def get_system_memory_mb():
     """(всего МБ, свободно МБ) или (None, None), если узнать не удалось."""
     try:
@@ -4945,7 +5002,6 @@ def jvm_preset_flags(preset, mem_mb):
     return list({"mojang": _JVM_MOJANG, "optimized": _JVM_OPTIMIZED}.get(name, []))
 
 
-# ===== Сборка сервера: синхронизация файлов =====
 SERVER_PACK_STATE_FILE = ".mafin_server_pack.json"
 SERVER_PACK_ROOTS = ("mods", "resourcepacks", "shaderpacks", "config")
 
@@ -5003,13 +5059,13 @@ def serverpack_plan(manifest, pack_dir, state, optional_choice):
         recorded = files_state.get(path) or {}
         exists = os.path.isfile(target)
         if not exists and root == "mods" and os.path.isfile(target + ".disabled"):
-            keep.append(f)  # игрок сам отключил мод: не возвращаем его
+            keep.append(f)
             continue
         if not exists:
             download.append(f)
             continue
         if root == "config" and recorded.get("hash") == want:
-            keep.append(f)  # конфиг не менялся на сервере: правки игрока не трогаем
+            keep.append(f)
             continue
         st = os.stat(target)
         if recorded.get("hash") == want and recorded.get("size") == st.st_size and recorded.get("mtime") == int(st.st_mtime):
@@ -5106,7 +5162,6 @@ def serverpack_download(api, f, dest):
                 out.write(chunk)
 
 
-# ===== Поиск виновного мода =====
 BISECT_STATE_FILE = ".mafin_bisect.json"
 
 
@@ -5173,7 +5228,6 @@ def mod_bisect_gen(files, closure):
         else:
             f2, c2 = yield from reduce(cands, fixed)
             culprits = f2 + c2
-    # виноватый мог оказаться библиотекой, которую он тянет за собой: проверяем зависимости отдельно
     chosen = set(culprits)
     extra = [f for f in closure(culprits) if f not in chosen]
     if extra and (yield closure(extra)):
@@ -9410,7 +9464,6 @@ class LauncherApp:
         if ok:
             self._pinned_fails = 0
         else:
-            # одиночный сбой сети не должен прятать сервер: убираем его после нескольких неудач подряд
             self._pinned_fails = getattr(self, "_pinned_fails", 0) + 1
             if self._pinned_fails < self.PINNED_FAILS_BEFORE_HIDE and self._pinned_server:
                 return
@@ -9847,15 +9900,11 @@ class LauncherApp:
             transient = bool(error) or not result or (
                 not result[0] and isinstance(result[1], dict) and result[1].get("_transient"))
             if transient:
-                # сеть/сервер недоступны — НЕ разлогиниваем (раньше тут вызывался api.logout(),
-                # который стирал токен на сервере и «кикал» пользователя)
                 tries = getattr(self, "_restore_tries", 0) + 1
                 self._restore_tries = tries
-                if tries <= 10:
-                    self.root.after(min(5000 * tries, 30000), self._try_restore_server_session)
+                self.root.after(min(5000 * tries, 30000), self._try_restore_server_session)
                 return
             if not result[0]:
-                # токен отвергнут сервером (401/403): чистим только локально
                 self.api.drop_local()
                 self.config["server_token"] = ""
                 save_json_file(CONFIG_FILE, self.config)
@@ -9883,6 +9932,8 @@ class LauncherApp:
                 self.refresh_admin_panel()
         self._refresh_account_info_label()
         self._sync_profile_with_server(self.api.nickname)
+        if hasattr(self, "_tg_rows"):
+            self._tg_refresh()
         self._rebuild_friends_tab()
         self._rebuild_quests_tab()
         self._rebuild_gifts_tab()
@@ -9913,7 +9964,6 @@ class LauncherApp:
             child.destroy()
         self.build_quests_tab(frame)
 
-    # ===== Автоподбор ОЗУ =====
     def _recommend_memory_now(self):
         total, free = get_system_memory_mb()
         mods = count_enabled_mods(self.mod_manager.mods_dir) if getattr(self, "mod_manager", None) else 0
@@ -9937,7 +9987,6 @@ class LauncherApp:
         except Exception:
             pass
 
-    # ===== Поиск виновного мода =====
     def _bisect_check_leftover(self):
         try:
             with open(bisect_state_path(self.mod_manager.mods_dir), "r", encoding="utf-8") as f:
@@ -9948,7 +9997,6 @@ class LauncherApp:
         self.refresh_mods()
         messagebox.showinfo("Поиск виновного мода", "Прошлый поиск был прерван. Все моды возвращены в прежнее состояние.")
 
-    # ===== Сборка сервера =====
     def _ensure_server_pack_entry(self, manifest):
         sp = self.config.setdefault("server_pack", {})
         pk = self._find_modpack(sp.get("pack_name", "")) if sp.get("pack_name") else None
@@ -10001,7 +10049,6 @@ class LauncherApp:
             return
         ServerPackDialog(self)
 
-    # ===== Косметика (шапки) =====
     def _priv_mode(self, mode):
         for page in (self._priv_page, self._cos_page):
             page.pack_forget()
@@ -10033,6 +10080,7 @@ class LauncherApp:
         ttk.Button(btns, text="🪙 Купить", style="Accent.TButton", command=self._cos_buy).pack(side="left")
         ttk.Button(btns, text="🎩 Надеть", command=self._cos_equip).pack(side="left", padx=6)
         ttk.Button(btns, text="Снять", command=lambda: self._cos_set_equipped(None)).pack(side="left")
+        ttk.Button(btns, text="⚙ Настроить", command=self.open_hat_adjust).pack(side="left", padx=6)
         self._cos_status = ttk.Label(btns, text="", foreground="#7a8599")
         self._cos_status.pack(side="left", padx=10)
         ttk.Label(page, text="Шапка появляется над головой через несколько секунд после входа на сервер или смены. "
@@ -10122,7 +10170,6 @@ class LauncherApp:
             self._load_cosmetics()
         self._async(lambda: self.api.cosmetics_equip(cid), done)
 
-    # ===== Недельный топ =====
     def build_top_tab(self, frame):
         top = ttk.Frame(frame)
         top.pack(fill="x", padx=8, pady=(8, 4))
@@ -10604,6 +10651,369 @@ class LauncherApp:
         ttk.Button(wrap, text="🏆 Топ игроков", command=self._show_server_top).grid(
             row=7, column=1, sticky="w", pady=(4, 0)
         )
+        tg_box = ttk.LabelFrame(wrap, text="✈️ Telegram-бот")
+        tg_box.grid(row=8, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        ttk.Label(
+            tg_box,
+            text=("Что умеет бот:\n"
+                  "• пишет, когда ваши друзья заходят в сеть;\n"
+                  "• присылает новости лаунчера и сервера;\n"
+                  "• /friends — показать, кто из друзей сейчас в сети;\n"
+                  "• /notify on|off — включить или выключить уведомления о друзьях;\n"
+                  "• /news on|off — включить или выключить новости;\n"
+                  "• /unlink — отвязать аккаунт."),
+            justify="left", foreground="#7a8599").pack(anchor="w", padx=10, pady=(8, 4))
+        self._tg_rows = {}
+        for bot, label in (("prod", "Основной бот"), ("test", "Тестовый бот (dc2)")):
+            row = ttk.Frame(tg_box)
+            row.pack(fill="x", padx=10, pady=3)
+            ttk.Label(row, text=label, width=20).pack(side="left")
+            st = ttk.Label(row, text="…", width=16)
+            st.pack(side="left")
+            btn = ttk.Button(row, text="✈️ Привязать", command=lambda b=bot: self._tg_toggle(b))
+            btn.pack(side="left", padx=6)
+            self._tg_rows[bot] = {"status": st, "btn": btn, "linked": False, "enabled": False}
+        ttk.Button(tg_box, text="🎩 Купить и настроить шапку",
+                   command=self.open_hat_adjust).pack(anchor="w", padx=10, pady=(6, 10))
+        self._tg_polling = 0
+        self.root.after(600, self._tg_refresh)
+
+    def _tg_refresh(self):
+        if not hasattr(self, "_tg_rows"):
+            return
+        if not self.api.is_logged_in():
+            for r in self._tg_rows.values():
+                r["status"].config(text="нужен вход")
+                r["btn"].config(state="disabled")
+            return
+
+        def done(result, error):
+            status, data = result if result else (0, {})
+            if status in (401, 403):
+                self._on_session_rejected()
+                return
+            for bot, r in self._tg_rows.items():
+                info = (data or {}).get(bot) if status == 200 else None
+                if not info:
+                    r["status"].config(text="нет связи")
+                    r["btn"].config(state="disabled")
+                    continue
+                r["enabled"] = bool(info.get("enabled"))
+                r["linked"] = bool(info.get("linked"))
+                if not r["enabled"]:
+                    r["status"].config(text="не настроен")
+                    r["btn"].config(state="disabled", text="✈️ Привязать")
+                elif r["linked"]:
+                    r["status"].config(text="✅ привязан")
+                    r["btn"].config(state="normal", text="Отвязать")
+                else:
+                    r["status"].config(text="не привязан")
+                    r["btn"].config(state="normal", text="✈️ Привязать")
+        self._async(lambda: self.api.tg_status(), done)
+
+    def _tg_toggle(self, bot):
+        r = self._tg_rows.get(bot)
+        if not r:
+            return
+        if r["linked"]:
+            if not messagebox.askyesno("Telegram", "Отвязать Telegram от аккаунта?"):
+                return
+            self._async(lambda: self.api.tg_unlink(bot), lambda res, err: self._tg_refresh())
+        else:
+            self.link_telegram(bot)
+            self._tg_polling = 60
+            self._tg_poll_tick()
+
+    def _tg_poll_tick(self):
+        if self._tg_polling <= 0:
+            return
+        self._tg_polling -= 1
+        self._tg_refresh()
+        if any(r["enabled"] and not r["linked"] for r in self._tg_rows.values()):
+            self.root.after(5000, self._tg_poll_tick)
+
+    def open_hat_adjust(self):
+        if not self.api.is_logged_in():
+            messagebox.showerror("Шапка", "Сначала войдите в аккаунт.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Шапки: покупка и настройка")
+        win.resizable(False, False)
+        win.transient(self.root)
+        st = {"items": {}, "sel": None, "y": 0.0, "s": 0.0, "timer": None, "skin": None, "hats": {}, "photo": None}
+        preview = tk.Label(win, bg="#1a1d23", width=30, height=17)
+        preview.grid(row=0, column=0, rowspan=4, padx=12, pady=12)
+        right = ttk.Frame(win)
+        right.grid(row=0, column=1, padx=(0, 12), pady=12, sticky="n")
+        balance = ttk.Label(right, text="🪙 …", font=("Segoe UI Semibold", 11))
+        balance.pack(anchor="w")
+        tree = ttk.Treeview(right, columns=("title", "price", "state"), show="headings", height=6, selectmode="browse")
+        for col, text, width in (("title", "Шапка", 150), ("price", "Цена", 60), ("state", "Статус", 90)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor="w")
+        tree.pack(fill="x", pady=6)
+        btns = ttk.Frame(right)
+        btns.pack(fill="x")
+        ctl = ttk.Frame(right)
+        ctl.pack(fill="x", pady=8)
+        note = ttk.Label(right, text="", foreground="#7a8599", wraplength=300, justify="left")
+        note.pack(anchor="w")
+        y_var, s_var = tk.StringVar(value="+0.00"), tk.StringVar(value="+0.00")
+
+        def worn():
+            return next((i for i in st["items"].values() if i.get("equipped")), None)
+
+        def load_png(data):
+            import io as _io
+            return Image.open(_io.BytesIO(data)).convert("RGBA")
+
+        def region(img, box):
+            return img.crop(box)
+
+        def compose():
+            if not HAS_PIL or not win.winfo_exists():
+                return
+            u = 8
+            canvas = Image.new("RGBA", (24 * u, 48 * u), (26, 29, 35, 255))
+            skin = st["skin"]
+            if skin is None:
+                skin = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+                d = ImageDraw.Draw(skin)
+                d.rectangle([8, 8, 15, 15], fill=(197, 140, 99, 255))
+                d.rectangle([20, 20, 27, 31], fill=(47, 143, 157, 255))
+                d.rectangle([44, 20, 47, 31], fill=(197, 140, 99, 255))
+                d.rectangle([36, 52, 39, 63], fill=(197, 140, 99, 255))
+                d.rectangle([4, 20, 7, 31], fill=(59, 76, 192, 255))
+                d.rectangle([20, 52, 23, 63], fill=(59, 76, 192, 255))
+                d.rectangle([9, 11, 10, 12], fill=(30, 30, 30, 255))
+                d.rectangle([13, 11, 14, 12], fill=(30, 30, 30, 255))
+            old = skin.height < 64
+
+            def put(box, over_box, x, y):
+                base = region(skin, box)
+                canvas.alpha_composite(base.resize(((box[2] - box[0]) * u, (box[3] - box[1]) * u), Image.NEAREST), (x * u, y * u))
+                if over_box and not (old and over_box[1] >= 32 and over_box != (40, 8, 48, 16)):
+                    ov = region(skin, over_box)
+                    canvas.alpha_composite(ov.resize(((over_box[2] - over_box[0]) * u, (over_box[3] - over_box[1]) * u), Image.NEAREST), (x * u, y * u))
+            left_arm = (44, 20, 48, 32) if old else (36, 52, 40, 64)
+            left_leg = (4, 20, 8, 32) if old else (20, 52, 24, 64)
+            put((8, 8, 16, 16), (40, 8, 48, 16), 8, 14)
+            put((20, 20, 28, 32), None if old else (20, 36, 28, 48), 8, 22)
+            put((44, 20, 48, 32), None if old else (44, 36, 48, 48), 4, 22)
+            put(left_arm, None if old else (52, 52, 56, 64), 16, 22)
+            put((4, 20, 8, 32), None if old else (4, 36, 8, 48), 8, 34)
+            put(left_leg, None if old else (4, 52, 8, 64), 12, 34)
+            it = worn()
+            if it:
+                size_units = max(3.0, min(max(it.get("scale", 0.7) + st["s"], 0.2), 2.0) * 16) / 2
+                lift = (it.get("y_offset", 0) + st["y"]) * 16 / 2
+                px = max(4, int(size_units * u))
+                bottom = int((14 - lift) * u)
+                left = int(12 * u - px / 2)
+                hat_img = st["hats"].get(it["id"])
+                if hat_img is not None:
+                    face = region(hat_img, (8, 8, 16, 16)).resize((px, px), Image.NEAREST)
+                    canvas.alpha_composite(face, (left, bottom - px))
+                    if hat_img.height >= 16 and hat_img.width >= 48:
+                        ov = region(hat_img, (40, 8, 48, 16)).resize((px, px), Image.NEAREST)
+                        canvas.alpha_composite(ov, (left, bottom - px))
+                else:
+                    sq = Image.new("RGBA", (px, px), (217, 130, 43, 255))
+                    ImageDraw.Draw(sq).rectangle([0, 0, px - 1, px - 1], outline=(122, 74, 16, 255), width=2)
+                    canvas.alpha_composite(sq, (left, bottom - px))
+            photo = ImageTk.PhotoImage(canvas.resize((24 * u * 3 // 2, 48 * u * 3 // 2), Image.NEAREST))
+            st["photo"] = photo
+            preview.config(image=photo, width=photo.width(), height=photo.height())
+
+        def redraw():
+            y_var.set(f"{st['y']:+.2f}")
+            s_var.set(f"{st['s']:+.2f}")
+            compose()
+
+        def fill_tree():
+            keep = st["sel"]
+            tree.delete(*tree.get_children())
+            for it in st["items"].values():
+                state = "✅ надета" if it["equipped"] else ("есть" if it["owned"] else "")
+                tree.insert("", "end", iid=str(it["id"]),
+                            values=(it["title"], "" if it["owned"] else f"{it['price']:g}", state))
+            if keep and str(keep) in tree.get_children():
+                tree.selection_set(str(keep))
+
+        def sel_item():
+            sel = tree.selection()
+            return st["items"].get(int(sel[0])) if sel else None
+
+        def load_hat_images():
+            for it in list(st["items"].values()):
+                if it.get("has_texture") and it["id"] not in st["hats"]:
+                    def work(i=it):
+                        code, data = self.api.fetch_bytes(f"/api/cosmetics/texture/{i['id']}")
+                        return i["id"], data if code == 200 else b""
+
+                    def done(res, err):
+                        if res and res[1] and win.winfo_exists():
+                            try:
+                                st["hats"][res[0]] = load_png(res[1])
+                                compose()
+                            except Exception:
+                                pass
+                    self._async(work, done)
+
+        def reload():
+            def done(result, error):
+                if not win.winfo_exists():
+                    return
+                status, data = result if result else (0, {})
+                if status != 200 or not data.get("success"):
+                    note.config(text="Не удалось загрузить данные с сервера.")
+                    return
+                st["items"] = {i["id"]: i for i in data.get("items", [])}
+                st["y"] = float(data.get("y_adj") or 0)
+                st["s"] = float(data.get("scale_adj") or 0)
+                self.api.coins = data.get("coins", self.api.coins)
+                balance.config(text=f"🪙 {data.get('coins', 0):g}")
+                fill_tree()
+                load_hat_images()
+                redraw()
+                if not st["items"]:
+                    note.config(text="Шапок пока нет в продаже.")
+                elif not worn():
+                    note.config(text="Выберите шапку, купите её и наденьте — затем настройте стрелками.")
+            self._async(lambda: self.api.cosmetics_list(), done)
+
+        def load_skin():
+            name = (self.player_var.get() or "").strip()
+
+            def work():
+                code, data = self.api.skin_mine(name)
+                skin = (data or {}).get("skin") if code == 200 else None
+                if not skin:
+                    return None
+                code2, raw = self.api.fetch_bytes(f"/yggdrasil/textures/{skin['hash']}")
+                return raw if code2 == 200 else None
+
+            def done(raw, err):
+                if raw and HAS_PIL and win.winfo_exists():
+                    try:
+                        st["skin"] = load_png(raw)
+                    except Exception:
+                        st["skin"] = None
+                    compose()
+            self._async(work, done)
+
+        def do_buy():
+            it = sel_item()
+            if not it:
+                note.config(text="Выберите шапку в списке.")
+                return
+            if it["owned"]:
+                note.config(text="Эта шапка уже куплена — нажмите «Надеть».")
+                return
+            if not messagebox.askyesno("Покупка", f"Купить «{it['title']}» за {it['price']:g} монет?", parent=win):
+                return
+
+            def done(result, error):
+                status, data = result if result else (0, {"error": str(error)})
+                if status == 200 and data.get("success"):
+                    note.config(text=f"✅ Куплено: {it['title']}")
+                else:
+                    note.config(text=(data or {}).get("error", "Не удалось купить"))
+                reload()
+            self._async(lambda: self.api.cosmetics_buy(it["id"]), done)
+
+        def do_equip(cid):
+            def done(result, error):
+                status, data = result if result else (0, {"error": str(error)})
+                if status == 200 and data.get("success"):
+                    note.config(text="Шапка снята" if cid is None else "Шапка надета. В игре появится через несколько секунд.")
+                else:
+                    note.config(text=(data or {}).get("error", "Не удалось сменить шапку"))
+                reload()
+            self._async(lambda: self.api.cosmetics_equip(cid), done)
+
+        def equip_selected():
+            it = sel_item()
+            if not it:
+                note.config(text="Выберите шапку в списке.")
+            elif not it["owned"]:
+                note.config(text="Сначала купите эту шапку.")
+            else:
+                do_equip(it["id"])
+
+        def save_later():
+            redraw()
+            if st["timer"]:
+                win.after_cancel(st["timer"])
+
+            def push():
+                y, sc = st["y"], st["s"]
+
+                def done(result, error):
+                    status, data = result if result else (0, {})
+                    note.config(text="Сохранено: в игре обновится через несколько секунд." if status == 200
+                                else ((data or {}).get("error") or "Не удалось сохранить настройку."))
+                self._async(lambda: self.api.cosmetics_adjust(y, sc), done)
+            st["timer"] = win.after(450, push)
+
+        def change(key, delta, lo, hi):
+            if not worn():
+                note.config(text="Сначала наденьте шапку.")
+                return
+            st[key] = round(min(max(st[key] + delta, lo), hi), 2)
+            save_later()
+
+        def reset():
+            if worn():
+                st["y"] = st["s"] = 0.0
+                save_later()
+
+        ttk.Button(btns, text="🪙 Купить", style="Accent.TButton", command=do_buy).pack(side="left")
+        ttk.Button(btns, text="🎩 Надеть", command=equip_selected).pack(side="left", padx=6)
+        ttk.Button(btns, text="Снять", command=lambda: do_equip(None)).pack(side="left")
+        for r, (label, key, lo, hi, up_t, down_t, var) in enumerate((
+                ("Высота", "y", -0.6, 0.6, "▲", "▼", y_var),
+                ("Размер", "s", -0.5, 0.8, "▶", "◀", s_var))):
+            ttk.Label(ctl, text=label, width=8).grid(row=r, column=0, pady=4)
+            ttk.Button(ctl, text=down_t, width=3,
+                       command=lambda k=key, a=lo, b=hi: change(k, -0.05, a, b)).grid(row=r, column=1)
+            ttk.Label(ctl, textvariable=var, width=7, anchor="center").grid(row=r, column=2)
+            ttk.Button(ctl, text=up_t, width=3,
+                       command=lambda k=key, a=lo, b=hi: change(k, 0.05, a, b)).grid(row=r, column=3)
+        ttk.Button(ctl, text="Сбросить", command=reset).grid(row=2, column=0, columnspan=4, pady=6)
+        ttk.Button(win, text="Закрыть", command=win.destroy).grid(row=4, column=0, columnspan=2, pady=(0, 12))
+        if not HAS_PIL:
+            note.config(text="Для предпросмотра нужен Pillow (pip install pillow).")
+        compose()
+        reload()
+        load_skin()
+
+    def link_telegram(self, bot):
+        """Привязка аккаунта к Telegram-боту (prod/test): сервер выдаёт одноразовую ссылку."""
+        if not self.api.is_logged_in():
+            messagebox.showerror("Telegram", "Сначала войдите в аккаунт.")
+            return
+
+        def work():
+            return self.api._post("/api/tg/link", {"bot": bot})
+
+        def done(result, error):
+            if error or not result:
+                messagebox.showerror("Telegram", "Сервер недоступен.")
+                return
+            status, data = result
+            if status in (401, 403):
+                self._on_session_rejected()
+                return
+            if status != 200 or not data.get("url"):
+                messagebox.showerror("Telegram", (data or {}).get("error") or "Не удалось получить ссылку.")
+                return
+            import webbrowser
+            webbrowser.open(data["url"])
+            messagebox.showinfo("Telegram", "Открылся Telegram. Нажмите «Start» у бота — "
+                                            "аккаунт привяжется (ссылка действует 10 минут).")
+
+        self._async(work, done)
 
     def _current_server_url(self):
         self.api.set_base_url(SERVER_URL)
@@ -11394,6 +11804,13 @@ class LauncherApp:
                 self.root.after(0, self._on_session_rejected)
             else:
                 self._flush_pending_sync()
+                gp = getattr(self, "_active_game_player", None)
+                proc = getattr(self, "process", None)
+                if gp and proc is not None and proc.poll() is None:
+                    try:
+                        self.api.register_mc_session(gp)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -11407,6 +11824,17 @@ class LauncherApp:
         try:
             self.server_status_var.set("Сессия истекла — войдите заново")
             self.account_info_label.config(text="Сессия истекла — войдите заново.")
+        except Exception:
+            pass
+        try:
+            if self.admin_tab_id is not None:
+                self.notebook.tab(self.admin_tab_id, state="hidden")
+        except Exception:
+            pass
+        try:
+            messagebox.showwarning("Сессия истекла",
+                                   "Сессия на сервере слетела. Войдите в аккаунт заново на вкладке «Аккаунт» — "
+                                   "без этого запуск игры и вход на сервер недоступны.")
         except Exception:
             pass
 
@@ -11838,7 +12266,9 @@ class LauncherApp:
             filetypes=[("JSON", "*.json")]
         )
         if path:
-            save_json_file(path, self.config)
+            safe = {k: v for k, v in self.config.items()
+                    if k not in ("server_token", "server_nickname", "pending_sync")}
+            save_json_file(path, safe)
             messagebox.showinfo("Экспорт", "✅ Конфиг экспортирован")
             self._bump_achievement("exports", 1)
 
@@ -11850,6 +12280,8 @@ class LauncherApp:
         if path:
             try:
                 imported = load_json_file(path, DEFAULT_CONFIG)
+                for k in ("server_token", "server_nickname", "pending_sync"):
+                    imported.pop(k, None)
                 self.config.update(imported)
                 self.save_config()
                 messagebox.showinfo("Импорт", "✅ Конфиг импортирован. Перезапустите лаунчер.")
@@ -12119,6 +12551,10 @@ class LauncherApp:
     def install_and_launch(self):
         if self.installing:
             return
+        if not self.api.is_logged_in():
+            messagebox.showerror("Требуется вход", "Сессия не активна. Войдите в аккаунт на вкладке «Аккаунт», чтобы играть.")
+            self._select_account_tab()
+            return
         self._apply_auto_memory()
         self.installing = True
         self.install_btn.config(state="disabled")
@@ -12259,8 +12695,21 @@ class LauncherApp:
         except Exception as e:
             _log_install(f"Не удалось добавить сервер лаунчера в «Сетевая игра»: {e}")
 
+    def _select_account_tab(self):
+        try:
+            for name, tab in self._nav_defs:
+                if "Аккаунт" in name:
+                    self.notebook.select(tab)
+                    break
+        except Exception:
+            pass
+
     def launch_only(self):
         if self.installing:
+            return
+        if not self.api.is_logged_in():
+            messagebox.showerror("Требуется вход", "Сессия не активна. Войдите в аккаунт на вкладке «Аккаунт», чтобы играть.")
+            self._select_account_tab()
             return
         version = self.version_var.get().strip()
         if not version:
@@ -12343,11 +12792,21 @@ class LauncherApp:
             self.core.memory = mem
             self._current_world = None
 
-            if self.api.is_logged_in():
-                try:
-                    self.api.register_mc_session(player)
-                except Exception as e:
-                    print(f"Не удалось зарегистрировать игровой ник на сервере: {e}")
+            if not self.api.is_logged_in():
+                raise SessionError("Сессия не активна. Войдите в аккаунт заново.")
+            try:
+                st_mc, data_mc = self.api.register_mc_session(player)
+            except Exception as e:
+                print(f"Не удалось зарегистрировать игровой ник на сервере: {e}")
+                st_mc, data_mc = 0, {}
+            if st_mc in (401, 403):
+                self.root.after(0, self._on_session_rejected)
+                raise SessionError("Сессия слетела. Войдите в аккаунт заново — запуск под этим ником запрещён.")
+            if st_mc in (400, 409):
+                err_txt = data_mc.get("error") if isinstance(data_mc, dict) else None
+                raise SessionError(err_txt or "Сервер отклонил игровой ник.")
+            if st_mc != 200:
+                self.root.after(0, lambda: self.status_var.set("⚠️ Сервер недоступен: вход на сервер может не сработать"))
 
             skins_on = self.config.get("skin_system_enabled", True)
             self.core.skin_server_url = self.api.base_url if skins_on else ""
@@ -12453,6 +12912,11 @@ class LauncherApp:
 
             threading.Thread(target=wait_and_record, daemon=True).start()
 
+        except SessionError as e:
+            self.root.after(0, lambda err=e: messagebox.showerror("Нужен вход", str(err)))
+            self.root.after(0, lambda: self.install_btn.config(state="normal"))
+            self.root.after(0, lambda: self.launch_btn.config(state="normal"))
+            self.root.after(0, lambda: self.status_var.set("Готов"))
         except Exception as e:
             self._last_launch_failed = True
             self.root.after(0, lambda err=e: messagebox.showerror("Ошибка запуска", str(err)))
@@ -12460,10 +12924,9 @@ class LauncherApp:
             self.root.after(0, lambda: self.launch_btn.config(state="normal"))
             self.root.after(0, lambda: self.status_var.set("Готов"))
 
-    # ===== Очередь синхронизации времени игры и запусков =====
     def _enqueue_pending_sync(self, entry):
         if entry.get("launch_counted") and not entry.get("minutes"):
-            return  # нечего отправлять
+            return
         with self._pending_sync_lock:
             q = list(self.config.get("pending_sync", []))
             q.append(entry)
@@ -12506,7 +12969,7 @@ class LauncherApp:
                     left.append(e)
                     stop = True
                 else:
-                    changed = True  # 400 и т.п. — запись некорректна, выбрасываем
+                    changed = True
             if changed:
                 self.config["pending_sync"] = left
                 save_json_file(CONFIG_FILE, self.config)
