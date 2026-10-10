@@ -19,7 +19,7 @@ import urllib.error
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string, send_from_directory
+from flask import Flask, request, jsonify, g, session, redirect, url_for, render_template_string, send_from_directory, has_app_context
 from werkzeug.utils import secure_filename
 
 DB_PATH = os.environ.get("MAFIN_DB_PATH", "mafin_launcher.db")
@@ -87,9 +87,10 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_UPDATE_SIZE_BYTES + 1024 * 1024
 
 def get_db():
     if 'db' not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=30)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA busy_timeout=30000")
     return g.db
 
 @app.teardown_appcontext
@@ -290,6 +291,13 @@ def init_db():
             applied_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS mc_sessions (
+            game_name_lower TEXT PRIMARY KEY,
+            nick TEXT NOT NULL,
+            ip TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS auth_sessions (
             token TEXT PRIMARY KEY,
             nickname TEXT NOT NULL,
@@ -341,6 +349,12 @@ def init_db():
         );
     """)
     
+    for _col in ("y_adj", "scale_adj"):
+        try:
+            db.execute(f"ALTER TABLE cosmetic_equipped ADD COLUMN {_col} REAL NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    db.commit()
     existing_cols = [row[1] for row in db.execute("PRAGMA table_info(profiles)").fetchall()]
     if "last_seen" not in existing_cols:
         db.execute("ALTER TABLE profiles ADD COLUMN last_seen TEXT")
@@ -502,8 +516,12 @@ def record_login_day(db, nickname):
         print(f"Ошибка записи login_days: {e}")
 
 def log_action(action, nickname=None, details=None):
+    own = None
     try:
-        db = get_db()
+        if has_app_context():
+            db = get_db()
+        else:
+            db = own = sqlite3.connect(DB_PATH, timeout=30)
         db.execute(
             "INSERT INTO server_logs (action, nickname, details) VALUES (?, ?, ?)",
             (action, nickname, details)
@@ -511,6 +529,9 @@ def log_action(action, nickname=None, details=None):
         db.commit()
     except Exception as e:
         print(f"Ошибка логирования: {e}")
+    finally:
+        if own is not None:
+            own.close()
 
 def _profile_by_token(db, token):
     """Профиль по токену: сначала таблица сессий (несколько устройств), затем старый profiles.token."""
@@ -525,10 +546,9 @@ def _profile_by_token(db, token):
 
 def _add_session(db, nickname, token):
     db.execute("INSERT OR REPLACE INTO auth_sessions (token, nickname) VALUES (?, ?)", (token, nickname))
-    # не больше 10 одновременных сессий на аккаунт
     db.execute(
         "DELETE FROM auth_sessions WHERE nickname = ? AND token NOT IN "
-        "(SELECT token FROM auth_sessions WHERE nickname = ? ORDER BY created_at DESC, rowid DESC LIMIT 10)",
+        "(SELECT token FROM auth_sessions WHERE nickname = ? ORDER BY created_at DESC, rowid DESC LIMIT 30)",
         (nickname, nickname))
 
 def auth_required(f):
@@ -644,7 +664,8 @@ def login():
     if not nickname or not password:
         return jsonify({"error": "Ник и пароль обязательны"}), 400
 
-    lockout_remaining = _check_login_lockout(nickname)
+    lock_key = f"{nickname.lower()}|{_client_ip()}"
+    lockout_remaining = _check_login_lockout(lock_key)
     if lockout_remaining > 0:
         return jsonify({
             "error": f"Слишком много неудачных попыток. Повторите через {int(lockout_remaining)} сек."
@@ -654,7 +675,7 @@ def login():
     profile = db.execute("SELECT * FROM profiles WHERE nickname = ?", (nickname,)).fetchone()
     
     if not profile:
-        _register_login_failure(nickname)
+        _register_login_failure(lock_key)
         return jsonify({"error": "Неверный ник или пароль"}), 404
     
     if profile['is_banned']:
@@ -662,10 +683,10 @@ def login():
     
     ok, needs_upgrade = verify_password(password, profile['salt'], profile['password_hash'])
     if not ok:
-        _register_login_failure(nickname)
+        _register_login_failure(lock_key)
         return jsonify({"error": "Неверный ник или пароль"}), 401
 
-    _clear_login_failures(nickname)
+    _clear_login_failures(lock_key)
 
     token = generate_token()
     now_iso = datetime.now().isoformat()
@@ -807,6 +828,8 @@ def set_gifts_visibility():
 @auth_required
 def get_me():
     profile = dict(g.current_profile)
+    for secret in ("password_hash", "salt", "token"):
+        profile.pop(secret, None)
     profile["is_online"] = True
     return jsonify(profile)
 
@@ -816,7 +839,6 @@ def logout():
     db = get_db()
     nickname = g.current_profile['nickname']
     cur_token = request.headers.get('Authorization', '').replace('Bearer ', '')
-    # закрываем только текущую сессию: вход/выход в кабинете не должен выкидывать лаунчер и наоборот
     db.execute("DELETE FROM auth_sessions WHERE token = ?", (cur_token,))
     remaining = db.execute(
         "SELECT token FROM auth_sessions WHERE nickname = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
@@ -834,10 +856,12 @@ def logout():
 @auth_required
 def heartbeat():
     db = get_db()
+    was_online = is_online(g.current_profile['last_seen'])
     touch_last_seen(db, g.current_profile['nickname'])
+    if not was_online:
+        _tg_notify_friends_online(g.current_profile['nickname'])
     return jsonify({"success": True})
 
-# ===== Авторизация игроков на Minecraft-сервере (плагин MafinAuth) =====
 def _load_mc_secret():
     """Секрет для плагина MafinAuth: из MAFIN_MC_SECRET или из файла .mc_secret.
     Если ни того ни другого нет, создаётся случайный и сохраняется в .mc_secret."""
@@ -864,6 +888,27 @@ def _load_mc_secret():
 MC_SECRET = _load_mc_secret()
 _mc_sessions = {}
 _mc_sessions_lock = threading.Lock()
+
+def _mc_sessions_load():
+    """Восстанавливает игровые сессии из БД после перезапуска сервера."""
+    try:
+        db = sqlite3.connect(DB_PATH, timeout=30)
+        rows = db.execute("SELECT game_name_lower, nick, ip FROM mc_sessions").fetchall()
+        db.close()
+    except sqlite3.Error as e:
+        print(f"Не удалось загрузить mc_sessions: {e}")
+        return
+    with _mc_sessions_lock:
+        for key, nick, ip in rows:
+            _mc_sessions[key] = {"nick": nick, "ip": ip or ""}
+
+def _client_ip():
+    """IP клиента. За обратным прокси задайте MAFIN_TRUST_PROXY=1 — тогда берётся X-Forwarded-For."""
+    if os.environ.get("MAFIN_TRUST_PROXY") == "1":
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            return _normalize_ip(xff.split(",")[0])
+    return _normalize_ip(request.remote_addr)
 
 def _normalize_ip(ip):
     ip = (ip or "").strip()
@@ -893,7 +938,15 @@ def mc_register_session():
                 return jsonify({"error": "Этот игровой ник сейчас используется другим аккаунтом"}), 409
         for k in [k for k, v in _mc_sessions.items() if v['nick'] == me and k != key]:
             del _mc_sessions[k]
-        _mc_sessions[key] = {"nick": me, "ip": _normalize_ip(request.remote_addr)}
+        ip = _client_ip()
+        _mc_sessions[key] = {"nick": me, "ip": ip}
+        try:
+            db.execute("DELETE FROM mc_sessions WHERE nick = ? AND game_name_lower != ?", (me, key))
+            db.execute("INSERT OR REPLACE INTO mc_sessions (game_name_lower, nick, ip, updated_at) "
+                       "VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (key, me, ip))
+            db.commit()
+        except sqlite3.Error as e:
+            print(f"mc_sessions persist error: {e}")
     return jsonify({"success": True})
 
 def _mc_access(db, name, ip):
@@ -1530,6 +1583,7 @@ def publish_news():
     )
     db.commit()
     log_action("news_publish", g.current_profile['nickname'], title)
+    _tg_broadcast_news(title, body)
     return jsonify({"success": True, "id": cur.lastrowid}), 201
 
 
@@ -1570,6 +1624,11 @@ def delete_news(news_id):
 
 def cascade_delete_profile(db, nickname):
     db.execute("DELETE FROM profiles WHERE nickname = ?", (nickname,))
+    db.execute("DELETE FROM mc_sessions WHERE nick = ?", (nickname,))
+    try:
+        db.execute("DELETE FROM tg_links WHERE nickname = ?", (nickname,))
+    except sqlite3.OperationalError:
+        pass
     db.execute("DELETE FROM play_sessions WHERE nickname = ?", (nickname,))
     db.execute("DELETE FROM achievements WHERE nickname = ?", (nickname,))
     db.execute(
@@ -1967,10 +2026,6 @@ def web_admin_required(f):
     return decorated
 
 
-# ===== Minecraft-сервер (Paper) под управлением app.py =====
-# Всё лежит в папке MAFIN_MC_DIR (по умолчанию mcserver/ рядом с app.py).
-# Процесс запускается отдельной группой и переживает перезапуск app.py;
-# команды в консоль идут через именованный канал (только Linux).
 MC_DIR = os.path.abspath(os.environ.get("MAFIN_MC_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcserver")))
 MC_VERSION = os.environ.get("MAFIN_MC_VERSION", "26.2")
 MC_JAVA = os.environ.get("MAFIN_MC_JAVA", "java")
@@ -1997,7 +2052,6 @@ def _mc_find_jar():
     jars = [os.path.join(MC_DIR, n) for n in os.listdir(MC_DIR)
             if n.lower().startswith("paper") and n.lower().endswith(".jar")]
     if not jars:
-        # запасной вариант: в папке лежит ровно один .jar с version.json внутри
         for n in os.listdir(MC_DIR):
             p = os.path.join(MC_DIR, n)
             if n.lower().endswith(".jar") and _mc_jar_info(p)["id"]:
@@ -2119,7 +2173,6 @@ def _mc_write_plugin_config():
         f.write(f'api_url: "http://127.0.0.1:{api_port}"\n')
         f.write(f"secret: {json.dumps(MC_SECRET)}\n")
         f.write("timeout_ms: 5000\n")
-    # MafinCosmetics читает адрес и секрет отсюда; свои настройки плагина лежат в config.yml и не перезаписываются
     cos_dir = _mc_path("plugins", "MafinCosmetics")
     os.makedirs(cos_dir, exist_ok=True)
     with open(os.path.join(cos_dir, "connection.yml"), "w", encoding="utf-8") as f:
@@ -2127,7 +2180,6 @@ def _mc_write_plugin_config():
         f.write(f"secret: {json.dumps(MC_SECRET)}\n")
 
 
-# ----- оперативная память сервера -----
 MC_MIN_MEMORY_MB = 512
 
 
@@ -2236,10 +2288,6 @@ def _mc_send(command):
         os.close(fd)
 
 
-# ----- вторая линия защиты: проверка при заходе игрока -----
-# Плагин MafinAuth проверяет игрока ещё до входа (AsyncPlayerPreLoginEvent). Если по какой-то причине
-# проверку удалось обойти (например, зашли через ViaVersion со старой версии), эта служба читает
-# консоль сервера, видит строку «Ник[/IP:порт] logged in», проверяет игрока тем же правилом и кикает.
 _MC_JOIN_RE = re.compile(r"\]: ([A-Za-z0-9_]{1,16})\[/([0-9A-Fa-f:.]+):\d+\] logged in with entity id")
 _MC_KICK_TEXT = {
     "not_logged_in": "Войди в Mafin Launcher и запусти игру из него.",
@@ -2287,7 +2335,7 @@ def _mc_guard_loop():
             pos = None
             continue
         if pos is None or size < pos:
-            pos = size if pos is None else 0  # при первом чтении старое не разбираем
+            pos = size if pos is None else 0
             buf = b""
             if pos == size:
                 continue
@@ -2343,7 +2391,6 @@ def _mc_start():
         if total and mem_mb > total:
             raise RuntimeError(f"Выделено {_mc_fmt_mb(mem_mb)} памяти, а в системе всего {_mc_fmt_mb(total)}. Уменьши объём в настройках")
         port = _mc_port()
-        # Вход защищает MafinAuth (плюс проверка при заходе в app.py), поэтому online-mode всегда false
         _mc_set_props({"online-mode": "false", "server-port": str(port)})
         _mc_write_plugin_config()
         fifo = _mc_path("console.fifo")
@@ -2510,7 +2557,6 @@ def _mc_download_paper(version):
     return f"Paper {version} build {data.get('id', '?')} ({data.get('channel', '?')}) скачан"
 
 
-# ----- название сервера и версии для игроков -----
 def _mc_branding():
     data = {"name": MC_NAME, "version_min": "", "version_max": ""}
     try:
@@ -2545,7 +2591,6 @@ def _mc_save_branding(name, vmin, vmax):
     return f"Сохранено: «{name}»" + (f", версии {vmin or '…'} – {vmax or '…'}" if (vmin or vmax) else "")
 
 
-# ----- плагины из Modrinth -----
 MODRINTH_API = os.environ.get("MAFIN_MODRINTH_API", "https://api.modrinth.com/v2").rstrip("/")
 _MODRINTH_OVERRIDDEN = "MAFIN_MODRINTH_API" in os.environ
 MC_PLUGIN_LOADERS = ["paper", "spigot", "bukkit", "folia", "purpur"]
@@ -2670,7 +2715,6 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
         new_name = _mc_plugin_yml_name(tmp)
         if new_name is None:
             raise _McPluginError("Это не плагин для Paper (внутри нет plugin.yml)")
-        # заменяем старые копии того же плагина (обновление или ручная установка)
         for old in _mc_list_plugins():
             if old["name"].lower() == new_name.lower() and old["file"] != filename:
                 if old["protected"]:
@@ -2688,7 +2732,6 @@ def _mc_install_plugin(project, force=False, _depth=0, _seen=None):
     return messages
 
 
-# Плагин входа через лаунчер, собранный под Paper 26.2 (исходники в репозитории: mc-auth-plugin)
 MAFINAUTH_JAR_B64 = (
     "UEsDBAoAAAgAAGCARV0AAAAAAAAAAAAAAAAJAAQATUVUQS1JTkYv/soAAFBLAwQUAAgICABggEVdAAAAAAAAAAAAAAAAFAAA"
     "AE1FVEEtSU5GL01BTklGRVNULk1G803My0xLLS7RDUstKs7Mz7NSMNQz4OVyLkpNLElN0XWqtFIwMtUz0DPRM1TQcE3OySwo"
@@ -2789,7 +2832,6 @@ def _mc_delete_plugin(filename):
     return f"{filename} удалён. Перезапусти сервер, чтобы изменения вступили в силу"
 
 
-# ===== Миры и описание сервера (MOTD) =====
 MC_ZIP_MAX_ENTRIES = 60000
 MC_WORLD_MAX_BYTES = 8 * 1024 ** 3
 MC_RESERVED_WORLD_NAMES = {
@@ -2805,7 +2847,6 @@ def _mc_rm(path):
         pass
 
 
-# ----- безопасные пути и распаковка -----
 def _mc_safe_rel(rel, root):
     """Нормализует путь из архива. Возвращает (чистый_путь, полный_путь) или None,
     если путь пытается выйти за пределы папки."""
@@ -2831,7 +2872,7 @@ def _mc_extract_zip(zf, prefix, dest_root, limit):
         rel = name[len(prefix):]
         if "__MACOSX/" in name or rel.endswith(".DS_Store"):
             continue
-        if ((info.external_attr >> 16) & 0o170000) == 0o120000:  # символическая ссылка
+        if ((info.external_attr >> 16) & 0o170000) == 0o120000:
             skipped += 1
             continue
         res = _mc_safe_rel(rel, dest_root)
@@ -2853,7 +2894,6 @@ def _mc_extract_zip(zf, prefix, dest_root, limit):
     return written, skipped
 
 
-# ----- миры -----
 def _mc_active_world():
     return _mc_read_props().get("level-name") or "world"
 
@@ -2932,7 +2972,6 @@ def _mc_world_import(zip_path, wanted_name, fallback_name):
         shutil.rmtree(stage, ignore_errors=True)
 
 
-# ----- описание сервера (MOTD) -----
 def _mc_props_unescape(s):
     def repl(m):
         t = m.group(1)
@@ -4922,10 +4961,6 @@ def _cli_set_password(nickname):
     db.close()
     print("Пароль изменён, старые токены лаунчера сброшены (нужно залогиниться заново).")
 
-# ===== Сайт: главная со скачиванием, личный кабинет, условия и политика =====
-# Положите файл лаунчера (.exe/.zip) в папку downloads/ рядом с app.py — кнопка «Скачать» отдаст самый новый файл.
-# Если папка пуста, отдаётся активная версия из админки (раздел обновлений).
-# Настройки через переменные окружения: SITE_NAME, SITE_CONTACT (ссылка/почта для связи), SITE_DISCORD.
 import html as _html
 
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
@@ -4975,6 +5010,8 @@ label{display:block;font-size:14px;color:var(--mut);margin:12px 0 5px}
 .item:first-child{border-top:0}.item .t{flex:1}.item .t small{display:block;color:var(--mut)}
 .price{font-weight:800;white-space:nowrap}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;padding:8px 6px;border-top:1px solid var(--line)}th{color:var(--mut);font-weight:600;border-top:0}
+.hatview{flex:none;width:260px;height:340px;background:var(--card2);border-radius:10px;border:1px solid var(--line);margin-right:16px;overflow:hidden}
+.hatview canvas{display:block;width:260px;height:340px}
 .skinprev{image-rendering:pixelated;width:128px;height:128px;background:var(--card2);border-radius:10px;border:1px solid var(--line)}
 .row{display:flex;gap:16px;flex-wrap:wrap}.row>*{flex:1;min-width:200px}
 """
@@ -5147,6 +5184,203 @@ function authView(){
     el('h3',{},'Личный кабинет'),el('p',{},'Войдите тем же ником и паролем, что и в лаунчере.'),
     el('div',{class:'tabs',style:'margin-top:14px'},tl,tr),
     el('label',{},'Ник'),nick,el('label',{},'Пароль'),pass,go,err)}
+function setBoxUV(geo,u,v,w,h,d,tw,th){
+  const reg=[[u+d+w,v+d,d,h],[u,v+d,d,h],[u+d,v,w,d],[u+d+w,v,w,d],[u+d,v+d,w,h],[u+d+w+d,v+d,w,h]];
+  const uv=geo.attributes.uv;
+  reg.forEach((r,i)=>{const x0=r[0]/tw,x1=(r[0]+r[2])/tw,y1=1-r[1]/th,y0=1-(r[1]+r[3])/th,k=i*4;
+    uv.setXY(k,x0,y1);uv.setXY(k+1,x1,y1);uv.setXY(k+2,x0,y0);uv.setXY(k+3,x1,y0)});
+  uv.needsUpdate=true}
+function pixTex(T,src){const t=new T.Texture(src);t.magFilter=T.NearestFilter;t.minFilter=T.NearestFilter;t.generateMipmaps=false;t.needsUpdate=true;return t}
+function defaultSkinCanvas(){
+  const c=document.createElement('canvas');c.width=64;c.height=64;const x=c.getContext('2d');
+  const fill=(col,a,b,w,h)=>{x.fillStyle=col;x.fillRect(a,b,w,h)};
+  fill('#c58c63',0,0,32,16);fill('#4b2e1a',8,0,8,8);fill('#4b2e1a',0,8,32,4);fill('#4b2e1a',24,8,8,8);
+  fill('#222',10,12,2,2);fill('#222',14,12,2,2);fill('#8a5a3c',11,14,4,1);
+  fill('#2f8f9d',16,16,24,16);fill('#c58c63',40,16,16,16);fill('#2f8f9d',44,16,8,4);
+  fill('#3b4cc0',0,16,16,16);fill('#c58c63',32,48,16,16);fill('#2f8f9d',36,48,8,4);fill('#3b4cc0',16,48,16,16);
+  return c}
+function mkSkinViewer(box){
+  const T=window.THREE;
+  if(!T){box.append(el('p',{style:'color:var(--mut)'},'3D-просмотр не загрузился'));return null}
+  const W=260,H=340;
+  const renderer=new T.WebGLRenderer({antialias:true,alpha:true,preserveDrawingBuffer:true});
+  renderer.setSize(W,H);renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+  box.append(renderer.domElement);
+  const scene=new T.Scene();
+  const cam=new T.PerspectiveCamera(32,W/H,1,500);cam.position.set(0,22,118);cam.lookAt(0,22,0);
+  scene.add(new T.AmbientLight(0xffffff,0.9));
+  const dl=new T.DirectionalLight(0xffffff,0.45);dl.position.set(30,50,70);scene.add(dl);
+  const pivot=new T.Group();scene.add(pivot);
+  let player=null,hat=null,drag=false,lastX=0,idle=true;
+  const el_=renderer.domElement;el_.style.cursor='grab';el_.style.touchAction='none';
+  el_.addEventListener('pointerdown',e=>{drag=true;idle=false;lastX=e.clientX;el_.setPointerCapture(e.pointerId)});
+  el_.addEventListener('pointermove',e=>{if(drag){pivot.rotation.y+=(e.clientX-lastX)*0.012;lastX=e.clientX}});
+  const end=()=>{drag=false};el_.addEventListener('pointerup',end);el_.addEventListener('pointercancel',end);
+  function mat(tex,alpha){return new T.MeshLambertMaterial({map:tex,transparent:!!alpha,alphaTest:alpha?0.02:0})}
+  function part(w,h,d,u,v,ou,ov,x,y,z,tex,tw,th,over,grow){
+    const g=new T.Group(),geo=new T.BoxGeometry(w,h,d);setBoxUV(geo,u,v,w,h,d,tw,th);g.add(new T.Mesh(geo,mat(tex,false)));
+    if(over){const og=new T.BoxGeometry(w+grow,h+grow,d+grow);setBoxUV(og,ou,ov,w,h,d,tw,th);g.add(new T.Mesh(og,mat(tex,true)))}
+    g.position.set(x,y,z);return g}
+  function setSkin(src,slim){
+    if(player)pivot.remove(player);
+    const tw=src.width,th=src.height,tex=pixTex(T,src),old=th<64,aw=slim?3:4,ax=slim?5.5:6;
+    player=new T.Group();
+    player.add(part(8,8,8,0,0,32,0,0,28,0,tex,tw,th,true,1));
+    player.add(part(8,12,4,16,16,16,32,0,18,0,tex,tw,th,!old,0.5));
+    player.add(part(aw,12,4,40,16,40,32,-(4+aw/2),18,0,tex,tw,th,!old,0.5));
+    player.add(part(aw,12,4,old?40:32,old?16:48,48,48,4+aw/2,18,0,tex,tw,th,!old,0.5));
+    player.add(part(4,12,4,0,16,0,32,-2,6,0,tex,tw,th,!old,0.5));
+    player.add(part(4,12,4,old?0:16,old?16:48,0,48,2,6,0,tex,tw,th,!old,0.5));
+    pivot.add(player)}
+  function matCanvas(name){
+    const c=document.createElement('canvas');c.width=16;c.height=16;const x=c.getContext('2d');
+    let h=0;for(const ch of name)h=(h*31+ch.charCodeAt(0))%360;
+    const base=/PUMPKIN/.test(name)?'#d9822b':/GOLD/.test(name)?'#f5d03a':/DIAMOND/.test(name)?'#4fe0d6':/IRON/.test(name)?'#cfcfcf':/LEATHER/.test(name)?'#9a5a2e':'hsl('+h+',45%,50%)';
+    x.fillStyle=base;x.fillRect(0,0,16,16);
+    for(let i=0;i<40;i++){x.fillStyle='rgba(0,0,0,'+(Math.random()*0.12)+')';x.fillRect(Math.random()*16|0,Math.random()*16|0,2,2)}
+    if(/CARVED_PUMPKIN/.test(name)){x.fillStyle='#2a1500';x.fillRect(3,4,3,3);x.fillRect(10,4,3,3);x.fillRect(4,10,8,2);x.fillRect(3,9,2,1);x.fillRect(11,9,2,1)}
+    return c}
+  function setHat(s){
+    if(hat){pivot.remove(hat);hat=null}
+    if(!s)return;
+    const size=Math.max(3,s.scale*16),g=new T.Group();
+    if(s.img){
+      const tw=s.img.width,th=s.img.height,tex=pixTex(T,s.img),geo=new T.BoxGeometry(size,size,size);
+      setBoxUV(geo,0,0,8,8,8,tw,th);g.add(new T.Mesh(geo,mat(tex,false)));
+      const og=new T.BoxGeometry(size*1.06,size*1.06,size*1.06);setBoxUV(og,32,0,8,8,8,tw,th);g.add(new T.Mesh(og,mat(tex,true)))}
+    else{
+      const tex=pixTex(T,matCanvas(s.material||''));
+      g.add(new T.Mesh(new T.BoxGeometry(size,size,size),mat(tex,false)))}
+    g.position.set(0,32+size/2+s.y*16,0);hat=g;pivot.add(g)}
+  setSkin(defaultSkinCanvas(),false);
+  let seen=false;
+  function tick(){
+    if(box.isConnected)seen=true;else if(seen)return;
+    if(idle&&!drag)pivot.rotation.y+=0.006;
+    renderer.render(scene,cam);requestAnimationFrame(tick)}
+  tick();
+  return {setSkin,setHat,pivot,renderer,scene,cam}}
+function mkHatSection(me,sname,up,del){
+  const cs=el('div',{class:'card',style:'margin-top:16px'});
+  cs.append(el('h3',{},'🎩 Шапки и предпросмотр'),el('p',{},'Крутите модель мышью. Предпросмотр примерный — в игре шапка может выглядеть чуть иначе.'));
+  const vbox=el('div',{class:'hatview',style:'flex:none;width:260px;max-width:100%'});
+  const viewer=mkSkinViewer(vbox);
+  const msg=el('div',{class:'err'});
+  const list=el('div',{style:'margin-top:8px'});
+  const ctl=el('div',{style:'margin-top:12px'});
+  const side=el('div',{style:'flex:1;min-width:240px'});
+  side.append(ctl,list,msg);
+  cs.append(el('div',{class:'row',style:'align-items:flex-start'},vbox,side));
+  let data=null,adj={y:0,s:0},saveTimer=null,curImg=null;
+  async function refreshSkin(){
+    if(!viewer)return;
+    try{
+      const d=await api('/api/skin/mine?game_name='+encodeURIComponent(sname.value.trim()));
+      if(d.skin){
+        const img=new Image();
+        img.onload=()=>viewer.setSkin(img,d.skin.model==='slim');
+        img.src='/yggdrasil/textures/'+d.skin.hash
+      }else viewer.setSkin(defaultSkinCanvas(),false)
+    }catch(e){}}
+  function applyHat(){
+    if(!viewer||!data)return;
+    const it=data.items.find(i=>i.equipped);
+    if(!it){viewer.setHat(null);return}
+    const spec=img=>({img,material:it.material,scale:Math.min(Math.max(it.scale+adj.s,0.2),2),y:it.y_offset+adj.y});
+    if(it.has_texture){
+      if(curImg&&curImg.id===it.id&&curImg.img){viewer.setHat(spec(curImg.img));return}
+      const img=new Image();
+      img.onload=()=>{curImg={id:it.id,img};viewer.setHat(spec(img))};
+      img.onerror=()=>viewer.setHat(spec(null));
+      img.src='/api/cosmetics/texture/'+it.id
+    }else viewer.setHat(spec(null))}
+  function queueSave(){
+    applyHat();drawCtl();
+    clearTimeout(saveTimer);
+    saveTimer=setTimeout(async()=>{try{await api('/api/cosmetics/adjust',{body:{y_adj:adj.y,scale_adj:adj.s}})}catch(e){msg.className='err';msg.textContent=e.message}},450)}
+  function drawCtl(){
+    ctl.replaceChildren();
+    const it=data&&data.items.find(i=>i.equipped);
+    if(!it){ctl.append(el('p',{style:'color:var(--mut)'},'Наденьте купленную шапку, чтобы настроить её положение.'));return}
+    const step=(label,dec,inc,val)=>el('div',{style:'display:flex;align-items:center;gap:8px;margin:6px 0'},
+      el('span',{style:'width:70px'},label),
+      el('button',{class:'btn sm ghost',type:'button',onclick:dec},label==='Высота'?'▼':'◀'),
+      el('span',{style:'min-width:56px;text-align:center'},val),
+      el('button',{class:'btn sm ghost',type:'button',onclick:inc},label==='Высота'?'▲':'▶'));
+    const r=v=>Math.round(v*100)/100;
+    ctl.append(
+      step('Высота',()=>{adj.y=r(Math.max(adj.y-0.05,-0.6));queueSave()},()=>{adj.y=r(Math.min(adj.y+0.05,0.6));queueSave()},(adj.y>0?'+':'')+adj.y.toFixed(2)),
+      step('Размер',()=>{adj.s=r(Math.max(adj.s-0.05,-0.5));queueSave()},()=>{adj.s=r(Math.min(adj.s+0.05,0.8));queueSave()},(adj.s>0?'+':'')+adj.s.toFixed(2)),
+      el('button',{class:'btn sm ghost',type:'button',onclick:()=>{adj={y:0,s:0};queueSave()}},'Сбросить'))}
+  async function load(){
+    data=await api('/api/cosmetics');
+    adj={y:data.y_adj||0,s:data.scale_adj||0};
+    list.replaceChildren();
+    if(!data.items.length)list.append(el('p',{style:'color:var(--mut)'},'Сейчас в магазине нет шапок.'));
+    for(const it of data.items){
+      const acts=el('div',{style:'display:flex;gap:6px'});
+      if(!it.owned){
+        const b=el('button',{class:'btn sm',type:'button'},'Купить');
+        b.onclick=async()=>{
+          if(!confirm('Купить «'+it.title+'» за '+it.price+' монет?'))return;
+          b.disabled=true;msg.className='err';msg.textContent='';
+          try{const r=await api('/api/cosmetics/buy',{body:{id:it.id}});
+            msg.className='err okmsg';msg.textContent='Куплено! Осталось монет: '+Math.floor(r.total_coins);await load()}
+          catch(e){msg.textContent=e.message}finally{b.disabled=false}};
+        acts.append(b)
+      }else{
+        const b=el('button',{class:'btn sm'+(it.equipped?' ghost':''),type:'button'},it.equipped?'Снять':'Надеть');
+        b.onclick=async()=>{
+          msg.className='err';msg.textContent='';
+          try{await api('/api/cosmetics/equip',{body:{id:it.equipped?null:it.id}});await load()}
+          catch(e){msg.textContent=e.message}};
+        acts.append(b)}
+      list.append(el('div',{class:'item'},el('div',{class:'t'},it.title,el('small',{},it.description||'')),el('div',{class:'price'},it.owned?'✔ куплено':it.price+' 🪙'),acts))}
+    applyHat();drawCtl()}
+  const upOrig=up.onclick,delOrig=del.onclick;
+  up.onclick=async()=>{await upOrig();refreshSkin()};
+  del.onclick=async()=>{await delOrig();refreshSkin()};
+  sname.addEventListener('change',refreshSkin);
+  refreshSkin();
+  load().catch(e=>{msg.textContent=e.message});
+  return cs}
+async function mkTgSection(){
+  const tg=el('div',{class:'card',style:'margin-top:16px'});
+  tg.append(el('h3',{},'✈️ Telegram'),el('p',{},'Привяжите аккаунт, чтобы получать уведомления, когда друзья заходят в сеть, и новости.'));
+  const list=el('div',{});
+  const msg=el('div',{class:'err'});
+  tg.append(list,msg);
+  let timer=null;
+  async function load(){
+    let d;
+    try{d=await api('/api/tg/status')}catch(e){msg.textContent=e.message;return}
+    list.replaceChildren();
+    let any=false;
+    for(const [bot,v] of Object.entries(d)){
+      if(!v.enabled)continue;
+      any=true;
+      const acts=el('div',{style:'display:flex;gap:6px;align-items:center'});
+      if(v.linked){
+        const b=el('button',{class:'btn sm red',type:'button'},'Отвязать');
+        b.onclick=async()=>{if(!confirm('Отвязать Telegram ('+v.title+')?'))return;
+          try{await api('/api/tg/unlink',{body:{bot}});await load()}catch(e){msg.textContent=e.message}};
+        acts.append(b)
+      }else{
+        const b=el('button',{class:'btn sm',type:'button'},'Привязать');
+        b.onclick=async()=>{
+          msg.className='err';msg.textContent='';b.disabled=true;
+          try{
+            const r=await api('/api/tg/link',{body:{bot}});
+            acts.replaceChildren(el('a',{class:'btn sm',href:r.url,target:'_blank',rel:'noopener'},'Открыть Telegram'));
+            let n=0;clearInterval(timer);
+            timer=setInterval(async()=>{n++;if(!list.isConnected||n>100){clearInterval(timer);return}
+              try{const s=await api('/api/tg/status');if(s[bot]&&s[bot].linked){clearInterval(timer);await load()}}catch(e){}},6000)
+          }catch(e){msg.textContent=e.message;b.disabled=false}};
+        acts.append(b)}
+      list.append(el('div',{class:'item'},el('div',{class:'t'},v.title,el('small',{},v.linked?'Привязан':'Не привязан')),el('div',{}),acts))}
+    if(!any)list.append(el('p',{style:'color:var(--mut)'},'Telegram-боты на сервере не настроены.'))}
+  await load();
+  return tg}
 async function cabinetView(){
   const me=await api('/api/me');
   const root=el('div',{});
@@ -5156,7 +5390,6 @@ async function cabinetView(){
   const st=(v,l)=>el('div',{},el('b',{},String(v)),el('span',{},l));
   stats.append(st(Math.floor(me.coins||0),'монет'),st(fmtTime(me.total_playtime_minutes),'в игре'),st(me.total_launches||0,'запусков'),st((me.created_at||'').slice(0,10),'регистрация'));
   root.append(stats);
-  // магазин
   const shop=el('div',{class:'card',style:'margin-bottom:16px'});
   shop.append(el('h3',{},'👑 Привилегии'));
   const gname=el('input',{value:me.nickname.replace(/[^A-Za-z0-9_]/g,'').slice(0,16),maxlength:16});
@@ -5184,7 +5417,6 @@ async function cabinetView(){
       for(const p of d.purchases)tb.append(el('tr',{},el('td',{},p.item_title),el('td',{},p.game_name),el('td',{},String(p.price)),el('td',{},p.status)));
       list.append(el('h3',{style:'margin-top:22px'},'Мои покупки'),tb)}}
   await loadShop();
-  // скин
   const sk=el('div',{class:'card'});
   sk.append(el('h3',{},'🧑 Скин'),el('p',{},'PNG 64×64 или 64×32. Виден игрокам, которые играют через лаунчер.'));
   const sname=el('input',{value:gname.value,maxlength:16}),model=el('select',{},el('option',{value:'default'},'Классические руки (Steve)'),el('option',{value:'slim'},'Тонкие руки (Alex)'));
@@ -5203,6 +5435,9 @@ async function cabinetView(){
   del.onclick=async()=>{if(!confirm('Удалить скин для ника '+sname.value+'?'))return;try{await api('/api/skin/delete',{body:{game_name:sname.value.trim()}});smsg.className='err okmsg';smsg.textContent='Скин удалён'}catch(e){smsg.textContent=e.message}};
   sk.append(el('div',{class:'row'},el('div',{},el('label',{},'Игровой ник'),sname,el('label',{},'Руки'),model,el('label',{},'Файл'),file),el('div',{},prev)),up,del,smsg);
   root.append(sk);
+  const hv=mkHatSection(me,sname,up,del);
+  root.append(hv);
+  root.append(await mkTgSection());
   return root}
 async function render(){
   const box=$('#app');box.replaceChildren();
@@ -5215,14 +5450,11 @@ render();
 @app.route('/cabinet', methods=['GET'])
 def site_cabinet():
     body = '<div class="wrap"><div id="app"></div></div><script>' + CABINET_JS + '</script>'
-    resp = _site_page("Личный кабинет", body)
+    resp = _site_page("Личный кабинет", body, head_extra='<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>')
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
-# ===== Скины для любых серверов (Yggdrasil-совместимый API под authlib-injector) =====
-# Клиент с authlib-injector спрашивает скины игроков по UUID у этого сервера, поэтому скины видны
-# и на нашем сервере, и на любых пиратских (offline-mode) серверах у всех, кто играет через лаунчер.
 SKIN_MAX_BYTES = 256 * 1024
 SKIN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 SKIN_KEY_PATH = os.environ.get("MAFIN_SKIN_KEY", os.path.join(BASE_DIR, "skin_signing_key.pem"))
@@ -5383,6 +5615,17 @@ def skin_delete():
     return jsonify({"success": True})
 
 
+@app.route('/api/skin/mine', methods=['GET'])
+@auth_required
+def skin_mine():
+    name = str(request.args.get('game_name', '')).strip().lower()
+    row = get_db().execute("SELECT hash, model FROM skins WHERE game_name_lower = ? AND owner = ?",
+                           (name, g.current_profile['nickname'])).fetchone()
+    if not row:
+        return jsonify({"success": True, "skin": None})
+    return jsonify({"success": True, "skin": {"hash": row["hash"], "model": row["model"]}})
+
+
 @app.route('/yggdrasil', methods=['GET'])
 @app.route('/yggdrasil/', methods=['GET'])
 def ygg_meta():
@@ -5456,7 +5699,6 @@ def ygg_texture(texture_hash):
     return resp
 
 
-# ===== Магазин привилегий за монеты (выдача групп через LuckPerms) =====
 SHOP_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 SHOP_GROUP_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,32}$")
 _shop_lock = threading.Lock()
@@ -5816,9 +6058,7 @@ load();setInterval(load,6000);
 """
 
 
-# ===== Сборка сервера, косметика (шапки) и недельный топ =====
 
-# ----- сборка для сервера: рекомендуемый набор модов, ресурспаков и конфигов для клиента -----
 MODPACK_DIR = os.path.join(BASE_DIR, "server_modpack")
 MODPACK_FILES_DIR = os.path.join(MODPACK_DIR, "files")
 MODPACK_MANIFEST_PATH = os.path.join(MODPACK_DIR, "manifest.json")
@@ -6144,7 +6384,6 @@ def admin_modpack_upload():
     return jsonify({"success": True, "message": f"{path} загружен ({size / 1048576:.1f} МБ)"})
 
 
-# ----- косметика: шапки за монеты, видны на сервере через плагин MafinCosmetics -----
 COSMETIC_SEED = (
     ("Тыква", "Классическая тыква на голове", "CARVED_PUMPKIN", 0.75, 0.0, 100),
     ("Торт", "Праздничный торт", "CAKE", 0.8, 0.0, 200),
@@ -6188,7 +6427,8 @@ def _cosmetic_server_lines():
         return []
     db = get_db()
     rows = db.execute(
-        "SELECT e.nickname, c.material, c.texture, c.scale, c.y_offset FROM cosmetic_equipped e "
+        "SELECT e.nickname, c.material, c.texture, c.scale + e.scale_adj AS scale, c.y_offset + e.y_adj AS y_offset "
+        "FROM cosmetic_equipped e "
         "JOIN cosmetics c ON c.id = e.cosmetic_id "
         "JOIN cosmetic_owned o ON o.nickname = e.nickname AND o.cosmetic_id = e.cosmetic_id").fetchall()
     by_nick = {r["nickname"]: r for r in rows}
@@ -6198,7 +6438,7 @@ def _cosmetic_server_lines():
         if not r or not SKIN_NAME_RE.fullmatch(game_lower):
             continue
         lines.append("hat|%s|%s|%s|%.3f|%.3f" % (game_lower, r["material"], r["texture"] or "-",
-                                                 r["scale"], r["y_offset"]))
+                                                 min(max(r["scale"], 0.2), 2.0), r["y_offset"]))
     return lines
 
 
@@ -6219,10 +6459,11 @@ def cosmetics_server():
 def cosmetics_list():
     db = get_db()
     me = g.current_profile['nickname']
-    items = db.execute("SELECT id, title, description, price, enabled FROM cosmetics ORDER BY sort_order, id").fetchall()
+    items = db.execute("SELECT id, title, description, price, enabled, material, texture, scale, y_offset "
+                       "FROM cosmetics ORDER BY sort_order, id").fetchall()
     owned = {r["cosmetic_id"] for r in db.execute(
         "SELECT cosmetic_id FROM cosmetic_owned WHERE nickname = ?", (me,)).fetchall()}
-    eq = db.execute("SELECT cosmetic_id FROM cosmetic_equipped WHERE nickname = ?", (me,)).fetchone()
+    eq = db.execute("SELECT cosmetic_id, y_adj, scale_adj FROM cosmetic_equipped WHERE nickname = ?", (me,)).fetchone()
     eq_id = eq["cosmetic_id"] if eq else None
     out = []
     for r in items:
@@ -6230,9 +6471,12 @@ def cosmetics_list():
         if not r["enabled"] and not has:
             continue
         out.append({"id": r["id"], "title": r["title"], "description": r["description"] or "",
-                    "price": r["price"], "owned": has, "equipped": has and r["id"] == eq_id})
+                    "price": r["price"], "owned": has, "equipped": has and r["id"] == eq_id,
+                    "material": r["material"], "has_texture": bool(r["texture"]),
+                    "scale": r["scale"], "y_offset": r["y_offset"]})
     return jsonify({"success": True, "coins": g.current_profile['coins'], "items": out,
-                    "equipped_id": eq_id if eq_id in owned else None})
+                    "equipped_id": eq_id if eq_id in owned else None,
+                    "y_adj": eq["y_adj"] if eq else 0, "scale_adj": eq["scale_adj"] if eq else 0})
 
 
 @app.route('/api/cosmetics/buy', methods=['POST'])
@@ -6244,25 +6488,9 @@ def cosmetics_buy():
     except (TypeError, ValueError):
         return jsonify({"error": "id обязателен"}), 400
     db = get_db()
-    me = g.current_profile['nickname']
-    item = db.execute("SELECT * FROM cosmetics WHERE id = ? AND enabled = 1", (cid,)).fetchone()
-    if not item:
-        return jsonify({"error": "Товар не найден или снят с продажи"}), 404
-    price = float(item['price'])
-    with _cosmetic_lock:
-        try:
-            db.execute("INSERT INTO cosmetic_owned (nickname, cosmetic_id, price_paid) VALUES (?, ?, ?)",
-                       (me, cid, price))
-        except sqlite3.IntegrityError:
-            db.rollback()
-            return jsonify({"error": "Это уже куплено"}), 409
-        cur = db.execute("UPDATE profiles SET coins = coins - ? WHERE id = ? AND coins >= ?",
-                         (price, g.current_profile['id'], price))
-        if cur.rowcount == 0:
-            db.rollback()
-            return jsonify({"error": "Недостаточно монет"}), 402
-        db.commit()
-    log_action("cosmetic_buy", me, f"{item['title']} (-{price:g} монет)")
+    code, res = _cosmetic_buy_core(db, g.current_profile['nickname'], cid)
+    if code != 200:
+        return jsonify({"error": res}), code
     coins = db.execute("SELECT coins FROM profiles WHERE id = ?", (g.current_profile['id'],)).fetchone()['coins']
     return jsonify({"success": True, "total_coins": coins})
 
@@ -6284,9 +6512,55 @@ def cosmetics_equip():
         return jsonify({"error": "id обязателен"}), 400
     if not db.execute("SELECT 1 FROM cosmetic_owned WHERE nickname = ? AND cosmetic_id = ?", (me, cid)).fetchone():
         return jsonify({"error": "Сначала купи эту шапку"}), 403
-    db.execute("INSERT OR REPLACE INTO cosmetic_equipped (nickname, cosmetic_id) VALUES (?, ?)", (me, cid))
+    db.execute("INSERT OR REPLACE INTO cosmetic_equipped (nickname, cosmetic_id, y_adj, scale_adj) VALUES (?, ?, 0, 0)",
+               (me, cid))
     db.commit()
-    return jsonify({"success": True, "equipped_id": cid})
+    return jsonify({"success": True, "equipped_id": cid, "y_adj": 0, "scale_adj": 0})
+
+
+@app.route('/api/cosmetics/adjust', methods=['POST'])
+@auth_required
+def cosmetics_adjust():
+    data = request.get_json(silent=True) or {}
+    try:
+        y_adj = float(data.get('y_adj', 0))
+        scale_adj = float(data.get('scale_adj', 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Некорректные значения"}), 400
+    y_adj = round(min(max(y_adj, -0.6), 0.6), 3)
+    scale_adj = round(min(max(scale_adj, -0.5), 0.8), 3)
+    db = get_db()
+    cur = db.execute("UPDATE cosmetic_equipped SET y_adj = ?, scale_adj = ? WHERE nickname = ?",
+                     (y_adj, scale_adj, g.current_profile['nickname']))
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Сначала наденьте шапку"}), 409
+    return jsonify({"success": True, "y_adj": y_adj, "scale_adj": scale_adj})
+
+
+_cosmetic_tex_cache = {}
+
+
+@app.route('/api/cosmetics/texture/<int:cid>', methods=['GET'])
+def cosmetics_texture(cid):
+    png = _cosmetic_tex_cache.get(cid)
+    if png is None:
+        row = get_db().execute("SELECT texture FROM cosmetics WHERE id = ?", (cid,)).fetchone()
+        url = row["texture"] if row else ""
+        if not url or not _COSMETIC_TEX_URL_RE.match(url):
+            return "", 404
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "MafinLauncher"}),
+                                        timeout=8) as r:
+                png = r.read(300 * 1024)
+        except Exception:
+            return "", 404
+        if png[:8] != b"\x89PNG\r\n\x1a\n":
+            return "", 404
+        _cosmetic_tex_cache[cid] = png
+    resp = app.response_class(png, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
 
 
 @app.route('/admin/cosmetics', methods=['GET'])
@@ -6391,7 +6665,6 @@ def admin_cosmetics_action(action):
     return fail("Неизвестное действие", 404)
 
 
-# ----- недельный топ по времени в игре -----
 def _parse_weekly_rewards():
     raw = os.environ.get("MAFIN_WEEKLY_REWARDS", "500,300,150")
     out = []
@@ -6440,7 +6713,6 @@ def _weekly_settle(now=None):
         try:
             last = db.execute("SELECT MAX(week_start) AS w FROM weekly_awards").fetchone()["w"]
             if last is None:
-                # первый запуск: прошлые недели не оплачиваем, считаем отсчёт с ближайшей
                 db.execute("INSERT OR IGNORE INTO weekly_awards (week_start, rank, nickname, minutes, coins) "
                            "VALUES (?, 0, '', 0, 0)", (prev_start.date().isoformat(),))
                 db.commit()
@@ -6721,6 +6993,498 @@ load();
 
 
 
+TG_PROD_TOKEN_CODE = ""
+TG_TEST_TOKEN_CODE = ""
+TG_PROD_NEWS_CHAT_CODE = ""
+TG_TEST_NEWS_CHAT_CODE = ""
+
+TG_BOTS = {
+    "prod": {"token": os.environ.get("TG_PROD_TOKEN", TG_PROD_TOKEN_CODE).strip(),
+             "news_chat": os.environ.get("TG_PROD_NEWS_CHAT", TG_PROD_NEWS_CHAT_CODE).strip(),
+             "title": "Mafin (прод)", "username": ""},
+    "test": {"token": os.environ.get("TG_TEST_TOKEN", TG_TEST_TOKEN_CODE).strip(),
+             "news_chat": os.environ.get("TG_TEST_NEWS_CHAT", TG_TEST_NEWS_CHAT_CODE).strip(),
+             "title": "Mafin (тест dc2)", "username": ""},
+}
+TG_CODE_TTL_SECONDS = 600
+
+def _tg_enabled(bot):
+    return bot in TG_BOTS and bool(TG_BOTS[bot]["token"])
+
+def _tg_call(bot, method, payload=None, timeout=35):
+    cfg = TG_BOTS[bot]
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{cfg['token']}/{method}",
+        data=json.dumps(payload or {}).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _tg_send(bot, chat_id, text, markup=None):
+    if not _tg_enabled(bot):
+        return False
+    prefix = "[TEST dc2] " if bot == "test" else ""
+    payload = {"chat_id": chat_id, "text": (prefix + text)[:4000], "disable_web_page_preview": True}
+    if markup:
+        payload["reply_markup"] = markup
+    for attempt in range(2):
+        try:
+            _tg_call(bot, "sendMessage", payload, timeout=10)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and isinstance(chat_id, int):
+                try:
+                    db = _tg_db()
+                    db.execute("DELETE FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id))
+                    db.commit()
+                    db.close()
+                except Exception:
+                    pass
+                return False
+            if e.code == 429 and attempt == 0:
+                try:
+                    wait = int(json.loads(e.read().decode("utf-8")).get("parameters", {}).get("retry_after", 2))
+                except Exception:
+                    wait = 2
+                time.sleep(min(max(wait, 1), 10))
+                continue
+            print(f"[tg:{bot}] send error: {e}")
+            return False
+        except Exception as e:
+            print(f"[tg:{bot}] send error: {e}")
+            return False
+    return False
+
+def _tg_edit(bot, chat_id, message_id, text, markup=None):
+    prefix = "[TEST dc2] " if bot == "test" else ""
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": (prefix + text)[:4000],
+               "disable_web_page_preview": True}
+    if markup:
+        payload["reply_markup"] = markup
+    try:
+        _tg_call(bot, "editMessageText", payload, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            print(f"[tg:{bot}] edit error: {e}")
+    except Exception as e:
+        print(f"[tg:{bot}] edit error: {e}")
+
+def _tg_answer(bot, cq_id, text=""):
+    try:
+        _tg_call(bot, "answerCallbackQuery", {"callback_query_id": cq_id, "text": text[:190]}, timeout=10)
+    except Exception:
+        pass
+
+def _tg_db():
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
+    return db
+
+def _tg_init_tables():
+    db = _tg_db()
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS tg_links (
+            bot TEXT NOT NULL, nickname TEXT NOT NULL, chat_id INTEGER NOT NULL,
+            notify_friends INTEGER NOT NULL DEFAULT 1, notify_news INTEGER NOT NULL DEFAULT 1,
+            linked_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (bot, nickname));
+        CREATE INDEX IF NOT EXISTS idx_tg_links_chat ON tg_links(bot, chat_id);
+        CREATE TABLE IF NOT EXISTS tg_link_codes (
+            code TEXT PRIMARY KEY, bot TEXT NOT NULL, nickname TEXT NOT NULL, expires REAL NOT NULL);
+    """)
+    db.commit(); db.close()
+
+_tg_notify_last = {}
+
+def _tg_notify_friends_online(nickname):
+    """Сообщает друзьям (привязавшим Telegram), что игрок появился в сети."""
+    now = time.time()
+    if now - _tg_notify_last.get(nickname, 0) < 600:
+        return
+    _tg_notify_last[nickname] = now
+
+    def work():
+        try:
+            db = _tg_db()
+            me = db.execute("SELECT is_banned FROM profiles WHERE nickname = ?", (nickname,)).fetchone()
+            if not me or me["is_banned"]:
+                db.close()
+                return
+            rows = db.execute(
+                "SELECT t.bot, t.chat_id FROM tg_links t JOIN friendships f ON f.status='accepted' AND "
+                "((f.requester = ? AND f.addressee = t.nickname) OR (f.addressee = ? AND f.requester = t.nickname)) "
+                "WHERE t.notify_friends = 1", (nickname, nickname)).fetchall()
+            db.close()
+            for r in rows:
+                _tg_send(r["bot"], r["chat_id"], f"🟢 {nickname} сейчас в сети")
+                time.sleep(0.05)
+        except Exception as e:
+            print(f"[tg] friends notify error: {e}")
+    if any(_tg_enabled(b) for b in TG_BOTS):
+        threading.Thread(target=work, daemon=True).start()
+
+def _tg_broadcast_news(title, body):
+    def work():
+        try:
+            db = _tg_db()
+            rows = db.execute("SELECT bot, chat_id FROM tg_links WHERE notify_news = 1").fetchall()
+            db.close()
+            text = f"📰 {title}\n\n{body[:3500]}"
+            for r in rows:
+                _tg_send(r["bot"], r["chat_id"], text)
+                time.sleep(0.05)
+            for bot, cfg in TG_BOTS.items():
+                if cfg["news_chat"]:
+                    _tg_send(bot, cfg["news_chat"], text)
+        except Exception as e:
+            print(f"[tg] news broadcast error: {e}")
+    if any(_tg_enabled(b) for b in TG_BOTS):
+        threading.Thread(target=work, daemon=True).start()
+
+def _tg_kb(rows):
+    return {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]}
+
+def _tg_menu_markup():
+    return _tg_kb([[("👥 Друзья", "m:friends"), ("👤 Профиль", "m:me")],
+                   [("🎩 Шапки", "m:hats"), ("⚙️ Настроить шапку", "m:hat")],
+                   [("🔔 Уведомления", "m:settings")]])
+
+_TG_HELP = ("Что умею:\n"
+            "/friends — кто из друзей в сети\n/me — профиль и монеты\n"
+            "/hats — купить и надеть шапку\n/hat — настроить шапку стрелками\n"
+            "/settings — уведомления\n/news on|off, /notify on|off — быстрые переключатели\n"
+            "/unlink — отвязать аккаунт")
+
+def _tg_fmt_signed(v):
+    return f"{v:+.2f}"
+
+def _tg_view_friends(db, nick):
+    rows = db.execute(
+        "SELECT p.nickname, p.last_seen FROM friendships f JOIN profiles p ON p.nickname = "
+        "CASE WHEN f.requester = ? THEN f.addressee ELSE f.requester END "
+        "WHERE f.status = 'accepted' AND (f.requester = ? OR f.addressee = ?)", (nick, nick, nick)).fetchall()
+    if not rows:
+        return "У вас пока нет друзей.", _tg_menu_markup()
+    rows = sorted(rows, key=lambda r: (not is_online(r["last_seen"]), r["nickname"].lower()))
+    return "\n".join(f"{'🟢' if is_online(r['last_seen']) else '⚪'} {r['nickname']}" for r in rows), _tg_menu_markup()
+
+def _tg_view_me(db, nick):
+    p = db.execute("SELECT coins, total_playtime_minutes, total_launches, created_at FROM profiles "
+                   "WHERE nickname = ?", (nick,)).fetchone()
+    if not p:
+        return "Профиль не найден.", None
+    minutes = int(round(p["total_playtime_minutes"] or 0))
+    return (f"👤 {nick}\n🪙 Монет: {int(p['coins'] or 0)}\n⏱ В игре: {minutes // 60} ч {minutes % 60} мин\n"
+            f"🚀 Запусков: {p['total_launches'] or 0}\n📅 Регистрация: {(p['created_at'] or '')[:10]}"), _tg_menu_markup()
+
+def _tg_view_settings(db, chat_link):
+    f, n = bool(chat_link["notify_friends"]), bool(chat_link["notify_news"])
+    return ("🔔 Уведомления\nНажмите, чтобы переключить.",
+            _tg_kb([[(f"👥 Друзья в сети: {'вкл' if f else 'выкл'}", "nt:f")],
+                    [(f"📰 Новости: {'вкл' if n else 'выкл'}", "nt:n")],
+                    [("← Меню", "m:menu")]]))
+
+def _tg_view_hats(db, nick):
+    coins = db.execute("SELECT coins FROM profiles WHERE nickname = ?", (nick,)).fetchone()
+    items = db.execute("SELECT id, title, price, enabled FROM cosmetics ORDER BY sort_order, id").fetchall()
+    owned = {r["cosmetic_id"] for r in db.execute(
+        "SELECT cosmetic_id FROM cosmetic_owned WHERE nickname = ?", (nick,)).fetchall()}
+    eq = db.execute("SELECT cosmetic_id FROM cosmetic_equipped WHERE nickname = ?", (nick,)).fetchone()
+    eq_id = eq["cosmetic_id"] if eq and eq["cosmetic_id"] in owned else None
+    lines, rows = [f"🎩 Шапки\n🪙 Монет: {int((coins['coins'] if coins else 0) or 0)}\n"], []
+    shown = 0
+    for it in items:
+        has = it["id"] in owned
+        if (not it["enabled"] and not has) or shown >= 20:
+            continue
+        shown += 1
+        if it["id"] == eq_id:
+            lines.append(f"✅ {it['title']} — надета")
+            rows.append([(f"Снять «{it['title']}»", "he:0")])
+        elif has:
+            lines.append(f"✔ {it['title']} — куплена")
+            rows.append([(f"🎩 Надеть «{it['title']}»", f"he:{it['id']}")])
+        else:
+            lines.append(f"• {it['title']} — {it['price']:g} 🪙")
+            rows.append([(f"🪙 Купить «{it['title']}» ({it['price']:g})", f"hb:{it['id']}")])
+    if not shown:
+        lines.append("Шапок пока нет в продаже.")
+    if eq_id:
+        rows.append([("⚙️ Настроить надетую шапку", "m:hat")])
+    rows.append([("← Меню", "m:menu")])
+    return "\n".join(lines), _tg_kb(rows)
+
+def _tg_view_hat_adjust(db, nick):
+    row = db.execute("SELECT e.cosmetic_id, e.y_adj, e.scale_adj, c.title FROM cosmetic_equipped e "
+                     "JOIN cosmetics c ON c.id = e.cosmetic_id "
+                     "JOIN cosmetic_owned o ON o.nickname = e.nickname AND o.cosmetic_id = e.cosmetic_id "
+                     "WHERE e.nickname = ?", (nick,)).fetchone()
+    if not row:
+        return "Шапка не надета. Откройте /hats, купите и наденьте её.", _tg_kb([[("🎩 Шапки", "m:hats")]])
+    return (f"🎩 {row['title']}\nВысота: {_tg_fmt_signed(row['y_adj'])}\nРазмер: {_tg_fmt_signed(row['scale_adj'])}\n\n"
+            "В игре шапка обновится через несколько секунд."), _tg_kb([
+        [("⬆️ Выше", "ha:y:+"), ("⬇️ Ниже", "ha:y:-")],
+        [("➕ Больше", "ha:s:+"), ("➖ Меньше", "ha:s:-")],
+        [("Сбросить", "ha:r"), ("← Меню", "m:menu")]])
+
+def _tg_view(db, link, name):
+    nick = link["nickname"]
+    if name == "friends":
+        return _tg_view_friends(db, nick)
+    if name == "me":
+        return _tg_view_me(db, nick)
+    if name == "hats":
+        return _tg_view_hats(db, nick)
+    if name == "hat":
+        return _tg_view_hat_adjust(db, nick)
+    if name == "settings":
+        return _tg_view_settings(db, link)
+    return "Главное меню", _tg_menu_markup()
+
+def _cosmetic_buy_core(db, nick, cid):
+    prof = db.execute("SELECT id, is_banned FROM profiles WHERE nickname = ?", (nick,)).fetchone()
+    if not prof or prof["is_banned"]:
+        return 403, "Профиль недоступен"
+    item = db.execute("SELECT * FROM cosmetics WHERE id = ? AND enabled = 1", (cid,)).fetchone()
+    if not item:
+        return 404, "Товар не найден или снят с продажи"
+    price = float(item["price"])
+    with _cosmetic_lock:
+        try:
+            db.execute("INSERT INTO cosmetic_owned (nickname, cosmetic_id, price_paid) VALUES (?, ?, ?)",
+                       (nick, cid, price))
+        except sqlite3.IntegrityError:
+            db.rollback()
+            return 409, "Это уже куплено"
+        cur = db.execute("UPDATE profiles SET coins = coins - ? WHERE id = ? AND coins >= ?",
+                         (price, prof["id"], price))
+        if cur.rowcount == 0:
+            db.rollback()
+            return 402, "Недостаточно монет"
+        db.commit()
+    log_action("cosmetic_buy", nick, f"{item['title']} (-{price:g} монет)")
+    return 200, item["title"]
+
+def _tg_handle_message(bot, msg):
+    chat_id = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text or (msg.get("chat") or {}).get("type") != "private":
+        return
+    cmd, _, arg = text.partition(" ")
+    cmd = cmd.split("@")[0].lower()
+    arg = arg.strip()
+    db = _tg_db()
+    try:
+        link = db.execute("SELECT * FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id)).fetchone()
+        if cmd == "/start" and arg:
+            row = db.execute("SELECT * FROM tg_link_codes WHERE code = ? AND bot = ?", (arg, bot)).fetchone()
+            if not row or row["expires"] < time.time():
+                _tg_send(bot, chat_id, "Код недействителен или истёк. Нажмите «Привязать» в лаунчере или кабинете ещё раз.")
+                return
+            db.execute("DELETE FROM tg_link_codes WHERE code = ?", (arg,))
+            db.execute("DELETE FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id))
+            db.execute("INSERT OR REPLACE INTO tg_links (bot, nickname, chat_id) VALUES (?, ?, ?)",
+                       (bot, row["nickname"], chat_id))
+            db.commit()
+            _tg_send(bot, chat_id, f"✅ Аккаунт {row['nickname']} привязан.\n\n{_TG_HELP}", _tg_menu_markup())
+        elif cmd == "/start" and not link:
+            _tg_send(bot, chat_id, "Привет! Чтобы привязать аккаунт, нажмите «Привязать Telegram» в лаунчере или личном кабинете.")
+        elif not link:
+            _tg_send(bot, chat_id, "Аккаунт не привязан. Нажмите «Привязать Telegram» в лаунчере или личном кабинете.")
+        elif cmd in ("/start", "/menu"):
+            _tg_send(bot, chat_id, "Главное меню", _tg_menu_markup())
+        elif cmd == "/help":
+            _tg_send(bot, chat_id, _TG_HELP, _tg_menu_markup())
+        elif cmd == "/unlink":
+            db.execute("DELETE FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id)); db.commit()
+            _tg_send(bot, chat_id, "Аккаунт отвязан.")
+        elif cmd in ("/news", "/notify"):
+            if arg.lower() not in ("on", "off"):
+                _tg_send(bot, chat_id, f"Использование: {cmd} on|off"); return
+            col = "notify_news" if cmd == "/news" else "notify_friends"
+            db.execute(f"UPDATE tg_links SET {col} = ? WHERE bot = ? AND chat_id = ?",
+                       (1 if arg.lower() == "on" else 0, bot, chat_id)); db.commit()
+            _tg_send(bot, chat_id, "Готово.")
+        elif cmd in ("/friends", "/status", "/me", "/hats", "/hat", "/settings"):
+            name = {"/status": "friends"}.get(cmd, cmd[1:])
+            text_, markup = _tg_view(db, link, name)
+            _tg_send(bot, chat_id, text_, markup)
+        else:
+            _tg_send(bot, chat_id, _TG_HELP, _tg_menu_markup())
+    finally:
+        db.close()
+
+def _tg_handle_callback(bot, cq):
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    message_id = msg.get("message_id")
+    data = str(cq.get("data") or "")
+    if not chat_id or not message_id:
+        _tg_answer(bot, cq.get("id"))
+        return
+    db = _tg_db()
+    try:
+        link = db.execute("SELECT * FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id)).fetchone()
+        if not link:
+            _tg_answer(bot, cq["id"], "Аккаунт не привязан")
+            return
+        nick = link["nickname"]
+        profile = db.execute("SELECT is_banned FROM profiles WHERE nickname = ?", (nick,)).fetchone()
+        if not profile or profile["is_banned"]:
+            _tg_answer(bot, cq["id"], "Профиль недоступен")
+            return
+        note, view = "", None
+        kind, _, rest = data.partition(":")
+        if kind == "m":
+            view = rest if rest in ("friends", "me", "hats", "hat", "settings", "menu") else "menu"
+        elif kind == "nt" and rest in ("f", "n"):
+            col = "notify_friends" if rest == "f" else "notify_news"
+            db.execute(f"UPDATE tg_links SET {col} = 1 - {col} WHERE bot = ? AND chat_id = ?", (bot, chat_id))
+            db.commit()
+            link = db.execute("SELECT * FROM tg_links WHERE bot = ? AND chat_id = ?", (bot, chat_id)).fetchone()
+            view = "settings"
+        elif kind == "hb" and rest.isdigit():
+            item = db.execute("SELECT title, price FROM cosmetics WHERE id = ? AND enabled = 1", (int(rest),)).fetchone()
+            if not item:
+                note, view = "Товар снят с продажи", "hats"
+            else:
+                _tg_answer(bot, cq["id"])
+                _tg_edit(bot, chat_id, message_id, f"Купить «{item['title']}» за {item['price']:g} монет?",
+                         _tg_kb([[("✅ Да, купить", f"hy:{rest}"), ("Отмена", "m:hats")]]))
+                return
+        elif kind == "hy" and rest.isdigit():
+            code, res = _cosmetic_buy_core(db, nick, int(rest))
+            if code == 200:
+                db.execute("INSERT OR REPLACE INTO cosmetic_equipped (nickname, cosmetic_id, y_adj, scale_adj) "
+                           "VALUES (?, ?, 0, 0)", (nick, int(rest)))
+                db.commit()
+                note = f"Куплено и надето: {res}"
+            else:
+                note = res
+            view = "hats"
+        elif kind == "he" and rest.isdigit():
+            cid = int(rest)
+            if cid == 0:
+                db.execute("DELETE FROM cosmetic_equipped WHERE nickname = ?", (nick,))
+                db.commit()
+                note = "Шапка снята"
+            elif not db.execute("SELECT 1 FROM cosmetic_owned WHERE nickname = ? AND cosmetic_id = ?", (nick, cid)).fetchone():
+                note = "Сначала купите эту шапку"
+            else:
+                db.execute("INSERT OR REPLACE INTO cosmetic_equipped (nickname, cosmetic_id, y_adj, scale_adj) "
+                           "VALUES (?, ?, 0, 0)", (nick, cid))
+                db.commit()
+                note = "Шапка надета"
+            view = "hats"
+        elif kind == "ha":
+            row = db.execute("SELECT y_adj, scale_adj FROM cosmetic_equipped WHERE nickname = ?", (nick,)).fetchone()
+            if not row:
+                note, view = "Сначала наденьте шапку", "hats"
+            else:
+                y, sc = row["y_adj"], row["scale_adj"]
+                parts = rest.split(":")
+                if parts[0] == "r":
+                    y = sc = 0.0
+                elif parts[0] in ("y", "s") and len(parts) == 2 and parts[1] in ("+", "-"):
+                    d = 0.05 if parts[1] == "+" else -0.05
+                    if parts[0] == "y":
+                        y = round(min(max(y + d, -0.6), 0.6), 3)
+                    else:
+                        sc = round(min(max(sc + d, -0.5), 0.8), 3)
+                db.execute("UPDATE cosmetic_equipped SET y_adj = ?, scale_adj = ? WHERE nickname = ?", (y, sc, nick))
+                db.commit()
+                view = "hat"
+        else:
+            view = "menu"
+        _tg_answer(bot, cq["id"], note)
+        if view:
+            text_, markup = _tg_view(db, link, view)
+            _tg_edit(bot, chat_id, message_id, (note + "\n\n" if note and view != "hat" else "") + text_, markup)
+    finally:
+        db.close()
+
+_TG_COMMANDS = [("menu", "Главное меню"), ("friends", "Друзья в сети"), ("me", "Профиль и монеты"),
+                ("hats", "Купить и надеть шапку"), ("hat", "Настроить шапку"), ("settings", "Уведомления"),
+                ("help", "Помощь"), ("unlink", "Отвязать аккаунт")]
+
+def _tg_poll_loop(bot):
+    offset = 0
+    while not TG_BOTS[bot]["username"]:
+        try:
+            TG_BOTS[bot]["username"] = (_tg_call(bot, "getMe", timeout=10).get("result") or {}).get("username", "")
+            _tg_call(bot, "setMyCommands", {"commands": [{"command": c, "description": d} for c, d in _TG_COMMANDS]},
+                     timeout=10)
+        except Exception as e:
+            print(f"[tg:{bot}] getMe error: {e}")
+            time.sleep(10)
+    while True:
+        try:
+            res = _tg_call(bot, "getUpdates", {"offset": offset, "timeout": 25,
+                                               "allowed_updates": ["message", "callback_query"]}, timeout=35)
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                try:
+                    if upd.get("message"):
+                        _tg_handle_message(bot, upd["message"])
+                    elif upd.get("callback_query"):
+                        _tg_handle_callback(bot, upd["callback_query"])
+                except Exception as e:
+                    print(f"[tg:{bot}] handler error: {e}")
+        except Exception as e:
+            print(f"[tg:{bot}] poll error: {e}")
+            time.sleep(5)
+
+def _tg_start():
+    _tg_init_tables()
+    for bot in TG_BOTS:
+        if _tg_enabled(bot):
+            threading.Thread(target=_tg_poll_loop, args=(bot,), daemon=True).start()
+            print(f"[tg:{bot}] бот запущен")
+
+@app.route('/api/tg/status', methods=['GET'])
+@auth_required
+def tg_status():
+    db = get_db()
+    nick = g.current_profile['nickname']
+    out = {}
+    for bot, cfg in TG_BOTS.items():
+        row = db.execute("SELECT notify_friends, notify_news FROM tg_links WHERE bot = ? AND nickname = ?",
+                         (bot, nick)).fetchone()
+        out[bot] = {"enabled": _tg_enabled(bot), "title": cfg["title"], "linked": bool(row),
+                    "notify_friends": bool(row and row["notify_friends"]),
+                    "notify_news": bool(row and row["notify_news"])}
+    return jsonify(out)
+
+@app.route('/api/tg/link', methods=['POST'])
+@auth_required
+def tg_link():
+    bot = str((request.get_json(silent=True) or {}).get("bot", "")).strip().lower()
+    if bot not in TG_BOTS:
+        return jsonify({"error": "Неизвестный бот"}), 400
+    if not _tg_enabled(bot):
+        return jsonify({"error": "Бот не настроен на сервере"}), 503
+    username = TG_BOTS[bot]["username"]
+    if not username:
+        return jsonify({"error": "Бот ещё запускается, попробуйте через пару секунд"}), 503
+    db = get_db()
+    nick = g.current_profile['nickname']
+    db.execute("DELETE FROM tg_link_codes WHERE nickname = ? AND bot = ? OR expires < ?", (nick, bot, time.time()))
+    code = secrets.token_urlsafe(12)
+    db.execute("INSERT INTO tg_link_codes (code, bot, nickname, expires) VALUES (?, ?, ?, ?)",
+               (code, bot, nick, time.time() + TG_CODE_TTL_SECONDS))
+    db.commit()
+    return jsonify({"success": True, "url": f"https://t.me/{username}?start={code}",
+                    "expires_in": TG_CODE_TTL_SECONDS})
+
+@app.route('/api/tg/unlink', methods=['POST'])
+@auth_required
+def tg_unlink():
+    bot = str((request.get_json(silent=True) or {}).get("bot", "")).strip().lower()
+    db = get_db()
+    db.execute("DELETE FROM tg_links WHERE bot = ? AND nickname = ?", (bot, g.current_profile['nickname']))
+    db.commit()
+    return jsonify({"success": True})
+
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == "set-password":
         _cli_set_password(sys.argv[2])
@@ -6729,6 +7493,8 @@ if __name__ == '__main__':
         _cli_admin_code(sys.argv[2], create="--create" in sys.argv[3:])
         sys.exit(0)
     init_db()
+    _tg_start()
+    _mc_sessions_load()
     _mc_guard_start()
     _shop_start()
     threading.Thread(target=_weekly_loop, daemon=True).start()
