@@ -349,6 +349,10 @@ def init_db():
         );
     """)
     
+    try:
+        db.execute("ALTER TABLE cosmetics ADD COLUMN model TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
     for _col in ("y_adj", "scale_adj"):
         try:
             db.execute(f"ALTER TABLE cosmetic_equipped ADD COLUMN {_col} REAL NOT NULL DEFAULT 0")
@@ -2521,6 +2525,9 @@ def _mc_status():
         "motd": _mc_get_motd(),
         "worlds": _mc_list_worlds(),
         "active_world": _mc_active_world(),
+        "backups": _mc_list_backups(),
+        "spawns": {w: _mc_read_spawn(w) for w in _mc_list_worlds()},
+        "job": dict(_mc_job),
     }
 
 
@@ -2931,6 +2938,237 @@ def _mc_world_delete(name):
     return f"Мир «{name}» удалён"
 
 
+_mc_job = {"running": False, "text": "", "ok": True}
+_mc_job_lock = threading.Lock()
+_MC_REGION_RE = re.compile(r"^r\.(-?\d+)\.(-?\d+)\.mca$")
+_MC_OVERSIZE_RE = re.compile(r"^c\.(-?\d+)\.(-?\d+)\.mcc$")
+_MC_BACKUP_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.zip$")
+
+
+def _mc_backups_dir():
+    return _mc_path("backups")
+
+
+def _mc_dir_size(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+def _mc_list_backups():
+    out = []
+    try:
+        for n in os.listdir(_mc_backups_dir()):
+            full = os.path.join(_mc_backups_dir(), n)
+            if _MC_BACKUP_RE.match(n) and os.path.isfile(full):
+                st = os.stat(full)
+                out.append({"file": n, "size": st.st_size, "time": int(st.st_mtime)})
+    except OSError:
+        pass
+    return sorted(out, key=lambda b: -b["time"])
+
+
+def _mc_zip_world(name):
+    src = _mc_path(name)
+    os.makedirs(_mc_backups_dir(), exist_ok=True)
+    size = _mc_dir_size(src)
+    if shutil.disk_usage(MC_DIR).free < size + 200 * 1024 * 1024:
+        raise ValueError("Недостаточно места на диске для бэкапа")
+    dest = os.path.join(_mc_backups_dir(), f"{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip")
+    tmp = dest + ".part"
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as z:
+            for root, _dirs, files in os.walk(src):
+                for f in files:
+                    if f == "session.lock":
+                        continue
+                    full = os.path.join(root, f)
+                    try:
+                        z.write(full, os.path.relpath(full, MC_DIR))
+                    except OSError:
+                        pass
+        os.replace(tmp, dest)
+    finally:
+        _mc_rm(tmp)
+    return dest
+
+
+def _mc_world_backup(name):
+    if name not in _mc_list_worlds():
+        raise ValueError("Такого мира нет")
+    running = bool(_mc_pid())
+    if running:
+        try:
+            _mc_send("save-off")
+            _mc_send("save-all flush")
+            time.sleep(6)
+        except OSError:
+            running = False
+    try:
+        dest = _mc_zip_world(name)
+    finally:
+        if running:
+            try:
+                _mc_send("save-on")
+            except OSError:
+                pass
+    return f"Бэкап готов: {os.path.basename(dest)} ({os.path.getsize(dest) // (1024 * 1024)} МБ)"
+
+
+def _mc_overworld_base(world_dir):
+    new_style = os.path.join(world_dir, "dimensions", "minecraft", "overworld")
+    return new_style if os.path.isdir(new_style) else world_dir
+
+
+def _nbt_parse(buf):
+    pos = [0]
+
+    def take(n):
+        chunk = buf[pos[0]:pos[0] + n]
+        if len(chunk) != n:
+            raise ValueError("NBT обрезан")
+        pos[0] += n
+        return chunk
+
+    def string():
+        return take(struct.unpack(">H", take(2))[0]).decode("utf-8", "replace")
+
+    def payload(t):
+        if t == 1:
+            return struct.unpack(">b", take(1))[0]
+        if t == 2:
+            return struct.unpack(">h", take(2))[0]
+        if t == 3:
+            return struct.unpack(">i", take(4))[0]
+        if t == 4:
+            return struct.unpack(">q", take(8))[0]
+        if t == 5:
+            return struct.unpack(">f", take(4))[0]
+        if t == 6:
+            return struct.unpack(">d", take(8))[0]
+        if t == 7:
+            return list(take(struct.unpack(">i", take(4))[0]))
+        if t == 8:
+            return string()
+        if t == 9:
+            et, n = struct.unpack(">bi", take(5))
+            return [payload(et) for _ in range(max(n, 0))]
+        if t == 10:
+            out = {}
+            while True:
+                tt = struct.unpack(">b", take(1))[0]
+                if tt == 0:
+                    return out
+                key = string()
+                out[key] = payload(tt)
+        if t == 11:
+            n = struct.unpack(">i", take(4))[0]
+            return list(struct.unpack(">%di" % n, take(4 * n)))
+        if t == 12:
+            n = struct.unpack(">i", take(4))[0]
+            return list(struct.unpack(">%dq" % n, take(8 * n)))
+        raise ValueError("Неизвестный тип NBT")
+
+    if struct.unpack(">b", take(1))[0] != 10:
+        raise ValueError("Это не NBT")
+    string()
+    return payload(10)
+
+
+def _mc_read_spawn(world):
+    """Точка мирового спавна из level.dat: (x, z) или None. Поддерживает старый и новый формат."""
+    import gzip
+    try:
+        with gzip.open(_mc_path(world, "level.dat"), "rb") as f:
+            data = _nbt_parse(f.read()).get("Data") or {}
+    except Exception:
+        return None
+    if "SpawnX" in data and "SpawnZ" in data:
+        return int(data["SpawnX"]), int(data["SpawnZ"])
+    spawn = data.get("spawn")
+    if isinstance(spawn, dict):
+        pos = spawn.get("pos")
+        if isinstance(pos, list) and len(pos) >= 3:
+            return int(pos[0]), int(pos[2])
+    return None
+
+
+def _mc_world_reset(name, cx, cz, radius, restart):
+    if name not in _mc_list_worlds():
+        raise ValueError("Такого мира нет")
+    if radius < 0 or radius > 5000:
+        raise ValueError("Радиус спавна: от 0 до 5000 блоков")
+    was_running = bool(_mc_pid())
+    if was_running:
+        _mc_stop()
+        if _mc_pid():
+            raise ValueError("Не удалось остановить сервер")
+    if cx is None or cz is None:
+        found = _mc_read_spawn(name)
+        cx, cz = found if found else (0, 0)
+    backup = _mc_zip_world(name)
+    base = _mc_overworld_base(_mc_path(name))
+    rx0, rx1 = int((cx - radius) // 512), int((cx + radius) // 512)
+    rz0, rz1 = int((cz - radius) // 512), int((cz + radius) // 512)
+
+    def keep_region(rx, rz):
+        return rx0 <= rx <= rx1 and rz0 <= rz <= rz1
+
+    removed = kept = 0
+    for sub in ("region", "poi", "entities"):
+        folder = os.path.join(base, sub)
+        if not os.path.isdir(folder):
+            continue
+        for fname in os.listdir(folder):
+            full = os.path.join(folder, fname)
+            if not os.path.isfile(full):
+                continue
+            m = _MC_REGION_RE.match(fname)
+            c = _MC_OVERSIZE_RE.match(fname)
+            keep = False
+            if sub != "entities":
+                if m:
+                    keep = keep_region(int(m.group(1)), int(m.group(2)))
+                elif c:
+                    keep = keep_region(int(c.group(1)) >> 5, int(c.group(2)) >> 5)
+            if keep:
+                kept += 1
+            else:
+                _mc_rm(full)
+                removed += 1
+    msg = (f"Мир «{name}» сброшен: удалено файлов {removed}, спавн сохранён ({kept} файлов). "
+           f"Незер и Энд, инвентари игроков и регионы плагинов не тронуты. Бэкап: {os.path.basename(backup)}")
+    if restart or was_running:
+        try:
+            _mc_start()
+            msg += ". Сервер запущен"
+        except RuntimeError as e:
+            msg += f". Сервер не запустился: {e}"
+    return msg
+
+
+def _mc_start_job(title, fn):
+    with _mc_job_lock:
+        if _mc_job["running"]:
+            raise ValueError("Уже выполняется другая операция: " + _mc_job["text"])
+        _mc_job.update(running=True, text=title + "…", ok=True)
+
+    def work():
+        try:
+            text, ok = fn(), True
+        except Exception as e:
+            text, ok = f"Ошибка: {e}", False
+        with _mc_job_lock:
+            _mc_job.update(running=False, text=text, ok=ok)
+    threading.Thread(target=work, daemon=True).start()
+    return title + ": запущено, ход виден в блоке «Миры»"
+
+
 def _mc_world_import(zip_path, wanted_name, fallback_name):
     """Ставит мир из zip-архива как отдельную папку (существующие миры не перезаписываются)."""
     stage = _mc_path(".world_stage")
@@ -3047,6 +3285,14 @@ def admin_minecraft_world_upload():
         _mc_rm(tmp)
     print(f"[mc] {g.web_admin['nickname']}: world upload -> {msg}")
     return jsonify({"success": True, "message": msg})
+
+
+@app.route('/admin/minecraft/backup/<fname>', methods=['GET'])
+@web_admin_required
+def admin_minecraft_backup_download(fname):
+    if not _MC_BACKUP_RE.match(fname) or not os.path.isfile(os.path.join(_mc_backups_dir(), fname)):
+        return "", 404
+    return send_from_directory(_mc_backups_dir(), fname, as_attachment=True)
 
 
 @app.route('/api/mc/status', methods=['GET'])
@@ -3292,6 +3538,25 @@ def admin_minecraft_action(action):
             msg = _mc_world_activate(str(data.get("name", "")))
         elif action == "world_delete":
             msg = _mc_world_delete(str(data.get("name", "")))
+        elif action == "world_backup":
+            wname = str(data.get("name", ""))
+            msg = _mc_start_job(f"Бэкап мира «{wname}»", lambda: _mc_world_backup(wname))
+        elif action == "world_reset":
+            wname = str(data.get("name", ""))
+            try:
+                cx = float(data["x"]) if str(data.get("x", "")).strip() != "" else None
+                cz = float(data["z"]) if str(data.get("z", "")).strip() != "" else None
+                rad = float(data.get("radius", 600))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "error": "Координаты и радиус должны быть числами"}), 400
+            restart = bool(data.get("restart"))
+            msg = _mc_start_job(f"Сброс мира «{wname}»", lambda: _mc_world_reset(wname, cx, cz, rad, restart))
+        elif action == "backup_delete":
+            fname = str(data.get("file", ""))
+            if not _MC_BACKUP_RE.match(fname) or not os.path.isfile(os.path.join(_mc_backups_dir(), fname)):
+                raise ValueError("Бэкап не найден")
+            os.remove(os.path.join(_mc_backups_dir(), fname))
+            msg = f"Бэкап {fname} удалён"
         elif action == "memory":
             msg = _mc_save_memory(data.get("amount"), data.get("unit"))
         elif action == "start":
@@ -3449,6 +3714,17 @@ code{background:#14161a;padding:1px 5px;border-radius:4px}
     <label>Имя папки <input type="text" id="w_name" style="width:160px;flex:none" maxlength="40" placeholder="необязательно"></label>
     <button onclick="uploadWorld()">⬆ Загрузить мир</button>
   </div>
+  <div id="jobbox" class="muted" style="margin:10px 0"></div>
+  <h2 style="margin-top:18px">Сброс мира с сохранением спавна</h2>
+  <div class="row">
+    <label>Центр X <input type="number" id="r_x" placeholder="авто" style="width:90px;flex:none"></label>
+    <label>Центр Z <input type="number" id="r_z" placeholder="авто" style="width:90px;flex:none"></label>
+    <label>Радиус, блоков <input type="number" id="r_rad" value="600" min="0" max="5000" style="width:90px;flex:none"></label>
+    <label style="flex:none"><input type="checkbox" id="r_restart"> запустить сервер после</label>
+  </div>
+  <p class="muted">Если X и Z пустые, центр берётся из точки спавна мира (level.dat; для мира показана рядом с названием). Если спавн задан плагином (EssentialsX, Multiverse), впишите его координаты вручную. Кнопка «♻ Сбросить» у мира: сервер остановится, сделается бэкап, затем удалятся все блоки и сущности (в том числе динамит) Обычного мира, кроме областей вокруг указанного центра. Сид сохраняется, поэтому земля сгенерируется такой же. Незер, Энд, инвентари игроков и регионы плагинов (WorldGuard) не затрагиваются.</p>
+  <h2 style="margin-top:18px">Бэкапы</h2>
+  <div id="backups" class="muted">—</div>
   <p class="muted">В архиве должна быть папка мира с файлом level.dat. Загруженный мир ставится отдельной папкой и ничего не перезаписывает. Чтобы играть в нём, сделай его активным (сервер при этом остановлен) и запусти сервер. Размер архива до 500 МБ.</p>
 </section>
 <section>
@@ -3546,9 +3822,17 @@ function renderWorlds(s){
   if(!list.length){box.innerHTML=html+'Миров пока нет. Папка мира появится после первого запуска сервера или загрузки архива.';return}
   html+=list.map(w=>{
     const isAct=(w===s.active_world);
-    return '<div class="item"><div><div class="t">'+esc(w)+(isAct?' <span class="ok">— активный</span>':'')+'</div></div><div>'+(isAct?'':'<button data-wact="'+esc2(w)+'"'+(busy?' disabled':'')+'>Сделать активным</button> <button class="danger" data-wdel="'+esc2(w)+'"'+(busy?' disabled':'')+'>Удалить</button>')+'</div></div>';
+    return '<div class="item"><div><div class="t">'+esc(w)+(isAct?' <span class="ok">— активный</span>':'')+'</div><div class="d">'+((s.spawns||{})[w]?'спавн мира: X '+s.spawns[w][0]+', Z '+s.spawns[w][1]:'спавн не определён (будет 0, 0)')+'</div></div><div><button data-wbak="'+esc2(w)+'">💾 Бэкап</button> <button class="danger" data-wreset="'+esc2(w)+'">♻ Сбросить</button> '+(isAct?'':'<button data-wact="'+esc2(w)+'"'+(busy?' disabled':'')+'>Сделать активным</button> <button class="danger" data-wdel="'+esc2(w)+'"'+(busy?' disabled':'')+'>Удалить</button>')+'</div></div>';
   }).join('');
   box.innerHTML=html;
+  const job=s.job||{};
+  const jb=document.getElementById('jobbox');
+  if(jb)jb.innerHTML=job.text?('<span class="'+(job.running?'':(job.ok?'ok':'bad'))+'">'+(job.running?'⏳ ':'')+esc(job.text)+'</span>'):'';
+  const bk=document.getElementById('backups');
+  if(bk){
+    const bl=s.backups||[];
+    bk.innerHTML=bl.length?bl.map(b=>'<div class="item"><div><div class="t">'+esc(b.file)+'</div><div class="d">'+Math.round(b.size/1048576)+' МБ · '+new Date(b.time*1000).toLocaleString()+'</div></div><div><a href="/admin/minecraft/backup/'+encodeURIComponent(b.file)+'"><button>⬇ Скачать</button></a> <button class="danger" data-bdel="'+esc2(b.file)+'">Удалить</button></div></div>').join(''):'Бэкапов пока нет';
+  }
 }
 function renderExtra(s){
   if(!motdLoaded&&typeof s.motd==='string'){document.getElementById('motd').value=s.motd;motdLoaded=true}
@@ -3563,6 +3847,12 @@ function renderExtra(s){
 document.addEventListener('click',function(e){
   const c=e.target.closest('button[data-wact]');
   if(c&&confirm('Сделать мир «'+c.dataset.wact+'» активным? Он загрузится при запуске сервера.'))act('world_activate',{name:c.dataset.wact});
+  const bk=e.target.closest('button[data-wbak]');
+  if(bk)act('world_backup',{name:bk.dataset.wbak});
+  const rs=e.target.closest('button[data-wreset]');
+  if(rs&&confirm('Сбросить мир «'+rs.dataset.wreset+'»? Сервер будет остановлен, сделается бэкап, затем весь Обычный мир, кроме области спавна, будет удалён и сгенерируется заново.'))act('world_reset',{name:rs.dataset.wreset,x:val('r_x'),z:val('r_z'),radius:val('r_rad'),restart:document.getElementById('r_restart').checked});
+  const bd=e.target.closest('button[data-bdel]');
+  if(bd&&confirm('Удалить бэкап '+bd.dataset.bdel+'?'))act('backup_delete',{file:bd.dataset.bdel});
   const d=e.target.closest('button[data-wdel]');
   if(d&&confirm('Удалить мир «'+d.dataset.wdel+'» НАВСЕГДА? Это нельзя отменить.'))act('world_delete',{name:d.dataset.wdel});
 });
@@ -6419,6 +6709,241 @@ def _cosmetic_normalize_texture(raw):
     return f"http://textures.minecraft.net/texture/{m.group(1)}"
 
 
+COSMETIC_MODELS_DIR = os.path.join(BASE_DIR, "cosmetic_models")
+COSMETIC_PACK_PATH = os.path.join(BASE_DIR, "cosmetic_pack.zip")
+PUBLIC_BASE_FILE = os.path.join(BASE_DIR, ".public_base")
+MC_PACK_FORMAT = int(os.environ.get("MAFIN_PACK_FORMAT", "88"))
+_cos_pack = {"sha1": "", "size": 0, "count": 0}
+_cos_pack_lock = threading.Lock()
+_COS_SLUG_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+_COS_PARENTS_OK = {"block/block", "minecraft:block/block", "item/generated", "minecraft:item/generated",
+                   "item/handheld", "minecraft:item/handheld", "builtin/entity", "minecraft:builtin/entity"}
+COS_MODEL_ZIP_MAX = 8 * 1024 * 1024
+COS_MODEL_TEXTURE_MAX = 2 * 1024 * 1024
+
+
+def _cos_slugify(text):
+    slug = re.sub(r"[^a-z0-9_]+", "_", str(text or "").lower()).strip("_")[:32]
+    return slug or "model"
+
+
+def _cos_models_list():
+    out = []
+    try:
+        names = sorted(os.listdir(COSMETIC_MODELS_DIR))
+    except OSError:
+        return out
+    for n in names:
+        d = os.path.join(COSMETIC_MODELS_DIR, n)
+        if _COS_SLUG_RE.match(n) and os.path.isfile(os.path.join(d, "model.json")):
+            tex = [f for f in os.listdir(os.path.join(d, "textures"))] if os.path.isdir(os.path.join(d, "textures")) else []
+            out.append({"slug": n, "textures": len(tex), "size": _mc_dir_size(d)})
+    return out
+
+
+def _cos_public_base():
+    env = (os.environ.get("MAFIN_PUBLIC_URL") or "").strip().rstrip("/")
+    if env:
+        return env
+    try:
+        with open(PUBLIC_BASE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _cos_remember_public_base():
+    """Запоминает внешний адрес сервера. Вызывается только из запросов авторизованного админа."""
+    if os.environ.get("MAFIN_PUBLIC_URL"):
+        return
+    base = request.host_url.rstrip("/")
+    host = request.host.split(":")[0].lower()
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or not re.fullmatch(r"https?://[A-Za-z0-9.\-]+(:\d+)?", base):
+        return
+    if base != _cos_public_base():
+        try:
+            with open(PUBLIC_BASE_FILE, "w", encoding="utf-8") as f:
+                f.write(base)
+        except OSError:
+            pass
+
+
+def _cos_png_ok(data):
+    return len(data) <= COS_MODEL_TEXTURE_MAX and data[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def _cosmetic_model_import(zip_path, wanted_name):
+    """Принимает zip с моделью Java Block/Item (из Blockbench) или ресурспаком, сохраняет модель и текстуры."""
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile:
+        raise ValueError("Это не zip-архив")
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > 400 or sum(i.file_size for i in infos) > 40 * 1024 * 1024:
+            raise ValueError("В архиве слишком много или слишком большие файлы")
+        pngs, models = {}, []
+        for i in infos:
+            name = i.filename.replace("\\", "/")
+            low = name.lower()
+            if low.startswith("__macosx/") or "/." in "/" + low:
+                continue
+            base = low.rsplit("/", 1)[-1]
+            if low.endswith(".png"):
+                if i.file_size > COS_MODEL_TEXTURE_MAX:
+                    raise ValueError(f"Текстура {base} больше 2 МБ")
+                data = zf.read(i)
+                if _cos_png_ok(data):
+                    pngs[base[:-4]] = data
+            elif low.endswith(".json") and i.file_size <= 1024 * 1024 and base != "pack.mcmeta":
+                try:
+                    obj = json.loads(zf.read(i).decode("utf-8-sig"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(obj, dict) and isinstance(obj.get("elements"), list) and obj["elements"]:
+                    models.append((base[:-5], obj))
+    if not models:
+        raise ValueError("В архиве нет модели: нужен JSON Java Block/Item (в Blockbench: File → Export → Export Block/Item Model)")
+    if len(models) > 1:
+        referenced = set()
+        for _n, obj in models:
+            par = str(obj.get("parent", "")).split("/")[-1].split(":")[-1]
+            referenced.add(par)
+        free = [m for m in models if m[0] not in referenced] or models
+        models = [max(free, key=lambda m: len(m[1]["elements"]))]
+    mname, model = models[0]
+    if len(model["elements"]) > 400:
+        raise ValueError("В модели больше 400 элементов")
+    for el in model["elements"]:
+        if not (isinstance(el, dict) and isinstance(el.get("from"), list) and isinstance(el.get("to"), list)
+                and len(el["from"]) == 3 and len(el["to"]) == 3
+                and all(isinstance(v, (int, float)) for v in el["from"] + el["to"])):
+            raise ValueError("В модели некорректный элемент (from/to)")
+    slug = _cos_slugify(wanted_name or mname)
+    base_slug, n = slug, 2
+    while os.path.exists(os.path.join(COSMETIC_MODELS_DIR, slug)):
+        slug = f"{base_slug}_{n}"
+        n += 1
+    if model.get("parent") not in _COS_PARENTS_OK:
+        model.pop("parent", None)
+    tex_names, out_tex = {}, {}
+    textures = model.get("textures") if isinstance(model.get("textures"), dict) else {}
+    for key, ref in list(textures.items()):
+        if not isinstance(ref, str) or ref.startswith("#"):
+            continue
+        tname = ref.split(":")[-1].split("/")[-1].lower()
+        if tname not in pngs:
+            raise ValueError(f"В архиве нет текстуры «{tname}.png», на которую ссылается модель")
+        if tname not in tex_names:
+            clean = _cos_slugify(tname)
+            while clean in out_tex:
+                clean += "_x"
+            tex_names[tname] = clean
+            out_tex[clean] = pngs[tname]
+        textures[key] = f"mafin:item/hats/{slug}/{tex_names[tname]}"
+    if not out_tex:
+        raise ValueError("У модели нет ни одной текстуры")
+    model["textures"] = textures
+    model.pop("overrides", None)
+    target = os.path.join(COSMETIC_MODELS_DIR, slug)
+    os.makedirs(os.path.join(target, "textures"), exist_ok=True)
+    with open(os.path.join(target, "model.json"), "w", encoding="utf-8") as f:
+        json.dump(model, f, ensure_ascii=False)
+    for tname, data in out_tex.items():
+        with open(os.path.join(target, "textures", tname + ".png"), "wb") as f:
+            f.write(data)
+    return slug
+
+
+def _cosmetic_pack_build():
+    """Собирает ресурспак со всеми загруженными моделями. Одинаковый набор даёт одинаковый sha1."""
+    with _cos_pack_lock:
+        slugs = [m["slug"] for m in _cos_models_list()]
+        if not slugs:
+            _mc_rm(COSMETIC_PACK_PATH)
+            _cos_pack.update(sha1="", size=0, count=0)
+            return
+        tmp = COSMETIC_PACK_PATH + ".part"
+
+        def add(z, name, data):
+            zi = zipfile.ZipInfo(name, date_time=(2024, 1, 1, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(zi, data)
+        with zipfile.ZipFile(tmp, "w") as z:
+            add(z, "pack.mcmeta", json.dumps({"pack": {
+                "pack_format": MC_PACK_FORMAT, "min_format": MC_PACK_FORMAT, "max_format": 999,
+                "description": "Mafin: шапки"}}))
+            for slug in slugs:
+                d = os.path.join(COSMETIC_MODELS_DIR, slug)
+                with open(os.path.join(d, "model.json"), "rb") as f:
+                    add(z, f"assets/mafin/models/item/hats/{slug}.json", f.read())
+                add(z, f"assets/mafin/items/hat_{slug}.json", json.dumps(
+                    {"model": {"type": "minecraft:model", "model": f"mafin:item/hats/{slug}"}}))
+                for tname in sorted(os.listdir(os.path.join(d, "textures"))):
+                    with open(os.path.join(d, "textures", tname), "rb") as f:
+                        add(z, f"assets/mafin/textures/item/hats/{slug}/{tname}", f.read())
+        os.replace(tmp, COSMETIC_PACK_PATH)
+        h = hashlib.sha1()
+        with open(COSMETIC_PACK_PATH, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        _cos_pack.update(sha1=h.hexdigest(), size=os.path.getsize(COSMETIC_PACK_PATH), count=len(slugs))
+
+
+@app.route('/api/cosmetics/pack.zip', methods=['GET'])
+def cosmetics_pack_download():
+    if not os.path.isfile(COSMETIC_PACK_PATH):
+        return "", 404
+    resp = send_from_directory(BASE_DIR, os.path.basename(COSMETIC_PACK_PATH), as_attachment=True,
+                               download_name="mafin-hats.zip")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@app.route('/api/cosmetics/model/<slug>.json', methods=['GET'])
+def cosmetics_model_json(slug):
+    path = os.path.join(COSMETIC_MODELS_DIR, slug, "model.json")
+    if not _COS_SLUG_RE.match(slug) or not os.path.isfile(path):
+        return "", 404
+    with open(path, "r", encoding="utf-8") as f:
+        resp = app.response_class(f.read(), mimetype="application/json")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@app.route('/api/cosmetics/model/<slug>/<tex>.png', methods=['GET'])
+def cosmetics_model_texture(slug, tex):
+    path = os.path.join(COSMETIC_MODELS_DIR, slug, "textures", tex + ".png")
+    if not _COS_SLUG_RE.match(slug) or not _COS_SLUG_RE.match(tex) or not os.path.isfile(path):
+        return "", 404
+    resp = send_from_directory(os.path.join(COSMETIC_MODELS_DIR, slug, "textures"), tex + ".png")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@app.route('/admin/cosmetics/model_upload', methods=['POST'])
+@web_admin_required
+def admin_cosmetics_model_upload():
+    _cos_remember_public_base()
+    f = request.files.get('file')
+    if not f or not f.filename or not f.filename.lower().endswith('.zip'):
+        return jsonify({"success": False, "error": "Выбери архив .zip с моделью"}), 400
+    os.makedirs(COSMETIC_MODELS_DIR, exist_ok=True)
+    tmp = os.path.join(COSMETIC_MODELS_DIR, "upload.part")
+    f.save(tmp)
+    try:
+        if os.path.getsize(tmp) > COS_MODEL_ZIP_MAX:
+            return jsonify({"success": False, "error": "Архив больше 8 МБ"}), 400
+        slug = _cosmetic_model_import(tmp, request.form.get('name', '') or os.path.splitext(f.filename)[0])
+        _cosmetic_pack_build()
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    finally:
+        _mc_rm(tmp)
+    log_action("cosmetic_model_upload", g.web_admin['nickname'], slug)
+    return jsonify({"success": True, "message": f"Модель «{slug}» загружена, ресурспак пересобран. Выберите её в форме шапки"})
+
+
 def _cosmetic_server_lines():
     """Строки для плагина: ник|материал|текстура|масштаб|сдвиг. Только игроки, которые сейчас в сессии."""
     with _mc_sessions_lock:
@@ -6427,7 +6952,7 @@ def _cosmetic_server_lines():
         return []
     db = get_db()
     rows = db.execute(
-        "SELECT e.nickname, c.material, c.texture, c.scale + e.scale_adj AS scale, c.y_offset + e.y_adj AS y_offset "
+        "SELECT e.nickname, c.material, c.texture, c.model, c.scale + e.scale_adj AS scale, c.y_offset + e.y_adj AS y_offset "
         "FROM cosmetic_equipped e "
         "JOIN cosmetics c ON c.id = e.cosmetic_id "
         "JOIN cosmetic_owned o ON o.nickname = e.nickname AND o.cosmetic_id = e.cosmetic_id").fetchall()
@@ -6437,8 +6962,8 @@ def _cosmetic_server_lines():
         r = by_nick.get(sess["nick"])
         if not r or not SKIN_NAME_RE.fullmatch(game_lower):
             continue
-        lines.append("hat|%s|%s|%s|%.3f|%.3f" % (game_lower, r["material"], r["texture"] or "-",
-                                                 min(max(r["scale"], 0.2), 2.0), r["y_offset"]))
+        lines.append("hat|%s|%s|%s|%.3f|%.3f|%s" % (game_lower, r["material"], r["texture"] or "-",
+                                                    min(max(r["scale"], 0.2), 2.0), r["y_offset"], r["model"] or "-"))
     return lines
 
 
@@ -6451,6 +6976,9 @@ def cosmetics_server():
     if not secrets.compare_digest(given.encode('utf-8'), MC_SECRET.encode('utf-8')):
         return jsonify({"error": "forbidden"}), 403
     lines = _cosmetic_server_lines()
+    base = _cos_public_base()
+    if _cos_pack["sha1"] and base:
+        lines.append("pack|%s/api/cosmetics/pack.zip?v=%s|%s" % (base, _cos_pack["sha1"][:12], _cos_pack["sha1"]))
     return app.response_class("v1\n" + "".join(l + "\n" for l in lines), mimetype="text/plain")
 
 
@@ -6459,7 +6987,7 @@ def cosmetics_server():
 def cosmetics_list():
     db = get_db()
     me = g.current_profile['nickname']
-    items = db.execute("SELECT id, title, description, price, enabled, material, texture, scale, y_offset "
+    items = db.execute("SELECT id, title, description, price, enabled, material, texture, scale, y_offset, model "
                        "FROM cosmetics ORDER BY sort_order, id").fetchall()
     owned = {r["cosmetic_id"] for r in db.execute(
         "SELECT cosmetic_id FROM cosmetic_owned WHERE nickname = ?", (me,)).fetchall()}
@@ -6472,7 +7000,7 @@ def cosmetics_list():
             continue
         out.append({"id": r["id"], "title": r["title"], "description": r["description"] or "",
                     "price": r["price"], "owned": has, "equipped": has and r["id"] == eq_id,
-                    "material": r["material"], "has_texture": bool(r["texture"]),
+                    "material": r["material"], "has_texture": bool(r["texture"]), "model": r["model"] or "",
                     "scale": r["scale"], "y_offset": r["y_offset"]})
     return jsonify({"success": True, "coins": g.current_profile['coins'], "items": out,
                     "equipped_id": eq_id if eq_id in owned else None,
@@ -6577,7 +7105,12 @@ def admin_cosmetics_data():
         "SELECT c.*, (SELECT COUNT(*) FROM cosmetic_owned o WHERE o.cosmetic_id = c.id) AS owners "
         "FROM cosmetics c ORDER BY c.sort_order, c.id").fetchall()
     plugin = any(p["name"].lower() == "mafincosmetics" for p in _mc_list_plugins())
-    return jsonify({"items": [dict(r) for r in items], "plugin": plugin, "server_running": bool(_mc_pid())})
+    _cos_remember_public_base()
+    return jsonify({"items": [dict(r) for r in items], "plugin": plugin, "server_running": bool(_mc_pid()),
+                    "models": [dict(m, used=db.execute("SELECT COUNT(*) FROM cosmetics WHERE model = ?",
+                                                       (m["slug"],)).fetchone()[0]) for m in _cos_models_list()],
+                    "pack": {"ready": bool(_cos_pack["sha1"]), "sha1": _cos_pack["sha1"], "size": _cos_pack["size"],
+                             "public_base": _cos_public_base()}})
 
 
 @app.route('/admin/cosmetics/<action>', methods=['POST'])
@@ -6596,6 +7129,12 @@ def admin_cosmetics_action(action):
         title = re.sub(r"[\x00-\x1f\x7f]", "", str(data.get("title", ""))).strip()
         desc = re.sub(r"[\x00-\x1f\x7f]", " ", str(data.get("description", ""))).strip()
         material = str(data.get("material", "")).strip().upper()
+        model = str(data.get("model", "")).strip()
+        if model:
+            if not _COS_SLUG_RE.match(model) or not os.path.isfile(os.path.join(COSMETIC_MODELS_DIR, model, "model.json")):
+                return fail("3D-модель не найдена: загрузите её в блоке «3D-модели»")
+            material = "PAPER"
+            data["texture"] = ""
         try:
             price = float(data.get("price"))
             scale = float(data.get("scale", 0.7))
@@ -6625,17 +7164,29 @@ def admin_cosmetics_action(action):
         if item_id:
             cur = db.execute(
                 "UPDATE cosmetics SET title=?, description=?, material=?, texture=?, scale=?, y_offset=?, "
-                "price=?, enabled=?, sort_order=? WHERE id=?",
-                (title, desc, material, texture, scale, y_off, price, enabled, order, int(item_id)))
+                "price=?, enabled=?, sort_order=?, model=? WHERE id=?",
+                (title, desc, material, texture, scale, y_off, price, enabled, order, model, int(item_id)))
             if cur.rowcount == 0:
                 return fail("Товар не найден", 404)
         else:
             db.execute(
-                "INSERT INTO cosmetics (title, description, material, texture, scale, y_offset, price, enabled, sort_order) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", (title, desc, material, texture, scale, y_off, price, enabled, order))
+                "INSERT INTO cosmetics (title, description, material, texture, scale, y_offset, price, enabled, sort_order, model) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)", (title, desc, material, texture, scale, y_off, price, enabled, order, model))
         db.commit()
         log_action("cosmetic_save", admin, title)
         return jsonify({"success": True, "message": "Сохранено"})
+
+    if action == "model_delete":
+        slug = str(data.get("slug", "")).strip()
+        if not _COS_SLUG_RE.match(slug) or not os.path.isdir(os.path.join(COSMETIC_MODELS_DIR, slug)):
+            return fail("Модель не найдена", 404)
+        used = db.execute("SELECT COUNT(*) AS n FROM cosmetics WHERE model = ?", (slug,)).fetchone()["n"]
+        if used:
+            return fail(f"Модель используется шапками ({used}). Сначала смените или удалите их")
+        shutil.rmtree(os.path.join(COSMETIC_MODELS_DIR, slug), ignore_errors=True)
+        _cosmetic_pack_build()
+        log_action("cosmetic_model_delete", admin, slug)
+        return jsonify({"success": True, "message": f"Модель «{slug}» удалена, ресурспак пересобран"})
 
     if action == "item_delete":
         try:
@@ -6832,10 +7383,22 @@ COSMETICS_ADMIN_TEMPLATE = """<!doctype html>
   <div id="msg"></div>
 </section>
 <section>
+  <h2>🧊 3D-модели</h2>
+  <p class="muted">Загрузите готовую модель в формате Java Block/Item: zip с файлом <code>.json</code> и текстурами <code>.png</code> (в Blockbench: File → Export → Export Block/Item Model; подходят и модели с сайтов вроде mcmodels.net). Сервер сам соберёт ресурспак, раздаст его игрокам при входе и обновит без перезапуска. Загруженную модель выберите в форме шапки ниже.</p>
+  <div class="row">
+    <label>Модель (.zip) <input type="file" id="m_file" accept=".zip"></label>
+    <label>Название <input type="text" id="m_name" maxlength="32" style="width:160px;flex:none" placeholder="необязательно"></label>
+    <button class="primary" onclick="uploadModel()">⬆ Загрузить модель</button>
+  </div>
+  <div id="packinfo" class="muted" style="margin:10px 0"></div>
+  <div id="models" class="muted">—</div>
+</section>
+<section>
   <h2 id="formTitle">Новая шапка</h2>
   <div class="row">
     <label>Название<input type="text" id="f_title" maxlength="40" style="width:180px"></label>
     <label>Материал<input type="text" id="f_material" maxlength="64" style="width:180px" placeholder="CARVED_PUMPKIN"></label>
+    <label>3D-модель<select id="f_model" style="width:170px"><option value="">— нет —</option></select></label>
     <label>Цена, монет<input type="number" id="f_price" value="200" min="0" step="any" style="width:100px"></label>
     <label>Масштаб<input type="number" id="f_scale" value="0.7" min="0.1" max="3" step="0.05" style="width:80px"></label>
     <label>Сдвиг по высоте<input type="number" id="f_y" value="0" min="-2" max="3" step="0.05" style="width:100px"></label>
@@ -6865,14 +7428,25 @@ async function call(action,body){
   return d;
 }
 async function act(action,body){const d=await call(action,body);setMsg(d.success?d.message:(d.error||'Ошибка'),!!d.success);load();return d}
+async function uploadModel(){
+  const inp=document.getElementById('m_file');
+  if(!inp.files.length){setMsg('Выбери архив .zip с моделью',false);return}
+  const fd=new FormData();fd.append('file',inp.files[0]);fd.append('name',val('m_name'));
+  setMsg('Загружаю модель…',true);
+  let d={};
+  try{const r=await fetch('/admin/cosmetics/model_upload',{method:'POST',body:fd});d=await r.json()}catch(e){}
+  setMsg(d.success?d.message:(d.error||'Ошибка загрузки'),!!d.success);
+  inp.value='';load();
+}
 function resetForm(){
   editId=null;document.getElementById('formTitle').textContent='Новая шапка';
+  document.getElementById('f_model').value='';
   ['f_title','f_material','f_texture','f_desc'].forEach(i=>document.getElementById(i).value='');
   document.getElementById('f_price').value=200;document.getElementById('f_scale').value=0.7;
   document.getElementById('f_y').value=0;document.getElementById('f_order').value=0;document.getElementById('f_enabled').checked=true;
 }
 function saveItem(){
-  act('item_save',{id:editId,title:val('f_title'),material:val('f_material'),texture:val('f_texture'),price:val('f_price'),
+  act('item_save',{id:editId,title:val('f_title'),material:val('f_material'),texture:val('f_texture'),model:val('f_model'),price:val('f_price'),
     scale:val('f_scale'),y_offset:val('f_y'),sort_order:val('f_order'),description:val('f_desc'),
     enabled:document.getElementById('f_enabled').checked}).then(d=>{if(d.success)resetForm()});
 }
@@ -6881,6 +7455,7 @@ function editItem(id){
   editId=id;document.getElementById('formTitle').textContent='Изменить шапку';
   document.getElementById('f_title').value=it.title;document.getElementById('f_material').value=it.material;
   document.getElementById('f_texture').value=it.texture||'';document.getElementById('f_price').value=it.price;
+  document.getElementById('f_model').value=it.model||'';
   document.getElementById('f_scale').value=it.scale;document.getElementById('f_y').value=it.y_offset;
   document.getElementById('f_order').value=it.sort_order;document.getElementById('f_desc').value=it.description||'';
   document.getElementById('f_enabled').checked=!!it.enabled;window.scrollTo(0,0);
@@ -6889,9 +7464,15 @@ async function load(){
   let d={};try{d=await (await fetch('/admin/cosmetics/data')).json()}catch(e){return}
   document.getElementById('state').innerHTML='Сервер: '+(d.server_running?'<span class="ok">запущен</span>':'<span class="warn">остановлен</span>')+
     ' · Плагин MafinCosmetics: '+(d.plugin?'<span class="ok">установлен</span>':'<span class="bad">не установлен — шапки не будут видны в игре</span>');
+  const sel=document.getElementById('f_model'),cur=sel.value;
+  sel.innerHTML='<option value="">— нет —</option>'+(d.models||[]).map(m=>'<option value="'+esc(m.slug)+'">'+esc(m.slug)+'</option>').join('');
+  sel.value=cur;
+  const pk=d.pack||{};
+  document.getElementById('packinfo').innerHTML=pk.ready?('Ресурспак готов: '+(d.models||[]).length+' мод., '+Math.round(pk.size/1024)+' КБ. '+(pk.public_base?'Игроки скачивают его с <code>'+esc(pk.public_base)+'/api/cosmetics/pack.zip</code>':'<span class="bad">Внешний адрес сервера неизвестен: откройте эту страницу по внешнему адресу (не localhost) или задайте MAFIN_PUBLIC_URL, иначе игроки не получат пак</span>')):'Ресурспака пока нет: загрузите первую модель.';
+  document.getElementById('models').innerHTML=(d.models||[]).length?(d.models).map(m=>'<div class="item"><div><div class="t">'+esc(m.slug)+'</div><div class="d">текстур: '+m.textures+' · '+Math.round(m.size/1024)+' КБ · шапок: '+m.used+'</div></div><button class="danger" data-mdel="'+esc(m.slug)+'">Удалить</button></div>').join(''):'Моделей пока нет';
   byId={};
   document.getElementById('items').innerHTML=d.items.map(it=>{byId[it.id]=it;
-    return '<tr><td>'+esc(it.title)+'<div class="muted">'+esc(it.description)+'</div></td><td><code>'+esc(it.material)+'</code></td><td>'+esc(it.price)+' 🪙</td><td>'+it.owners+'</td><td>'+
+    return '<tr><td>'+esc(it.title)+'<div class="muted">'+esc(it.description)+'</div></td><td>'+(it.model?'🧊 <code>'+esc(it.model)+'</code>':'<code>'+esc(it.material)+'</code>')+'</td><td>'+esc(it.price)+' 🪙</td><td>'+it.owners+'</td><td>'+
     (it.enabled?'<span class="ok">в продаже</span>':'<span class="muted">скрыта</span>')+'</td><td><button data-edit="'+it.id+'">Изменить</button> <button class="danger" data-del="'+it.id+'">Удалить</button></td></tr>'}).join('')||
     '<tr><td colspan="6" class="muted">Шапок пока нет. Нажми «Добавить примеры» или создай свою.</td></tr>';
 }
@@ -6899,6 +7480,7 @@ document.addEventListener('click',function(e){
   const b=e.target.closest('button');if(!b)return;
   if(b.dataset.edit)editItem(Number(b.dataset.edit));
   else if(b.dataset.del){if(confirm('Удалить шапку?'))act('item_delete',{id:Number(b.dataset.del)})}
+  else if(b.dataset.mdel){if(confirm('Удалить модель '+b.dataset.mdel+'?'))act('model_delete',{slug:b.dataset.mdel})}
 });
 load();setInterval(load,8000);
 </script>
@@ -6993,8 +7575,8 @@ load();
 
 
 
-TG_PROD_TOKEN_CODE = ""
-TG_TEST_TOKEN_CODE = ""
+TG_PROD_TOKEN_CODE = "токен бота прод"
+TG_TEST_TOKEN_CODE = "токен бота тест (dc2)/test"
 TG_PROD_NEWS_CHAT_CODE = ""
 TG_TEST_NEWS_CHAT_CODE = ""
 
@@ -7495,6 +8077,10 @@ if __name__ == '__main__':
     init_db()
     _tg_start()
     _mc_sessions_load()
+    try:
+        _cosmetic_pack_build()
+    except Exception as e:
+        print(f"[cosmetics] не удалось собрать ресурспак: {e}")
     _mc_guard_start()
     _shop_start()
     threading.Thread(target=_weekly_loop, daemon=True).start()
