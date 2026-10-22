@@ -824,10 +824,6 @@ def set_gifts_visibility():
     log_action("profile_edit", me, f"gifts_visible={visible}")
     return jsonify({"success": True, "gifts_visible": bool(visible)})
 
-    result = dict(profile)
-    result["is_online"] = is_online(result.get("last_seen"))
-    return jsonify(result)
-
 @app.route('/api/me', methods=['GET'])
 @auth_required
 def get_me():
@@ -897,21 +893,29 @@ def _mc_sessions_load():
     """Восстанавливает игровые сессии из БД после перезапуска сервера."""
     try:
         db = sqlite3.connect(DB_PATH, timeout=30)
-        rows = db.execute("SELECT game_name_lower, nick, ip FROM mc_sessions").fetchall()
+        try:
+            db.execute("ALTER TABLE mc_sessions ADD COLUMN platform TEXT DEFAULT 'pc'")
+            db.commit()
+        except sqlite3.Error:
+            pass
+        rows = db.execute("SELECT game_name_lower, nick, ip, COALESCE(platform, 'pc') FROM mc_sessions").fetchall()
         db.close()
     except sqlite3.Error as e:
         print(f"Не удалось загрузить mc_sessions: {e}")
         return
     with _mc_sessions_lock:
-        for key, nick, ip in rows:
-            _mc_sessions[key] = {"nick": nick, "ip": ip or ""}
+        for key, nick, ip, platform in rows:
+            _mc_sessions[key] = {"nick": nick, "ip": ip or "", "platform": platform or "pc"}
 
 def _client_ip():
     """IP клиента. За обратным прокси задайте MAFIN_TRUST_PROXY=1 — тогда берётся X-Forwarded-For."""
-    if os.environ.get("MAFIN_TRUST_PROXY") == "1":
-        xff = request.headers.get("X-Forwarded-For", "")
-        if xff:
-            return _normalize_ip(xff.split(",")[0])
+    xff = request.headers.get("X-Forwarded-For", "")
+    real = request.headers.get("X-Real-IP", "")
+    local = _normalize_ip(request.remote_addr) in ("127.0.0.1", "::1", "localhost")
+    if xff and (os.environ.get("MAFIN_TRUST_PROXY") == "1" or local):
+        return _normalize_ip(xff.split(",")[0])
+    if real and local:
+        return _normalize_ip(real)
     return _normalize_ip(request.remote_addr)
 
 def _normalize_ip(ip):
@@ -943,11 +947,17 @@ def mc_register_session():
         for k in [k for k, v in _mc_sessions.items() if v['nick'] == me and k != key]:
             del _mc_sessions[k]
         ip = _client_ip()
-        _mc_sessions[key] = {"nick": me, "ip": ip}
+        platform = str(data.get('platform', '')).strip().lower()
+        if platform not in ('pc', 'mobile'):
+            platform = str(request.headers.get('X-Mafin-Platform', '')).strip().lower()
+        if platform not in ('pc', 'mobile'):
+            platform = 'mobile' if 'MafinLauncher-Android' in (request.headers.get('User-Agent') or '') else 'pc'
+        print(f"[mc] сессия: ник={game_name} платформа={platform} UA={(request.headers.get('User-Agent') or '')[:60]}", flush=True)
+        _mc_sessions[key] = {"nick": me, "ip": ip, "platform": platform}
         try:
             db.execute("DELETE FROM mc_sessions WHERE nick = ? AND game_name_lower != ?", (me, key))
-            db.execute("INSERT OR REPLACE INTO mc_sessions (game_name_lower, nick, ip, updated_at) "
-                       "VALUES (?, ?, ?, CURRENT_TIMESTAMP)", (key, me, ip))
+            db.execute("INSERT OR REPLACE INTO mc_sessions (game_name_lower, nick, ip, updated_at, platform) "
+                       "VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)", (key, me, ip, platform))
             db.commit()
         except sqlite3.Error as e:
             print(f"mc_sessions persist error: {e}")
@@ -968,7 +978,8 @@ def _mc_access(db, name, ip):
         return False, "banned"
     if not is_online(profile['last_seen']):
         return False, "offline"
-    if sess['ip'] != _normalize_ip(ip):
+    if os.environ.get("MAFIN_MC_IP_CHECK", "1") != "0" and sess['ip'] != _normalize_ip(ip):
+        print(f"[mc] ip_mismatch: ник={name} ip лаунчера={sess['ip']} ip в игре={_normalize_ip(ip)}", flush=True)
         return False, "ip_mismatch"
     return True, None
 
@@ -984,7 +995,9 @@ def mc_check():
     data = request.get_json(silent=True) or {}
     ok, reason = _mc_access(get_db(), str(data.get('name', '')), data.get('ip', ''))
     if ok:
-        return jsonify({"allowed": True})
+        with _mc_sessions_lock:
+            sess = _mc_sessions.get(str(data.get('name', '')).strip().lower()) or {}
+        return jsonify({"allowed": True, "platform": sess.get("platform", "pc")})
     return jsonify({"allowed": False, "reason": reason})
 
 @app.route('/api/online/<nickname>', methods=['GET'])
@@ -1772,6 +1785,11 @@ tr:hover{background:#2d323c}
     <h2>📦 Обновления лаунчера</h2>
     {% if upload_error %}<div class="err" style="margin-bottom:14px">{{ upload_error }}</div>{% endif %}
     <form class="upload-form" method="post" action="/admin/updates/upload" enctype="multipart/form-data">
+      <label style="display:flex;align-items:center;gap:6px;margin:6px 0;font-size:13px;color:#c8d0e0">
+        <input type="checkbox" name="mobile" value="1"
+               onchange="var m=this.checked;var f=this.form;f.version.required=!m;f.version.style.display=m?'none':'';f.changelog.style.display=m?'none':'';f.extra_needed.disabled=m;f.file.accept=m?'.apk':'.exe,.zip';document.getElementById('extra_file_row').style.display='none'">
+        📱 Это мобильная версия (.apk для Android)
+      </label>
       <input type="text" name="version" placeholder="Версия, например 1.3" required>
       <textarea name="changelog" placeholder="Что нового в этой версии..." rows="3"></textarea>
       <input type="file" name="file" accept=".exe,.zip" required>
@@ -1784,7 +1802,63 @@ tr:hover{background:#2d323c}
         <input type="file" name="extra_file" accept=".dll,.zip">
       </div>
       <button type="submit">⬆️ Загрузить и сделать активной</button>
+      <div id="up_status" class="muted" style="margin-top:8px"></div>
     </form>
+    <script>
+    (function () {
+      var form = document.querySelector('form[action="/admin/updates/upload"]');
+      if (!form || !window.fetch) return;
+      var CH = 512 * 1024;
+      function rid() { var a = new Uint8Array(12); crypto.getRandomValues(a); return Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join(''); }
+      function say(t) { document.getElementById('up_status').textContent = t; }
+      async function send(file, label) {
+        var id = rid(), off = 0, fails = 0;
+        while (off < file.size || off === 0) {
+          var blob = file.slice(off, off + CH);
+          try {
+            var r = await fetch('/admin/updates/chunk?id=' + id + '&offset=' + off, {method: 'POST', body: blob, credentials: 'same-origin'});
+            var j = null; try { j = await r.json(); } catch (e) {}
+            if (r.status === 409 && j && typeof j.size === 'number') { off = j.size; continue; }
+            if (!r.ok) throw new Error(j && j.error ? j.error : 'HTTP ' + r.status);
+            off = j.size; fails = 0;
+            say(label + ': ' + Math.floor(off * 100 / Math.max(file.size, 1)) + '%');
+            if (file.size === 0) break;
+          } catch (e) {
+            if (++fails > 6) throw e;
+            say(label + ': обрыв связи, повтор…');
+            await new Promise(function (ok) { setTimeout(ok, 1500 * fails); });
+          }
+        }
+        return id;
+      }
+      form.addEventListener('submit', async function (ev) {
+        var jobs = [];
+        ['file', 'extra_file'].forEach(function (n) {
+          var inp = form.elements[n];
+          var wanted = n === 'file' || (form.elements['extra_needed'] && form.elements['extra_needed'].checked);
+          if (inp && inp.files && inp.files.length && wanted) jobs.push([n, inp]);
+        });
+        if (!jobs.length) return;
+        ev.preventDefault();
+        var btn = form.querySelector('button[type=submit]'); btn.disabled = true;
+        try {
+          for (var i = 0; i < jobs.length; i++) {
+            var n = jobs[i][0], inp = jobs[i][1], f = inp.files[0];
+            var id = await send(f, f.name);
+            [[n + '_upload_id', id], [n + '_upload_name', f.name]].forEach(function (kv) {
+              var h = document.createElement('input'); h.type = 'hidden'; h.name = kv[0]; h.value = kv[1]; form.appendChild(h);
+            });
+            inp.removeAttribute('required'); inp.removeAttribute('name');
+          }
+          say('Файл передан, сохраняю…');
+          form.submit();
+        } catch (e) {
+          say('Не удалось загрузить: ' + e.message);
+          btn.disabled = false;
+        }
+      });
+    })();
+    </script>
     <table>
       <tr><th>Версия</th><th>Файл</th><th>Размер</th><th>Доп. файл</th><th>Кем загружено</th><th>Дата</th><th>Статус</th><th>Действия</th></tr>
       {% for u in updates %}
@@ -4190,14 +4264,88 @@ def web_give_coins(nickname):
     return redirect(url_for('admin_dashboard'))
 
 
+CHUNKS_DIR = os.path.join(UPDATES_DIR, "_chunks")
+
+
+class _StagedUpload:
+    """Файл, уже загруженный кусками (/admin/updates/chunk): ведёт себя как FileStorage для save()/filename."""
+
+    def __init__(self, path, filename):
+        self.path = path
+        self.filename = filename
+
+    def save(self, dest):
+        os.replace(self.path, dest)
+
+
+def _upload_field(name):
+    """Файл из обычного multipart-поля либо из поля, загруженного кусками (name_upload_id + name_upload_name)."""
+    up_id = (request.form.get(name + '_upload_id') or '').strip()
+    if up_id:
+        if not re.fullmatch(r'[0-9a-f]{8,64}', up_id):
+            return None
+        path = os.path.join(CHUNKS_DIR, up_id + '.part')
+        if not os.path.isfile(path):
+            return None
+        return _StagedUpload(path, request.form.get(name + '_upload_name') or '')
+    return request.files.get(name)
+
+
+@app.route('/admin/updates/chunk', methods=['POST'])
+@web_admin_required
+def web_upload_chunk():
+    """Приём большого файла кусками по ~512 КБ. Работает даже при маленьком client_max_body_size в nginx (по умолчанию 1 МБ)."""
+    up_id = (request.args.get('id') or '').strip()
+    if not re.fullmatch(r'[0-9a-f]{8,64}', up_id):
+        return jsonify({"error": "bad id"}), 400
+    try:
+        offset = int(request.args.get('offset', '0'))
+    except ValueError:
+        return jsonify({"error": "bad offset"}), 400
+    os.makedirs(CHUNKS_DIR, exist_ok=True)
+    now = time.time()
+    for fn in os.listdir(CHUNKS_DIR):
+        fp = os.path.join(CHUNKS_DIR, fn)
+        try:
+            if now - os.path.getmtime(fp) > 86400:
+                os.remove(fp)
+        except OSError:
+            pass
+    path = os.path.join(CHUNKS_DIR, up_id + '.part')
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    if offset == 0:
+        size = 0
+        open(path, 'wb').close()
+    if offset != size:
+        return jsonify({"error": "offset mismatch", "size": size}), 409
+    data = request.get_data(cache=False)
+    if size + len(data) > MAX_UPDATE_SIZE_BYTES:
+        return jsonify({"error": "file too large"}), 413
+    with open(path, 'ab') as f:
+        f.write(data)
+    return jsonify({"size": size + len(data)})
+
+
 @app.route('/admin/updates/upload', methods=['POST'])
 @web_admin_required
 def web_upload_update():
+    if request.form.get('mobile') == '1':
+        apk = _upload_field('file')
+        if not apk or not (apk.filename or '').lower().endswith('.apk'):
+            session['upload_error'] = "Для мобильной версии выберите файл .apk."
+            return redirect(url_for('admin_dashboard'))
+        os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+        tmp = os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME + ".part")
+        apk.save(tmp)
+        dst = os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME)
+        os.replace(tmp, dst)
+        log_action("upload_mobile_apk", g.web_admin['nickname'], f"{os.path.getsize(dst)} байт")
+        return redirect(url_for('admin_dashboard'))
     version = request.form.get('version', '').strip()
     changelog = request.form.get('changelog', '').strip()
-    file = request.files.get('file')
+    file = _upload_field('file')
     extra_needed = request.form.get('extra_needed') == '1'
-    extra_file = request.files.get('extra_file')
+    extra_file = _upload_field('extra_file')
 
     if not version:
         session['upload_error'] = "Введите номер новой версии — без него загрузить обновление нельзя."
@@ -5328,11 +5476,20 @@ def _site_page(title, body, head_extra=""):
     return resp
 
 
+MOBILE_APK_NAME = "mafinlaunchermobile.apk"
+
+
+def _site_mobile_apk():
+    path = os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME)
+    return path if os.path.isfile(path) else None
+
+
 def _site_latest_download():
     """(папка, имя файла, версия) самого свежего файла для скачивания или None."""
     try:
         files = [f for f in os.listdir(DOWNLOADS_DIR)
-                 if not f.startswith(".") and os.path.isfile(os.path.join(DOWNLOADS_DIR, f))]
+                 if not f.startswith(".") and f.lower() != MOBILE_APK_NAME
+                 and os.path.isfile(os.path.join(DOWNLOADS_DIR, f))]
     except OSError:
         files = []
     if files:
@@ -5354,6 +5511,45 @@ def _fmt_size(n):
         n /= 1024
 
 
+@app.route('/api/mobile/latest', methods=['GET'])
+def api_mobile_latest():
+    """Сведения о последнем APK для проверки обновлений в мобильном лаунчере."""
+    apk = _site_mobile_apk()
+    if not apk:
+        return jsonify({"available": False})
+    st = os.stat(apk)
+    h = hashlib.sha256()
+    with open(apk, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return jsonify({"available": True, "size": st.st_size, "modified": int(st.st_mtime),
+                    "sha256": h.hexdigest(), "url": "/download/mobile"})
+
+
+@app.route('/api/admin/mobile/upload', methods=['POST'])
+@admin_required
+def api_admin_mobile_upload():
+    """Загрузка нового APK мобильной версии из админки (поле формы file)."""
+    f = request.files.get("file")
+    if not f or not (f.filename or "").lower().endswith(".apk"):
+        return jsonify({"error": "Нужен файл .apk"}), 400
+    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+    tmp = os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME + ".part")
+    f.save(tmp)
+    os.replace(tmp, os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME))
+    return jsonify({"success": True, "size": os.path.getsize(os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME))})
+
+
+@app.route('/download/mobile', methods=['GET'])
+@app.route('/download/android', methods=['GET'])
+def site_download_mobile():
+    if not _site_mobile_apk():
+        return _site_page("Скачать", '<div class="wrap doc"><h1>Мобильная версия пока недоступна</h1>'
+                          '<p>Файл ещё не загружен. Загляните позже.</p></div>'), 404
+    return send_from_directory(DOWNLOADS_DIR, MOBILE_APK_NAME, as_attachment=True,
+                               mimetype="application/vnd.android.package-archive")
+
+
 @app.route('/download', methods=['GET'])
 def site_download():
     found = _site_latest_download()
@@ -5372,9 +5568,15 @@ def site_index():
         size = _fmt_size(os.path.getsize(os.path.join(folder, name)))
         ver = f" · версия {_html.escape(str(version))}" if version else ""
         btn = '<a class="btn" href="/download">⬇ Скачать лаунчер</a>'
+        apk = _site_mobile_apk()
+        if apk:
+            btn += f' <a class="btn" href="/download/mobile">📱 Android · {_fmt_size(os.path.getsize(apk))}</a>'
         meta = f'<div class="meta">{_html.escape(name)} · {size}{ver} · Windows</div>'
     else:
         btn = '<span class="btn" style="opacity:.5">Скоро</span>'
+        apk = _site_mobile_apk()
+        if apk:
+            btn += f' <a class="btn" href="/download/mobile">📱 Android · {_fmt_size(os.path.getsize(apk))}</a>'
         meta = '<div class="meta">Файл лаунчера ещё не загружен</div>'
     body = f"""<div class="wrap"><section class="hero"><h1>Играйте в Minecraft<br>с {_html.escape(SITE_NAME)}</h1>
 <p>Свой лаунчер с друзьями, чатом, достижениями, скинами и привилегиями на нашем сервере.</p>{btn}{meta}</section>
@@ -5743,6 +5945,305 @@ def site_cabinet():
     resp = _site_page("Личный кабинет", body, head_extra='<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>')
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+HUB_CSS = r""":root{--bg:#1a1d23;--bg2:#23272e;--bg3:#2d323c;--tx:#e1e4e8;--mu:#7a8599;--ac:#43b581;--bad:#ed4245;--r:12px}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,Arial,sans-serif;font-size:15px}
+#app{min-height:100vh;display:flex;flex-direction:column;max-width:720px;margin:0 auto}
+.top{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg2);border-bottom:1px solid var(--bg3)}
+.brand{font-weight:700;color:var(--ac);font-size:17px}.who{display:flex;gap:12px;align-items:center;font-size:13px}
+main{flex:1;padding:12px 12px 90px;display:flex;flex-direction:column;gap:10px}
+.tabs{position:fixed;bottom:0;left:0;right:0;z-index:6;display:flex;overflow-x:auto;background:var(--bg2);border-top:1px solid var(--bg3);padding:4px 4px calc(4px + env(safe-area-inset-bottom));scrollbar-width:none;max-width:720px;margin:0 auto}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;min-width:64px;background:none;border:0;color:var(--mu);display:flex;flex-direction:column;align-items:center;gap:1px;padding:5px 6px;border-radius:10px;font:inherit;cursor:pointer}
+.tab span{font-size:20px}.tab small{font-size:10.5px}.tab.on{color:var(--ac);background:var(--bg3)}
+.card{background:var(--bg2);border:1px solid var(--bg3);border-radius:var(--r);padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.card h2,.card h3,.card p{margin:0}.card h3{font-size:15px}
+.muted{color:var(--mu)}.ok{color:var(--ac)}.err{color:var(--bad);font-size:13px}.pre{white-space:pre-wrap;word-break:break-word}
+.row{display:flex;gap:8px;align-items:center}.row.between{justify-content:space-between}.row.wrap{flex-wrap:wrap}.grow{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+input,textarea,select{width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--bg3);border-radius:10px;padding:10px 12px;font:inherit}
+input[type=checkbox]{width:auto}input[type=file]{padding:8px}
+textarea{resize:vertical}
+.btn{display:inline-block;text-align:center;text-decoration:none;background:var(--ac);color:#fff;border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:600;cursor:pointer}
+.btn.sm{padding:7px 12px;font-size:13.5px}.btn.wide{width:100%}.btn.ghost{background:var(--bg3);color:var(--tx)}.btn:disabled{opacity:.5}
+.stat{display:flex;justify-content:space-between;gap:10px;padding:2px 0}
+.li{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bg3)}.li:last-child{border:0}.li .grow{cursor:pointer}
+.log{font-size:12.5px;align-items:flex-start;flex-direction:column;gap:0}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#555;margin-right:2px}.dot.on{background:var(--ac)}
+.chk{display:flex;gap:8px;align-items:center}
+.auth{margin:36px 12px;gap:10px}
+.toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%);background:var(--ac);color:#fff;padding:10px 16px;border-radius:10px;z-index:20;max-width:88vw;font-size:14px}.toast.bad{background:var(--bad)}
+.giftrow,.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:8px}
+.grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.gift{display:flex;flex-direction:column;align-items:center;text-align:center;gap:3px}.gift img{width:56px;height:56px;object-fit:contain;image-rendering:pixelated}
+.gift.big img{width:84px;height:84px}
+.bar{height:8px;background:var(--bg3);border-radius:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--ac)}
+.ach{flex-direction:row;align-items:center;opacity:.55}.ach.on{opacity:1;border-color:var(--ac)}.aic{font-size:28px;width:40px;text-align:center}
+.rank{width:34px;color:var(--ac)}
+.chat{display:flex;flex-direction:column;gap:6px;height:52vh;overflow-y:auto;background:var(--bg2);border:1px solid var(--bg3);border-radius:var(--r);padding:10px}
+.msg{display:flex;flex-direction:column;align-items:flex-start;max-width:86%}.msg.me{align-self:flex-end;align-items:flex-end}
+.bub{background:var(--bg3);padding:7px 11px;border-radius:14px;word-break:break-word;white-space:pre-wrap}.bub.me{background:var(--ac);color:#fff}.bub.gift img{width:48px;height:48px;display:block}
+.typing{min-height:16px;font-size:12px}
+.skinprev{width:128px;height:128px;image-rendering:pixelated;object-fit:contain;background:var(--bg);border-radius:8px;align-self:center}
+"""
+
+HUB_JS = r"""const $=(s,r=document)=>r.querySelector(s);
+const h=(t,a,...k)=>{const e=document.createElement(t);if(a)for(const[x,v]of Object.entries(a)){if(v===false||v==null)continue;if(x==='class')e.className=v;else if(x==='html')e.innerHTML=v;else if(x.startsWith('on'))e.addEventListener(x.slice(2),v);else if(x==='value')e.value=v;else e.setAttribute(x,v===true?'':v)}for(const c of k.flat())if(c!=null&&c!==false)e.append(c.nodeType?c:document.createTextNode(String(c)));return e};
+const ls={get(k){try{return localStorage.getItem(k)||''}catch(e){return''}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}},del(k){try{localStorage.removeItem(k)}catch(e){}}};
+const S={token:'',nick:'',admin:false,coins:0,tab:'profile',chat:null,view:null,timers:[],achCatalog:null};
+(function(){const m=/[#&]t=([0-9a-f]+)/.exec(location.hash);if(m){ls.set('mafin_token',m[1]);const g=/[#&]go=(\w+)/.exec(location.hash);if(g)ls.set('mafin_go',g[1]);history.replaceState(null,'',location.pathname)}S.token=ls.get('mafin_token')})();
+async function api(path,opt={}){
+  const method=opt.method||(opt.body!==undefined?'POST':'GET');
+  const r=await fetch(path,{method,headers:{'Content-Type':'application/json',...(S.token?{Authorization:'Bearer '+S.token}:{})},body:opt.body!==undefined?JSON.stringify(opt.body):undefined});
+  let d={};try{d=await r.json()}catch(e){}
+  if(r.status===401&&S.token&&!opt.soft){signOut(true)}
+  if(!r.ok)throw new Error(d.error||('Ошибка '+r.status));
+  return d}
+const toast=(t,bad)=>{const e=h('div',{class:'toast'+(bad?' bad':'')},t);document.body.append(e);setTimeout(()=>e.remove(),3200)};
+const guard=async(fn)=>{try{return await fn()}catch(e){toast(e.message,true)}};
+const fmtMin=m=>{m=Math.round(m||0);return Math.floor(m/60)+' ч '+(m%60)+' мин'};
+const num=v=>{v=Number(v||0);return Number.isInteger(v)?String(v):v.toFixed(1)};
+const fmtDate=s=>{if(!s)return'';const d=new Date(String(s).replace(' ','T')+(/[zZ]|[+-]\d\d:?\d\d$/.test(s)?'':'Z'));return isNaN(d)?String(s):d.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})};
+const dot=on=>h('span',{class:'dot '+(on?'on':'')});
+const clearTimers=()=>{S.timers.forEach(clearInterval);S.timers=[]};
+const every=(fn,ms)=>{S.timers.push(setInterval(fn,ms))};
+function signOut(silent){if(!silent&&S.token)api('/api/logout',{body:{},soft:true}).catch(()=>{});S.token='';S.nick='';ls.del('mafin_token');clearTimers();render()}
+const TABS=[['profile','👤','Профиль'],['friends','👥','Друзья'],['gifts','🎁','Подарки'],['shop','🛒','Магазин'],['quests','📋','Задания'],['ach','🏆','Ачивки'],['top','🥇','Топ'],['news','📰','Новости'],['skin','🧍','Скин'],['cab','🎩','Шапка'],['tg','✈️','Telegram'],['server','⛏','Сервер'],['admin','🛡','Админ']];
+function authView(){
+  let mode='login';
+  const err=h('div',{class:'err'});
+  const nick=h('input',{autocomplete:'username',maxlength:20,placeholder:'Ник'}),pass=h('input',{type:'password',autocomplete:'current-password',placeholder:'Пароль'});
+  const go=h('button',{class:'btn wide'},'Войти');
+  const t1=h('button',{class:'btn sm',type:'button'},'Вход'),t2=h('button',{class:'btn sm ghost',type:'button'},'Регистрация');
+  const setMode=m=>{mode=m;go.textContent=m==='login'?'Войти':'Создать аккаунт';t1.className='btn sm'+(m==='login'?'':' ghost');t2.className='btn sm'+(m==='login'?' ghost':'');err.textContent=''};
+  t1.onclick=()=>setMode('login');t2.onclick=()=>setMode('register');
+  const submit=async()=>{err.textContent='';go.disabled=true;
+    try{const d=await api(mode==='login'?'/api/login':'/api/register',{body:{nickname:nick.value.trim(),password:pass.value},soft:true});S.token=d.token;ls.set('mafin_token',d.token);render()}
+    catch(e){err.textContent=e.message}finally{go.disabled=false}};
+  go.onclick=submit;pass.addEventListener('keydown',e=>{if(e.key==='Enter')submit()});
+  return h('div',{class:'card auth'},h('h2',{},'⛏ Mafin'),h('p',{class:'muted'},'Тот же ник и пароль, что и в лаунчере.'),h('div',{class:'row'},t1,t2),nick,pass,err,go)}
+async function render(){
+  clearTimers();
+  const root=$('#app');root.replaceChildren();
+  if(!S.token){root.append(authView());return}
+  let me;
+  try{me=await api('/api/me')}catch(e){root.append(authView());return}
+  S.me=me;S.nick=me.nickname;S.admin=!!me.is_admin;S.coins=me.coins;
+  const go=ls.get('mafin_go');if(go){ls.del('mafin_go');S.tab=go;S.chat=null}
+  const top=h('div',{class:'top'},h('div',{class:'brand'},'⛏ Mafin'),h('div',{class:'who'},h('span',{id:'coins'},'🪙 '+num(S.coins)),h('b',{},S.nick)));
+  const bar=h('nav',{class:'tabs'});
+  for(const[id,ic,name]of TABS){if(id==='admin'&&!S.admin)continue;bar.append(h('button',{class:'tab'+(S.tab===id?' on':''),'data-tab':id,onclick:()=>{S.tab=id;S.chat=null;render()}},h('span',{},ic),h('small',{},name)))}
+  const main=h('main',{id:'main'});
+  root.append(top,main,bar);
+  const active=bar.querySelector('.on');if(active)active.scrollIntoView({inline:'center',block:'nearest'});
+  api('/api/heartbeat',{body:{},soft:true}).catch(()=>{});
+  every(()=>api('/api/heartbeat',{body:{},soft:true}).catch(()=>{}),60000);
+  try{await VIEWS[S.tab](main)}catch(e){main.append(h('div',{class:'card err'},'Не удалось загрузить: '+e.message))}
+}
+const setCoins=c=>{S.coins=c;const e=$('#coins');if(e)e.textContent='🪙 '+num(c)};
+const card=(...k)=>h('div',{class:'card'},...k);
+const stat=(a,b)=>h('div',{class:'stat'},h('span',{class:'muted'},a),h('b',{},b));
+const VIEWS={};
+VIEWS.profile=async main=>{
+  const p=await api('/api/profile/'+encodeURIComponent(S.nick));
+  const bio=h('textarea',{rows:3,maxlength:300,placeholder:'Расскажите о себе'},p.bio||'');
+  const vis=h('input',{type:'checkbox'});vis.checked=!!p.gifts_visible;
+  vis.onchange=()=>guard(()=>api('/api/profile/gifts_visibility',{body:{visible:vis.checked}}));
+  const gifts=h('div',{class:'giftrow'});
+  main.append(card(h('div',{class:'row between'},h('h2',{},p.nickname),h('span',{},dot(p.is_online),p.is_online?' В сети':' Не в сети')),
+    bio,h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/profile/me',{method:'PUT',body:{bio:bio.value.trim()}});toast('Описание сохранено')})},'💾 Сохранить описание')),
+    card(stat('🪙 Монеты',num(p.coins)),stat('⏱ Время в игре',fmtMin(p.total_playtime_minutes)),stat('🚀 Запусков',p.total_launches),stat('🏆 Ачивок',p.achievements_count)),
+    card(h('label',{class:'chk'},vis,' Показывать подарки на моём профиле'),h('h3',{},'🎁 Полученные подарки'),gifts),
+    card(h('button',{class:'btn ghost wide',onclick:()=>signOut()},'Выйти из аккаунта')));
+  await fillReceived(gifts,S.nick)};
+async function fillReceived(box,nick){
+  try{const d=await api('/api/gifts/received/'+encodeURIComponent(nick));
+    if(d.hidden){box.append(h('p',{class:'muted'},'Подарки скрыты владельцем профиля'));return}
+    if(!d.gifts.length){box.append(h('p',{class:'muted'},'Пока нет подарков'));return}
+    for(const g of d.gifts)box.append(h('div',{class:'gift',title:g.name+' от '+g.from+(g.note?': '+g.note:'')},h('img',{src:g.image_url,alt:g.name}),h('small',{},g.name),h('small',{class:'muted'},'от '+g.from)))}
+  catch(e){box.append(h('p',{class:'muted'},'Не удалось загрузить подарки'))}}
+async function openProfile(nick){
+  const main=$('#main');main.replaceChildren(h('p',{class:'muted'},'Загрузка...'));
+  const p=await api('/api/profile/'+encodeURIComponent(nick));
+  const gifts=h('div',{class:'giftrow'});
+  let actions;
+  const st=p.friendship_status;
+  const reload=()=>guard(()=>openProfile(nick));
+  if(p.friendship_status==='self')actions=h('span',{});
+  else if(st==='friends')actions=h('span',{class:'ok'},'✅ Вы друзья');
+  else if(st==='request_sent')actions=h('span',{class:'muted'},'⏳ Заявка отправлена');
+  else if(st==='request_received')actions=h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/friends/respond',{body:{nickname:nick,accept:true}});reload()})},'Принять заявку');
+  else actions=h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/friends/request',{body:{nickname:nick}});reload()})},'➕ Добавить в друзья');
+  main.replaceChildren(h('button',{class:'btn sm ghost',onclick:()=>render()},'← Назад'),
+    card(h('div',{class:'row between'},h('h2',{},p.nickname),h('span',{},dot(p.is_online),p.is_online?' В сети':' Не в сети')),h('p',{},p.bio||''),
+      stat('🪙 Монеты',num(p.coins)),stat('⏱ Время в игре',fmtMin(p.total_playtime_minutes)),stat('🚀 Запусков',p.total_launches),stat('🏆 Ачивок',p.achievements_count),
+      h('div',{class:'row'},actions,p.friendship_status==='self'?null:h('button',{class:'btn sm',onclick:()=>{S.tab='gifts';S.giftTo=nick;render()}},'🎁 Подарить'))),
+    p.gifts_visible?card(h('h3',{},'🎁 Полученные подарки'),gifts):card(h('p',{class:'muted'},'🎁 Подарки скрыты владельцем профиля')));
+  if(p.gifts_visible)await fillReceived(gifts,nick)}
+VIEWS.friends=async main=>{
+  if(S.chat)return chatView(main,S.chat);
+  const d=await api('/api/friends/list');
+  const unread=await api('/api/messages/unread_count').catch(()=>({count:0}));
+  const q=h('input',{placeholder:'Найти игрока по нику'}),res=h('div',{});
+  const search=async()=>{res.replaceChildren();if(q.value.trim().length<2)return;
+    const r=await api('/api/users/search?q='+encodeURIComponent(q.value.trim()));
+    for(const u of r.results)res.append(h('div',{class:'li'},h('span',{class:'grow',onclick:()=>openProfile(u.nickname)},dot(u.is_online),' ',u.nickname),
+      u.friendship_status==='none'?h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/friends/request',{body:{nickname:u.nickname}});toast('Заявка отправлена');render()})},'➕'):h('small',{class:'muted'},({friends:'друг',request_sent:'заявка отправлена',request_received:'ждёт ответа'})[u.friendship_status]||'')));
+    if(!r.results.length)res.append(h('p',{class:'muted'},'Никого не найдено'))};
+  let t;q.oninput=()=>{clearTimeout(t);t=setTimeout(()=>guard(search),350)};
+  main.append(card(h('h3',{},'🔎 Поиск'),q,res));
+  if(d.incoming_requests.length)main.append(card(h('h3',{},'Заявки в друзья'),d.incoming_requests.map(r=>h('div',{class:'li'},h('span',{class:'grow',onclick:()=>openProfile(r.requester)},r.requester),
+    h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/friends/respond',{body:{nickname:r.requester,accept:true}});render()})},'Принять'),
+    h('button',{class:'btn sm ghost',onclick:()=>guard(async()=>{await api('/api/friends/respond',{body:{nickname:r.requester,accept:false}});render()})},'Отклонить')))));
+  main.append(card(h('h3',{},'Друзья'+(unread.count?' · новых сообщений: '+unread.count:'')),
+    d.friends.length?d.friends.map(f=>h('div',{class:'li'},h('span',{class:'grow',onclick:()=>openProfile(f.nickname)},dot(f.is_online),' ',f.nickname),
+      h('button',{class:'btn sm',onclick:()=>{S.chat=f.nickname;render()}},'💬'),
+      h('button',{class:'btn sm ghost',onclick:()=>{if(confirm('Удалить '+f.nickname+' из друзей?'))guard(async()=>{await api('/api/friends/remove',{body:{nickname:f.nickname}});render()})}},'✕'))):h('p',{class:'muted'},'Пока нет друзей. Найдите игроков через поиск.')));
+  if(d.outgoing_requests.length)main.append(card(h('h3',{},'Отправленные заявки'),d.outgoing_requests.map(r=>h('div',{class:'li'},h('span',{class:'grow'},r.addressee),h('small',{class:'muted'},'ожидает')))))};
+async function chatView(main,peer){
+  const list=h('div',{class:'chat'}),typing=h('div',{class:'typing muted'}),inp=h('input',{placeholder:'Сообщение',maxlength:2000});
+  let last=0,seen=new Set(),lastType=0;
+  const add=m=>{if(seen.has(m.id))return;seen.add(m.id);last=Math.max(last,m.id);const mine=m.sender===S.nick;
+    let body;
+    if(m.message_type==='gift'||m.gift_name)body=h('div',{class:'bub gift'+(mine?' me':'')},m.gift_image_url?h('img',{src:m.gift_image_url}):null,h('div',{},'🎁 '+(m.gift_name||'Подарок')+(m.gift_note?': '+m.gift_note:'')));
+    else body=h('div',{class:'bub'+(mine?' me':'')},m.text);
+    list.append(h('div',{class:'msg'+(mine?' me':'')},body,h('small',{class:'muted'},fmtDate(m.created_at))));list.scrollTop=list.scrollHeight};
+  const poll=async()=>{try{const d=await api('/api/messages/with/'+encodeURIComponent(peer)+'?after_id='+last);d.messages.forEach(add);
+    const t=await api('/api/messages/typing/'+encodeURIComponent(peer));typing.textContent=t.is_typing?peer+' печатает...':''}catch(e){}};
+  const send=async()=>{const text=inp.value.trim();if(!text)return;inp.value='';await guard(async()=>{await api('/api/messages/send',{body:{to:peer,text}});await poll()})};
+  inp.addEventListener('keydown',e=>{if(e.key==='Enter')send()});
+  inp.addEventListener('input',()=>{const n=Date.now();if(n-lastType>2500){lastType=n;api('/api/messages/typing',{body:{to:peer},soft:true}).catch(()=>{})}});
+  main.append(h('div',{class:'row between'},h('button',{class:'btn sm ghost',onclick:()=>{S.chat=null;render()}},'← Друзья'),h('b',{},'💬 '+peer),h('button',{class:'btn sm ghost',onclick:()=>openProfile(peer)},'Профиль')),
+    list,typing,h('div',{class:'row'},inp,h('button',{class:'btn',onclick:send},'➤')));
+  await poll();every(poll,3000)}
+VIEWS.gifts=async main=>{
+  const d=await api('/api/gifts');
+  const to=h('input',{placeholder:'Кому (ник)',value:S.giftTo||''});S.giftTo='';
+  const note=h('input',{placeholder:'Сообщение к подарку (необязательно)',maxlength:500});
+  main.append(card(h('h3',{},'🎁 Магазин подарков'),to,note,h('p',{class:'muted'},'Выберите подарок ниже: он будет отправлен указанному игроку.')));
+  if(!d.gifts.length){main.append(card(h('p',{class:'muted'},'Пока нет подарков в продаже')));return}
+  const grid=h('div',{class:'grid'});
+  for(const g of d.gifts)grid.append(h('div',{class:'card gift big'},h('img',{src:g.image_url,alt:g.name}),h('b',{},g.name),h('small',{class:'muted'},g.quantity==null?'без ограничения':'осталось: '+g.quantity),
+    h('button',{class:'btn sm',onclick:()=>guard(async()=>{if(!to.value.trim())throw new Error('Укажите, кому подарить');if(!confirm('Отправить «'+g.name+'» игроку '+to.value.trim()+' за '+num(g.price)+' 🪙?'))return;
+      const r=await api('/api/gifts/send',{body:{gift_id:g.id,to:to.value.trim(),message:note.value.trim()}});if(r.total_coins!=null)setCoins(r.total_coins);else setCoins(S.coins-g.price);toast('Подарок отправлен!')})},'🪙 '+num(g.price))));
+  main.append(grid)};
+VIEWS.shop=async main=>{
+  const d=await api('/api/shop/items');setCoins(d.coins);
+  const name=h('input',{placeholder:'Игровой ник',value:S.nick,maxlength:16});
+  main.append(card(h('h3',{},'🛒 Привилегии'),h('p',{class:'muted'},'Покупка выдаётся на указанный игровой ник на сервере.'),name));
+  if(!d.items.length)main.append(card(h('p',{class:'muted'},'Товаров пока нет')));
+  for(const it of d.items)main.append(card(h('div',{class:'row between'},h('b',{},it.title),h('span',{class:'ok'},'🪙 '+num(it.price))),h('p',{class:'muted'},it.description||''),h('small',{class:'muted'},it.duration_days?('Срок: '+it.duration_days+' дн.'):'Навсегда'),
+    h('button',{class:'btn sm',onclick:()=>guard(async()=>{if(!confirm('Купить «'+it.title+'» для '+name.value.trim()+' за '+num(it.price)+' 🪙?'))return;const r=await api('/api/shop/buy',{body:{item_id:it.id,game_name:name.value.trim()}});setCoins(r.total_coins);toast(r.status==='applied'?'Куплено и выдано':'Куплено, выдача в течение минуты');render()})},'Купить')));
+  if(d.purchases.length)main.append(card(h('h3',{},'Мои покупки'),d.purchases.map(p=>h('div',{class:'li'},h('span',{class:'grow'},p.item_title+' → '+p.game_name),h('small',{class:'muted'},({applied:'выдано',pending:'ожидает'})[p.status]||p.status)))))};
+VIEWS.quests=async main=>{
+  const q=await api('/api/quests');
+  if(!q.length){main.append(card(h('p',{class:'muted'},'Заданий пока нет')));return}
+  for(const x of q){const pr=Math.min(x.progress,x.target_value),pct=x.target_value?Math.round(100*pr/x.target_value):0;
+    main.append(card(h('b',{},x.title),x.description?h('p',{class:'muted'},x.description):null,h('div',{class:'bar'},h('i',{style:'width:'+pct+'%'})),
+      h('div',{class:'row between'},h('small',{class:'muted'},num(pr)+'/'+num(x.target_value)+' · награда '+num(x.reward_coins)+' 🪙'),
+        x.claimed?h('span',{class:'ok'},'✅ Получено'):x.completed?h('button',{class:'btn sm',onclick:()=>guard(async()=>{const r=await api('/api/quests/claim',{body:{quest_id:x.id}});setCoins(r.total_coins);toast('Получено '+num(r.reward_coins)+' монет!');render()})},'Забрать награду'):h('small',{class:'muted'},'В процессе'))))}};
+VIEWS.ach=async main=>{
+  if(!S.achCatalog)S.achCatalog=(await api('/api/achievements/catalog')).achievements;
+  const[mine,cn]=await Promise.all([api('/api/achievements/mine'),api('/api/achievement_counters/mine')]);
+  const got=new Map(mine.achievements.map(a=>[a.achievement_id,a.unlocked_at]));
+  const facts={total_launches:S.me.total_launches,total_play_minutes:S.me.total_playtime_minutes,...cn.counters};
+  main.append(card(h('b',{},'🏆 Получено: '+got.size+' из '+S.achCatalog.length)));
+  for(const a of S.achCatalog){const on=got.has(a.id);let prog='';
+    if(!on&&a.counter&&a.target){const v=Math.min(Number(facts[a.counter]||0),a.target);prog=h('div',{class:'bar'},h('i',{style:'width:'+Math.round(100*v/a.target)+'%'}))}
+    main.append(h('div',{class:'card ach'+(on?' on':'')},h('div',{class:'aic'},a.icon),h('div',{class:'grow'},h('b',{},a.title),h('p',{class:'muted'},a.desc),prog,on?h('small',{class:'ok'},'Получено '+fmtDate(got.get(a.id))):null)))}};
+VIEWS.top=async main=>{
+  const[t,w]=await Promise.all([api('/api/top?limit=20'),api('/api/top/weekly?limit=20')]);
+  const rows=(arr,f)=>arr.map(r=>h('div',{class:'li'},h('b',{class:'rank'},'#'+r.rank),h('span',{class:'grow',onclick:()=>openProfile(r.nickname)},dot(r.is_online),' ',r.nickname),h('small',{class:'muted'},f(r))));
+  main.append(card(h('h3',{},'🥇 Топ недели'),h('small',{class:'muted'},'Награды: '+(w.rewards||[]).map(num).join(' / ')+' 🪙 · минимум '+num(w.min_minutes)+' мин'+(w.seconds_left?' · осталось '+Math.floor(w.seconds_left/3600)+' ч':'')),
+    w.top.length?rows(w.top,r=>fmtMin(r.minutes)):h('p',{class:'muted'},'На этой неделе ещё никого')),
+    card(h('h3',{},'🏅 Топ за всё время'),rows(t.top,r=>fmtMin(r.playtime)+' · '+num(r.coins)+' 🪙')))};
+VIEWS.news=async main=>{
+  const d=await api('/api/news');
+  if(d.news.length){const mx=Math.max(...d.news.map(n=>n.id));ls.set('mafin_seen_news',String(mx))}
+  if(S.admin){const t=h('input',{placeholder:'Заголовок'}),b=h('textarea',{rows:3,placeholder:'Текст новости'});
+    main.append(card(h('h3',{},'Опубликовать новость'),t,b,h('button',{class:'btn sm',onclick:()=>guard(async()=>{await api('/api/news',{body:{title:t.value.trim(),body:b.value.trim()}});render()})},'📣 Опубликовать')))}
+  if(!d.news.length)main.append(card(h('p',{class:'muted'},'Новостей пока нет')));
+  for(const n of d.news){const c=card(h('div',{class:'row between'},h('b',{},n.title),h('small',{class:'muted'},fmtDate(n.created_at)+(n.edited?' (изм.)':''))),h('p',{class:'pre'},n.body),h('small',{class:'muted'},n.author||''));
+    if(S.admin)c.append(h('div',{class:'row'},h('button',{class:'btn sm ghost',onclick:()=>{const t=prompt('Заголовок',n.title);if(t==null)return;const b=prompt('Текст',n.body);if(b==null)return;guard(async()=>{await api('/api/news/'+n.id,{method:'PUT',body:{title:t,body:b}});render()})}},'✏️'),h('button',{class:'btn sm ghost',onclick:()=>{if(confirm('Удалить новость?'))guard(async()=>{await api('/api/news/'+n.id,{method:'DELETE'});render()})}},'🗑')));
+    main.append(c)}};
+VIEWS.skin=async main=>{
+  const name=h('input',{value:S.nick,maxlength:16,placeholder:'Игровой ник'});
+  const model=h('select',{},h('option',{value:'default'},'Обычная модель (Steve)'),h('option',{value:'slim'},'Тонкие руки (Alex)'));
+  const prev=h('img',{class:'skinprev',alt:''});const file=h('input',{type:'file',accept:'image/png'});
+  const info=h('p',{class:'muted'});let png=null;
+  const loadCur=async()=>{prev.removeAttribute('src');info.textContent='';
+    const r=await api('/api/skin/mine?game_name='+encodeURIComponent(name.value.trim()));
+    if(r.skin){const b=await fetch('/yggdrasil/textures/'+r.skin.hash);prev.src=URL.createObjectURL(await b.blob());model.value=r.skin.model;info.textContent='Текущий скин загружен'}else info.textContent='Скин для этого ника не загружен'};
+  file.onchange=()=>{const f=file.files[0];if(!f)return;const fr=new FileReader();fr.onload=()=>{const img=new Image();img.onload=()=>{if(!(img.width===64&&(img.height===64||img.height===32))){toast('Скин должен быть PNG 64×64 или 64×32',true);png=null;return}
+    png=fr.result.split(',')[1];prev.src=fr.result;info.textContent='Новый скин выбран, нажмите «Загрузить»'};img.src=fr.result};fr.readAsDataURL(f)};
+  main.append(card(h('h3',{},'🧍 Скин'),h('p',{class:'muted'},'Скин показывается на сервере вместе с модулем скинов лаунчера.'),name,model,file,prev,info,
+    h('div',{class:'row'},h('button',{class:'btn sm',onclick:()=>guard(async()=>{if(!png)throw new Error('Сначала выберите PNG-файл');await api('/api/skin/upload',{body:{game_name:name.value.trim(),model:model.value,png_b64:png}});png=null;toast('Скин загружен');await loadCur()})},'⬆️ Загрузить'),
+      h('button',{class:'btn sm ghost',onclick:()=>guard(async()=>{if(!confirm('Удалить скин?'))return;await api('/api/skin/delete',{body:{game_name:name.value.trim()}});toast('Скин удалён');await loadCur()})},'🗑 Удалить'),
+      h('button',{class:'btn sm ghost',onclick:()=>guard(loadCur)},'Обновить'))));
+  await loadCur()};
+VIEWS.cab=async main=>{
+  main.append(card(h('h3',{},'🎩 Личный кабинет'),h('p',{class:'muted'},'Просмотр скина с шапкой в 3D, покупка и настройка шапки стрелками.'),h('a',{class:'btn wide',href:'/cabinet'},'Открыть кабинет')))};
+VIEWS.tg=async main=>{
+  const d=await api('/api/tg/status');
+  for(const[bot,s]of Object.entries(d)){const box=card(h('h3',{},'✈️ '+s.title));
+    if(!s.enabled)box.append(h('p',{class:'muted'},'Бот не настроен на сервере'));
+    else if(s.linked)box.append(h('p',{class:'ok'},'✅ Привязан'),h('p',{class:'muted'},'Уведомления: друзья '+(s.notify_friends?'вкл':'выкл')+', новости '+(s.notify_news?'вкл':'выкл')+'. Настройки меняются командами бота.'),
+      h('button',{class:'btn sm ghost',onclick:()=>guard(async()=>{await api('/api/tg/unlink',{body:{bot}});render()})},'Отвязать'));
+    else box.append(h('p',{class:'muted'},'Не привязан. Бот присылает уведомления о друзьях и новостях, показывает профиль, топ, магазин и шапки.'),
+      h('button',{class:'btn sm',onclick:()=>guard(async()=>{const r=await api('/api/tg/link',{body:{bot}});window.location.href=r.url})},'🔗 Привязать'));
+    main.append(box)}};
+VIEWS.server=async main=>{
+  const s=await api('/api/mc/status');
+  main.append(card(h('h3',{},'⛏ '+(s.name||'Сервер')),h('p',{},dot(s.running&&s.ready),s.running&&s.ready?' Работает':' Недоступен'),stat('Адрес',s.address||'—'),stat('Игроков',(s.players_online||0)+' / '+(s.players_max||0)),stat('Версия',s.version||(s.version_min?(s.version_min+' – '+s.version_max):'—')),s.description?h('p',{class:'muted'},s.description):null,
+    h('button',{class:'btn sm',onclick:()=>{try{navigator.clipboard.writeText(s.address);toast('Адрес скопирован')}catch(e){toast(s.address)}}},'📋 Скопировать адрес')));
+  const mp=await api('/api/modpack').catch(()=>null);
+  if(mp&&mp.modpack)main.append(card(h('h3',{},'🧩 Сборка сервера'),stat('Название',mp.modpack.name||'—'),stat('Minecraft',mp.modpack.mc_version),stat('Загрузчик',(mp.modpack.loader||'vanilla')+(mp.modpack.loader_version?' '+mp.modpack.loader_version:'')),stat('Файлов',(mp.modpack.files||[]).length),h('p',{class:'muted'},'Установка сборки — в приложении лаунчера.')))};
+VIEWS.admin=async main=>{
+  if(!S.admin){main.append(card(h('p',{class:'muted'},'Нет доступа')));return}
+  const[st,ps]=await Promise.all([api('/api/admin/stats'),api('/api/admin/profiles')]);
+  main.append(card(h('h3',{},'🛡 Статистика'),stat('Игроков',st.total_profiles),stat('Забанено',st.total_banned),stat('Админов',st.total_admins),stat('Время в игре',fmtMin(st.total_playtime_minutes)),stat('Монет у игроков',num(st.total_coins))));
+  const q=h('input',{placeholder:'Фильтр по нику'}),list=h('div',{});
+  const draw=()=>{list.replaceChildren();const f=q.value.trim().toLowerCase();
+    for(const p of ps.filter(x=>x.nickname.toLowerCase().includes(f)).slice(0,60)){
+      const act=(label,fn,cls)=>h('button',{class:'btn sm '+(cls||'ghost'),onclick:()=>guard(async()=>{await fn();ps.splice(0,ps.length,...await api('/api/admin/profiles'));draw()})},label);
+      const row=h('div',{class:'card'},h('div',{class:'row between'},h('b',{},dot(p.is_online),' ',p.nickname,p.is_admin?' 🛡':'',p.is_banned?' ⛔':''),h('small',{class:'muted'},num(p.coins)+' 🪙 · '+fmtMin(p.total_playtime_minutes))),
+        h('small',{class:'muted'},'Запусков: '+p.total_launches+' · вход: '+fmtDate(p.last_login)+(p.ban_reason?' · причина бана: '+p.ban_reason:'')),
+        h('div',{class:'row wrap'},p.nickname===S.nick?null:[
+          p.is_banned?act('Разбанить',()=>api('/api/admin/unban',{body:{nickname:p.nickname}})):act('Забанить',()=>{const r=prompt('Причина бана','');if(r===null)throw new Error('Отменено');return api('/api/admin/ban',{body:{nickname:p.nickname,reason:r}})}),
+          p.is_admin?act('Снять админа',()=>api('/api/admin/remove_admin',{body:{nickname:p.nickname}})):act('Сделать админом',()=>api('/api/admin/make_admin',{body:{nickname:p.nickname}})),
+          act('Удалить',()=>{if(!confirm('Удалить аккаунт '+p.nickname+' безвозвратно?'))throw new Error('Отменено');return api('/api/admin/delete_account',{body:{nickname:p.nickname}})})]));
+      list.append(row)}};
+  q.oninput=draw;draw();
+  main.append(card(h('h3',{},'Игроки'),q),list);
+  const logs=await api('/api/admin/logs?limit=40');
+  main.append(card(h('h3',{},'Журнал'),logs.map(l=>h('div',{class:'li log'},h('small',{class:'muted'},fmtDate(l.created_at)),h('span',{class:'grow'},(l.action||'')+' · '+(l.nickname||'')+' · '+(l.details||''))))))};
+render();
+"""
+
+HUB_HTML = (
+    '<!doctype html><html lang="ru"><head><meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+    '<meta name="theme-color" content="#23272e"><title>Mafin</title><style>' + HUB_CSS + '</style></head>'
+    '<body><div id="app"></div><script>' + HUB_JS + '</script></body></html>'
+)
+
+ACHIEVEMENT_CATALOG = json.loads(r'''[{"id":"launch_1","icon":"🎮","title":"Первый запуск","desc":"Запустите Minecraft через лаунчер в первый раз","counter":"total_launches","target":1.0},{"id":"launch_10","icon":"🕹️","title":"Разогрелся","desc":"Запустите игру 10 раз","counter":"total_launches","target":10.0},{"id":"launch_50","icon":"🔥","title":"Завсегдатай","desc":"Запустите игру 50 раз","counter":"total_launches","target":50.0},{"id":"launch_200","icon":"🏰","title":"Домосед","desc":"Запустите игру 200 раз","counter":"total_launches","target":200.0},{"id":"launch_1000","icon":"👑","title":"Легенда лаунчера","desc":"Запустите игру 1000 раз","counter":"total_launches","target":1000.0},{"id":"time_30m","icon":"⏱️","title":"Полчаса как один миг","desc":"Наиграйте суммарно 30 минут","counter":"total_play_minutes","target":30.0},{"id":"time_5h","icon":"⏳","title":"Погружение","desc":"Наиграйте суммарно 5 часов","counter":"total_play_minutes","target":300.0},{"id":"time_10h","icon":"🕰️","title":"Втянулся","desc":"Наиграйте суммарно 10 часов","counter":"total_play_minutes","target":600.0},{"id":"time_24h","icon":"🌍","title":"Целые сутки","desc":"Наиграйте суммарно 24 часа","counter":"total_play_minutes","target":1440.0},{"id":"time_100h","icon":"🏆","title":"Ветеран","desc":"Наиграйте суммарно 100 часов","counter":"total_play_minutes","target":6000.0},{"id":"time_500h","icon":"🌟","title":"Легенда Minecraft","desc":"Наиграйте суммарно 500 часов","counter":"total_play_minutes","target":30000.0},{"id":"versions_installed_1","icon":"📦","title":"Первая установка","desc":"Установите свою первую версию Minecraft","counter":"versions_installed","target":1.0},{"id":"versions_installed_5","icon":"📦","title":"Коллекционер версий","desc":"Установите 5 разных версий Minecraft","counter":"versions_installed","target":5.0},{"id":"versions_installed_20","icon":"🗃️","title":"Архив версий","desc":"Установите 20 разных версий Minecraft","counter":"versions_installed","target":20.0},{"id":"distinct_launched_3","icon":"🔀","title":"Разнообразие","desc":"Запустите 3 разные версии Minecraft","counter":"distinct_versions_launched","target":3.0},{"id":"distinct_launched_10","icon":"🎲","title":"Испытатель версий","desc":"Запустите 10 разных версий Minecraft","counter":"distinct_versions_launched","target":10.0},{"id":"same_version_20","icon":"💎","title":"Верность выбору","desc":"Запустите одну и ту же версию 20 раз","counter":"max_single_version_launches","target":20.0},{"id":"legacy_launch","icon":"🦕","title":"Археолог","desc":"Запустите очень старую версию Minecraft (alpha/beta/classic)","counter":"legacy_launches","target":1.0},{"id":"prerelease_launch","icon":"🧪","title":"Тестировщик","desc":"Запустите снапшот, pre-release или RC версию","counter":"prerelease_launches","target":1.0},{"id":"forge_install","icon":"⚒️","title":"Модостроитель","desc":"Установите Forge","counter":"forge_installs","target":1.0},{"id":"fabric_install","icon":"🧵","title":"Фабрикант","desc":"Установите Fabric","counter":"fabric_installs","target":1.0},{"id":"both_loaders","icon":"🛠️","title":"Универсал","desc":"Установите и Forge, и Fabric"},{"id":"mods_1","icon":"🧩","title":"Первый мод","desc":"Добавьте свой первый мод","counter":"mods_installed","target":1.0},{"id":"mods_10","icon":"🧰","title":"Моддер","desc":"Добавьте 10 модов","counter":"mods_installed","target":10.0},{"id":"mods_50","icon":"🏗️","title":"Сборкодел","desc":"Добавьте 50 модов","counter":"mods_installed","target":50.0},{"id":"resourcepack_1","icon":"🎨","title":"Художник","desc":"Добавьте свой первый ресурспак","counter":"resourcepacks_installed","target":1.0},{"id":"resourcepack_5","icon":"🖼️","title":"Куратор текстур","desc":"Добавьте 5 ресурспаков","counter":"resourcepacks_installed","target":5.0},{"id":"skin_change_1","icon":"👕","title":"Новый образ","desc":"Смените скин персонажа","counter":"skins_changed","target":1.0},{"id":"skin_change_5","icon":"🧥","title":"Модник","desc":"Смените скин 5 раз","counter":"skins_changed","target":5.0},{"id":"accounts_2","icon":"👥","title":"Не один","desc":"Добавьте второй аккаунт","counter":"accounts_count","target":2.0},{"id":"accounts_5","icon":"👨‍👩‍👧‍👦","title":"Целая семья","desc":"Добавьте 5 аккаунтов","counter":"accounts_count","target":5.0},{"id":"server_add_1","icon":"🌐","title":"В сеть","desc":"Добавьте свой первый сервер","counter":"servers_added_total","target":1.0},{"id":"server_add_10","icon":"🗺️","title":"Коллекционер серверов","desc":"Добавьте 10 серверов","counter":"servers_added_total","target":10.0},{"id":"server_ping","icon":"📶","title":"Разведчик","desc":"Проверьте пинг сервера","counter":"server_pings","target":1.0},{"id":"p2p_host_1","icon":"🏠","title":"Гостеприимный хозяин","desc":"Создайте P2P-комнату для друзей","counter":"p2p_host_count","target":1.0},{"id":"p2p_host_10","icon":"🏟️","title":"Хост со стажем","desc":"Создайте P2P-комнату 10 раз","counter":"p2p_host_count","target":10.0},{"id":"p2p_join_1","icon":"🚪","title":"В гости","desc":"Подключитесь к другу через P2P","counter":"p2p_join_count","target":1.0},{"id":"logs_cleaned","icon":"🧹","title":"Чистюля","desc":"Очистите старые логи","counter":"logs_cleaned","target":1.0},{"id":"smart_cleanup_1","icon":"✨","title":"Генеральная уборка","desc":"Запустите умную очистку временных файлов","counter":"smart_cleanups","target":1.0},{"id":"smart_cleanup_10","icon":"🧼","title":"Порядок превыше всего","desc":"Запустите умную очистку 10 раз","counter":"smart_cleanups","target":10.0},{"id":"orphan_cleanup","icon":"🗑️","title":"Ничего лишнего","desc":"Очистите неиспользуемые ассеты","counter":"orphan_asset_cleanups","target":1.0},{"id":"export_profile","icon":"💾","title":"Архивариус","desc":"Экспортируйте профиль лаунчера","counter":"exports","target":1.0},{"id":"import_profile","icon":"📥","title":"Реставратор","desc":"Импортируйте профиль лаунчера","counter":"imports","target":1.0},{"id":"theme_change","icon":"🎭","title":"Стиль важен","desc":"Смените тему лаунчера","counter":"theme_changes","target":1.0},{"id":"java_custom","icon":"☕","title":"Технарь","desc":"Укажите свою Java вручную в настройках","counter":"java_path_customized","target":1.0},{"id":"memory_custom","icon":"🧠","title":"Оптимизатор","desc":"Измените выделение ОЗУ по умолчанию","counter":"memory_customized","target":1.0},{"id":"dir_custom","icon":"📁","title":"Своя папка","desc":"Смените папку установки игры","counter":"dir_customized","target":1.0},{"id":"search_used","icon":"🔎","title":"Следопыт","desc":"Воспользуйтесь поиском версий","counter":"search_used","target":1.0},{"id":"hotkey_used","icon":"⌨️","title":"Скорострел","desc":"Воспользуйтесь горячей клавишей лаунчера","counter":"hotkey_used","target":1.0},{"id":"night_owl_1","icon":"🌙","title":"Полуночник","desc":"Запустите игру ночью (00:00-05:00)","counter":"night_launches","target":1.0},{"id":"night_owl_10","icon":"🦉","title":"Сова","desc":"Запустите игру ночью 10 раз","counter":"night_launches","target":10.0},{"id":"weekend_gamer","icon":"🎉","title":"Выходной день","desc":"Запустите игру по выходным 5 раз","counter":"weekend_launches","target":5.0},{"id":"crash_recovery","icon":"🩹","title":"Не сдаюсь","desc":"Успешно перезапустите игру после сбоя","counter":"crash_recoveries","target":1.0},{"id":"discord_online","icon":"💬","title":"На связи","desc":"Подключитесь к Discord Rich Presence","counter":"discord_connected","target":1.0},{"id":"collector_25","icon":"🥈","title":"На полпути","desc":"Разблокируйте 25 других ачивок","counter":"unlocked_count","target":25.0},{"id":"collector_all","icon":"🥇","title":"Всё собрал","desc":"Разблокируйте все остальные ачивки"}]''')
+
+
+@app.route('/m', methods=['GET'])
+@app.route('/m/', methods=['GET'])
+@app.route('/mobile', methods=['GET'])
+def site_hub():
+    resp = app.response_class(HUB_HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
+@app.route('/api/achievements/catalog', methods=['GET'])
+def achievements_catalog():
+    return jsonify({"achievements": ACHIEVEMENT_CATALOG})
 
 
 SKIN_MAX_BYTES = 256 * 1024
@@ -7575,8 +8076,8 @@ load();
 
 
 
-TG_PROD_TOKEN_CODE = "токен бота прод"
-TG_TEST_TOKEN_CODE = "токен бота тест (dc2)/test"
+TG_PROD_TOKEN_CODE = ""
+TG_TEST_TOKEN_CODE = ""
 TG_PROD_NEWS_CHAT_CODE = ""
 TG_TEST_NEWS_CHAT_CODE = ""
 
