@@ -182,6 +182,13 @@ def animate_image_on_label(label, image_bytes, max_px=96, circular=False):
     label.after(durations[0], step)
 
 
+if "--autostart" in sys.argv:
+    try:
+        os.chdir(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)))
+    except OSError:
+        pass
+
+
 def _resolve_config_path():
     name = "launcher_config.json"
     base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
@@ -196,7 +203,7 @@ def _resolve_config_path():
 
 CONFIG_FILE = _resolve_config_path()
 
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.4"
 
 
 def _sha256_file(path):
@@ -866,6 +873,8 @@ DEFAULT_CONFIG = {
     "java_path": "java",
     "memory_mb": 2048,
     "auto_memory": False,
+    "autostart": False,
+    "discord_rpc": True,
     "jvm_preset": "default",
     "last_version": "",
     "accounts": [],
@@ -1755,6 +1764,15 @@ class StatsManager:
     def add_play_time(self, minutes):
         self.stats["total_play_time_minutes"] += minutes
 
+    def reset(self):
+        """Сбрасывает локальные итоги (при смене аккаунта, чтобы не унаследовать чужие запуски)."""
+        self.stats = {
+            "total_launches": 0,
+            "total_play_time_minutes": 0,
+            "versions_launched": {},
+            "last_launch": None,
+        }
+
     def adopt_server_totals(self, total_launches, total_play_minutes):
         if total_launches is not None:
             self.stats["total_launches"] = max(self.stats["total_launches"], total_launches)
@@ -1951,6 +1969,7 @@ class AchievementManager:
         self.data["unlocked"] = {}
         self.data["counters"] = {}
         self.data["owner"] = None
+        self.stats.reset()
 
     def ensure_owner(self, nickname):
         if not nickname:
@@ -1959,6 +1978,7 @@ class AchievementManager:
             self.data["unlocked"] = {}
             self.data["counters"] = {}
             self.data["owner"] = nickname
+            self.stats.reset()
 
     def mark_unlocked_silent(self, achievement_id, when=None):
         if achievement_id in self.data["unlocked"]:
@@ -2198,6 +2218,91 @@ def _log_discord(message):
         pass
 
 
+
+_AUTOSTART_NAME = "MafinLauncher"
+
+
+def _autostart_argv():
+    """Команда запуска лаунчера для автозагрузки (с флагом --autostart: окно стартует свёрнутым)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--autostart"]
+    exe = sys.executable
+    if os.name == "nt":
+        pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pyw):
+            exe = pyw
+    return [exe, os.path.abspath(__file__), "--autostart"]
+
+
+def _autostart_path_linux():
+    return os.path.join(os.path.expanduser("~"), ".config", "autostart", "mafin-launcher.desktop")
+
+
+def _schtasks(*args):
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(["schtasks"] + list(args), capture_output=True, text=True, creationflags=flags, timeout=30)
+
+
+def _win_run_key(enabled, cmd=""):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+        if enabled:
+            winreg.SetValueEx(k, _AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(k, _AUTOSTART_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def is_autostart_enabled():
+    try:
+        if os.name == "nt":
+            if _schtasks("/query", "/tn", _AUTOSTART_NAME).returncode == 0:
+                return True
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+                winreg.QueryValueEx(k, _AUTOSTART_NAME)
+            return True
+        if sys.platform.startswith("linux"):
+            return os.path.exists(_autostart_path_linux())
+    except Exception:
+        pass
+    return False
+
+
+def set_autostart(enabled):
+    try:
+        if os.name == "nt":
+            cmd = subprocess.list2cmdline(_autostart_argv())
+            workdir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+            if not enabled:
+                _schtasks("/delete", "/tn", _AUTOSTART_NAME, "/f")
+                _win_run_key(False)
+                return True, ""
+            r = _schtasks("/create", "/tn", _AUTOSTART_NAME, "/tr", cmd, "/sc", "onlogon",
+                          "/delay", "0000:15", "/rl", "limited", "/f")
+            if r.returncode == 0:
+                _win_run_key(False)
+                return True, ""
+            _win_run_key(True, cmd)
+            return True, ""
+        if sys.platform.startswith("linux"):
+            path = _autostart_path_linux()
+            if enabled:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                exec_line = " ".join('"%s"' % a.replace('"', '\\"') for a in _autostart_argv())
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("[Desktop Entry]\nType=Application\nName=Mafin Launcher\nExec=%s\n"
+                            "X-GNOME-Autostart-enabled=true\nTerminal=false\n" % exec_line)
+            elif os.path.exists(path):
+                os.remove(path)
+            return True, ""
+        return False, "Автозапуск поддерживается только в Windows и Linux"
+    except Exception as e:
+        return False, str(e)
+
+
 class DiscordRPC:
 
     def __init__(self, client_id=""):
@@ -2213,6 +2318,9 @@ class DiscordRPC:
         self._server = None
         self._world = None
         self._gamemode = None
+        self.enabled = True
+        self._last_args = None
+        self._reconnecting = False
 
     def is_available(self):
         return bool(self.client_id)
@@ -2308,6 +2416,7 @@ class DiscordRPC:
 
     def update(self, state=None, details=None, start=None,
                large_image="launcher_icon", large_text="Mafin Launcher"):
+        self._last_args = (state, details, start, large_image, large_text)
         if not self.connected or not self.rpc:
             return
         try:
@@ -2318,6 +2427,36 @@ class DiscordRPC:
         except Exception as e:
             print("Discord RPC: не удалось обновить статус:", e)
             self.connected = False
+            self._start_reconnect()
+
+    def _start_reconnect(self):
+        """Discord перезапустили или связь пропала: пробуем подключиться снова и вернуть последний статус."""
+        if self._reconnecting or not self.enabled:
+            return
+        self._reconnecting = True
+
+        def work():
+            try:
+                for _ in range(40):
+                    time.sleep(15)
+                    if not self.enabled:
+                        return
+                    with self._lock:
+                        try:
+                            if self.rpc:
+                                self.rpc.close()
+                        except Exception:
+                            pass
+                        self.rpc = None
+                    if self.connect(retries=1, delay=0):
+                        if self._last_args:
+                            self.update(*self._last_args)
+                        _log_discord("Discord RPC: соединение восстановлено")
+                        return
+            finally:
+                self._reconnecting = False
+
+        threading.Thread(target=work, daemon=True).start()
 
     def clear(self):
         if self.connected and self.rpc:
@@ -5420,7 +5559,7 @@ class ServerPackDialog(tk.Toplevel):
                     mgr.prune(int(app.config.get("pack_backup_keep", 5)))
                     self._ui(lambda: self._say("Сделан бэкап сборки перед обновлением"))
                 except Exception as e:
-                    self._ui(lambda: self._say(f"⚠ бэкап не сделан: {e}"))
+                    self._ui(lambda e=e: self._say(f"⚠ бэкап не сделан: {e}"))
 
             def progress(n, total, name):
                 def upd():
@@ -5436,7 +5575,7 @@ class ServerPackDialog(tk.Toplevel):
             serverpack_save_state(pack_dir, new_state)
             self._ui(lambda: self._finished(pk, failed))
         except Exception as e:
-            self._ui(lambda: self._finished(pk, [str(e)]))
+            self._ui(lambda e=e: self._finished(pk, [str(e)]))
 
     def _finished(self, pk, failed):
         self.busy = False
@@ -6723,7 +6862,10 @@ class LauncherApp:
         self._achievements_restore_pending = False
 
         self.discord = DiscordRPC(DISCORD_CLIENT_ID)
-        if self.discord.is_available():
+        self.discord.enabled = bool(self.config.get("discord_rpc", True))
+        if not self.discord.enabled:
+            _log_discord("Discord RPC выключен в настройках лаунчера")
+        elif self.discord.is_available():
             _log_discord("Инициализация Discord RPC")
             threading.Thread(target=self._init_discord_rpc, daemon=True).start()
         else:
@@ -6894,6 +7036,33 @@ class LauncherApp:
                 pass
         self.root.after(80, check)
 
+    def _on_autostart_toggle(self):
+        want = bool(self.autostart_var.get())
+        ok, err = set_autostart(want)
+        if not ok:
+            self.autostart_var.set(not want)
+            messagebox.showerror("Автозапуск", f"Не удалось {'включить' if want else 'выключить'} автозапуск:\n{err}")
+            return
+        self.config["autostart"] = want
+        save_json_file(CONFIG_FILE, self.config)
+
+    def _on_discord_toggle(self):
+        want = bool(self.discord_rpc_var.get())
+        self.discord.enabled = want
+        self.config["discord_rpc"] = want
+        save_json_file(CONFIG_FILE, self.config)
+        if want:
+            if self.discord.is_available() and not self.discord.connected:
+                threading.Thread(target=self._init_discord_rpc, daemon=True).start()
+        else:
+            def _off():
+                try:
+                    self.discord.clear()
+                    self.discord.close()
+                except Exception:
+                    pass
+            threading.Thread(target=_off, daemon=True).start()
+
     def _on_tray_settings(self):
         self.config["tray_on_minimize"] = bool(self.tray_min_var.get())
         self.config["tray_on_close"] = bool(self.tray_close_var.get())
@@ -6950,10 +7119,15 @@ class LauncherApp:
             return
 
         def work():
-            try:
-                self.api.bump_achievement_counters(deltas=deltas, set_values=set_values)
-            except Exception as e:
-                print(f"Не удалось синхронизировать счётчик ачивок с сервером: {e}")
+            for attempt in range(1, 5):
+                try:
+                    status, _data = self.api.bump_achievement_counters(deltas=deltas, set_values=set_values)
+                    if status == 200 or status in (400, 401, 403, 404):
+                        return
+                    raise RuntimeError(f"status={status}")
+                except Exception as e:
+                    print(f"Не удалось синхронизировать счётчик ачивок с сервером (попытка {attempt}): {e}")
+                    time.sleep(min(3 * attempt, 12))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -6981,29 +7155,44 @@ class LauncherApp:
             time.sleep(delay)
             self._sync_achievement_to_server(achievement_id, attempt=attempt + 1, max_attempts=max_attempts)
 
-    def _sync_achievements_from_server(self):
+    def _sync_achievements_from_server(self, attempt=1):
+        """Подтягивает с сервера итоги, счётчики и уже полученные ачивки.
+        Пока ВСЕ три запроса не удались, проверку ачивок не запускаем (_achievements_restore_pending остаётся True):
+        иначе при плохом интернете локальные данные пустые и выдаются заново все ачивки «с первой»."""
         if not self.api.is_logged_in():
+            self._achievements_restore_pending = False
             return
+        owner = self.api.nickname
+        ok = False
         try:
-            status, me_data = self.api.me()
-            if status == 200:
+            st_me, me_data = self.api.me()
+            st_cnt, counters_data = self.api.my_achievement_counters()
+            st_ach, data = self.api.my_achievements()
+            if st_me == 200 and st_cnt == 200 and st_ach == 200 \
+                    and isinstance(data, dict) and isinstance(counters_data, dict) and isinstance(me_data, dict):
+                if self.api.nickname != owner or self.achievements.data.get("owner") != owner:
+                    return
                 self.stats.adopt_server_totals(
                     me_data.get("total_launches"), me_data.get("total_playtime_minutes"))
-            status, counters_data = self.api.my_achievement_counters()
-            if status == 200:
                 self.achievements.adopt_server_counters(counters_data.get("counters"))
-            status, data = self.api.my_achievements()
-            if status != 200:
-                return
-            for entry in data.get("achievements", []):
-                self.achievements.mark_unlocked_silent(entry["achievement_id"], entry.get("unlocked_at"))
-            if hasattr(self, "_ach_list_frame"):
-                self.root.after(0, self.refresh_achievements)
+                for entry in data.get("achievements", []):
+                    self.achievements.mark_unlocked_silent(entry["achievement_id"], entry.get("unlocked_at"))
+                ok = True
+            else:
+                print(f"Ачивки: сервер ответил {st_me}/{st_cnt}/{st_ach}, повторю позже")
         except Exception as e:
             print(f"Не удалось загрузить ачивки с сервера: {e}")
-        finally:
-            self._achievements_restore_pending = False
-            self.root.after(0, self._check_achievements)
+        if not ok:
+            if self.api.is_logged_in() and self.api.nickname == owner:
+                delay = min(5 * attempt, 60)
+                t = threading.Timer(delay, lambda: self._sync_achievements_from_server(attempt + 1))
+                t.daemon = True
+                t.start()
+            return
+        self._achievements_restore_pending = False
+        if hasattr(self, "_ach_list_frame"):
+            self.root.after(0, self.refresh_achievements)
+        self.root.after(0, self._check_achievements)
 
     def _render_achievement_toast(self, achievement):
         toast = tk.Toplevel(self.root)
@@ -12111,6 +12300,18 @@ class LauncherApp:
                             ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
 
         row += 1
+        self.autostart_var = tk.BooleanVar(value=is_autostart_enabled())
+        ttk.Checkbutton(frame, text="Запускать лаунчер вместе с системой",
+                        variable=self.autostart_var, command=self._on_autostart_toggle
+                        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
+
+        row += 1
+        self.discord_rpc_var = tk.BooleanVar(value=bool(self.config.get("discord_rpc", True)))
+        ttk.Checkbutton(frame, text="Показывать статус в Discord (Rich Presence)",
+                        variable=self.discord_rpc_var, command=self._on_discord_toggle
+                        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
+
+        row += 1
         ttk.Label(frame, text="Акцентный цвет:").grid(row=row, column=0, sticky="w", pady=5, padx=10)
         current_theme = self.config.get("launcher_theme", DEFAULT_LAUNCHER_THEME)
         self._theme_labels = {v["label"]: k for k, v in LAUNCHER_THEMES.items()}
@@ -12535,7 +12736,7 @@ class LauncherApp:
                         self.root.after(0, self.on_version_select)
                 self.root.after(0, update_ui)
             except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось загрузить версии: {e}"))
+                self.root.after(0, lambda e=e: messagebox.showerror("Ошибка", f"Не удалось загрузить версии: {e}"))
 
         self.root.after(100, lambda: threading.Thread(target=fetch, daemon=True).start())
 
@@ -13166,9 +13367,42 @@ def main():
     splash.close()
 
     root.deiconify()
+    try:
+        root.iconbitmap(default=resource_path("icon.ico"))
+    except Exception:
+        pass
     app = LauncherApp(root)
+    try:
+        if app.config.get("autostart") and os.name == "nt":
+            threading.Thread(target=set_autostart, args=(True,), daemon=True).start()
+    except Exception:
+        pass
     root.mainloop()
 
 
+def _write_crash_log(text):
+    for base in (_app_base_dir(), os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MafinLauncher"), tempfile.gettempdir()):
+        try:
+            os.makedirs(base, exist_ok=True)
+            path = os.path.join(base, "launcher_crash.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n{text}\n")
+            return path
+        except OSError:
+            continue
+    return None
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        _tb = traceback.format_exc()
+        _path = _write_crash_log(_tb)
+        try:
+            _r = tk.Tk()
+            _r.withdraw()
+            messagebox.showerror("Mafin Launcher", "Лаунчер упал при запуске.\n\n" + _tb[-900:] + (f"\nЖурнал: {_path}" if _path else ""))
+        except Exception:
+            pass
+        raise
