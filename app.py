@@ -192,6 +192,12 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS browser_sync (
+            nickname TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS login_days (
             nickname TEXT NOT NULL,
             day TEXT NOT NULL,
@@ -911,6 +917,7 @@ def _client_ip():
     """IP клиента. За обратным прокси задайте MAFIN_TRUST_PROXY=1 — тогда берётся X-Forwarded-For."""
     xff = request.headers.get("X-Forwarded-For", "")
     real = request.headers.get("X-Real-IP", "")
+                                                                                                   
     local = _normalize_ip(request.remote_addr) in ("127.0.0.1", "::1", "localhost")
     if xff and (os.environ.get("MAFIN_TRUST_PROXY") == "1" or local):
         return _normalize_ip(xff.split(",")[0])
@@ -1566,6 +1573,38 @@ def gifts_received(nickname):
     return jsonify({"gifts": gifts, "hidden": False})
 
 
+@app.route('/api/browser/sync', methods=['GET'])
+@auth_required
+def browser_sync_get():
+    row = get_db().execute("SELECT data, updated_at FROM browser_sync WHERE nickname = ?",
+                           (g.current_profile['nickname'],)).fetchone()
+    if not row:
+        return jsonify({"data": None, "updated_at": 0})
+    return jsonify({"data": json.loads(row['data']), "updated_at": row['updated_at']})
+
+
+@app.route('/api/browser/sync', methods=['PUT'])
+@auth_required
+def browser_sync_put():
+    raw = request.get_data()
+    if len(raw) > 2 * 1024 * 1024:
+        return jsonify({"error": "Слишком большой объём данных"}), 413
+    try:
+        body = json.loads(raw)
+        data = body["data"]
+        if not isinstance(data, dict):
+            raise ValueError
+    except Exception:
+        return jsonify({"error": "Неверный формат"}), 400
+    now = int(time.time())
+    db = get_db()
+    db.execute("INSERT INTO browser_sync (nickname, data, updated_at) VALUES (?, ?, ?) "
+               "ON CONFLICT(nickname) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+               (g.current_profile['nickname'], json.dumps(data, ensure_ascii=False), now))
+    db.commit()
+    return jsonify({"success": True, "updated_at": now})
+
+
 @app.route('/api/news', methods=['GET'])
 def get_news():
     db = get_db()
@@ -1784,6 +1823,7 @@ tr:hover{background:#2d323c}
   <section>
     <h2>📦 Обновления лаунчера</h2>
     {% if upload_error %}<div class="err" style="margin-bottom:14px">{{ upload_error }}</div>{% endif %}
+    {% if upload_ok %}<div style="margin-bottom:14px;padding:10px 14px;border-radius:8px;background:#163a27;color:#7ee2a8">{{ upload_ok }}</div>{% endif %}
     <form class="upload-form" method="post" action="/admin/updates/upload" enctype="multipart/form-data">
       <label style="display:flex;align-items:center;gap:6px;margin:6px 0;font-size:13px;color:#c8d0e0">
         <input type="checkbox" name="mobile" value="1"
@@ -1884,6 +1924,26 @@ tr:hover{background:#2d323c}
       {% else %}
       <tr><td colspan="8" class="muted">Обновлений ещё не загружено.</td></tr>
       {% endfor %}
+    </table>
+    <h3 style="margin:22px 0 8px">📱 Мобильная версия (Android)</h3>
+    <table>
+      <tr><th>Файл</th><th>Размер</th><th>Загружено</th><th>SHA-256</th><th>Действия</th></tr>
+      {% if mobile %}
+      <tr>
+        <td>{{ mobile.name }}</td>
+        <td>{{ mobile.size_mb }} МБ</td>
+        <td class="muted">{{ mobile.when }}</td>
+        <td class="muted">{{ mobile.sha }}…</td>
+        <td class="actions">
+          <a href="/download/mobile" style="margin-right:10px">Скачать</a>
+          <form method="post" action="/admin/mobile/delete" onsubmit="return confirm('Удалить APK мобильной версии?');">
+            <button type="submit" class="danger">Удалить</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">APK ещё не загружен.</td></tr>
+      {% endif %}
     </table>
   </section>
 
@@ -4097,10 +4157,21 @@ def admin_dashboard():
         "total_admins": db.execute("SELECT COUNT(*) FROM profiles WHERE is_admin = 1").fetchone()[0],
     }
     upload_error = session.pop('upload_error', None)
+    upload_ok = session.pop('upload_ok', None)
     pw_msg = session.pop('pw_msg', None)
+    mobile = None
+    apk = _site_mobile_apk()
+    if apk:
+        st = os.stat(apk)
+        h = hashlib.sha256()
+        with open(apk, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b''):
+                h.update(chunk)
+        mobile = {"name": MOBILE_APK_NAME, "size_mb": round(st.st_size / 1024 / 1024, 1),
+                  "when": datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M'), "sha": h.hexdigest()[:12]}
     return render_template_string(
-        DASHBOARD_TEMPLATE, profiles=profiles, updates=updates, stats=stats, me=g.web_admin,
-        upload_error=upload_error, pw_msg=pw_msg,
+        DASHBOARD_TEMPLATE, profiles=profiles, updates=updates, stats=stats, me=g.web_admin, mobile=mobile,
+        upload_error=upload_error, upload_ok=upload_ok, pw_msg=pw_msg,
         has_password=(g.web_admin['password_hash'] != '!')
     )
 
@@ -4304,7 +4375,7 @@ def web_upload_chunk():
         return jsonify({"error": "bad offset"}), 400
     os.makedirs(CHUNKS_DIR, exist_ok=True)
     now = time.time()
-    for fn in os.listdir(CHUNKS_DIR):
+    for fn in os.listdir(CHUNKS_DIR):                                                         
         fp = os.path.join(CHUNKS_DIR, fn)
         try:
             if now - os.path.getmtime(fp) > 86400:
@@ -4317,7 +4388,7 @@ def web_upload_chunk():
         size = 0
         open(path, 'wb').close()
     if offset != size:
-        return jsonify({"error": "offset mismatch", "size": size}), 409
+        return jsonify({"error": "offset mismatch", "size": size}), 409                              
     data = request.get_data(cache=False)
     if size + len(data) > MAX_UPDATE_SIZE_BYTES:
         return jsonify({"error": "file too large"}), 413
@@ -4340,6 +4411,7 @@ def web_upload_update():
         dst = os.path.join(DOWNLOADS_DIR, MOBILE_APK_NAME)
         os.replace(tmp, dst)
         log_action("upload_mobile_apk", g.web_admin['nickname'], f"{os.path.getsize(dst)} байт")
+        session['upload_ok'] = f"📱 Мобильная версия загружена ({os.path.getsize(dst) / 1024 / 1024:.1f} МБ). Она доступна по /download/mobile и в проверке обновлений мобильного лаунчера."
         return redirect(url_for('admin_dashboard'))
     version = request.form.get('version', '').strip()
     changelog = request.form.get('changelog', '').strip()
@@ -4398,6 +4470,18 @@ def web_upload_update():
     db.commit()
     extra_log = f", доп. файл {extra_safe_name} ({extra_size} байт)" if extra_safe_name else ""
     log_action("upload_update", g.web_admin['nickname'], f"v{version} ({safe_name}, {file_size} байт){extra_log}")
+    session['upload_ok'] = f"✅ Версия {version} загружена и сделана активной ({file_size / 1024 / 1024:.1f} МБ)."
+    return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/admin/mobile/delete', methods=['POST'])
+@web_admin_required
+def web_delete_mobile():
+    apk = _site_mobile_apk()
+    if apk:
+        os.remove(apk)
+        log_action("delete_mobile_apk", g.web_admin['nickname'], MOBILE_APK_NAME)
+        session['upload_ok'] = "APK мобильной версии удалён."
     return redirect(url_for('admin_dashboard'))
 
 
