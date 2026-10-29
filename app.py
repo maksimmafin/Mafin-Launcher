@@ -917,7 +917,6 @@ def _client_ip():
     """IP клиента. За обратным прокси задайте MAFIN_TRUST_PROXY=1 — тогда берётся X-Forwarded-For."""
     xff = request.headers.get("X-Forwarded-For", "")
     real = request.headers.get("X-Real-IP", "")
-                                                                                                   
     local = _normalize_ip(request.remote_addr) in ("127.0.0.1", "::1", "localhost")
     if xff and (os.environ.get("MAFIN_TRUST_PROXY") == "1" or local):
         return _normalize_ip(xff.split(",")[0])
@@ -1414,6 +1413,19 @@ def unread_count():
     return jsonify({"count": row[0]})
 
 
+@app.route('/api/messages/unread_summary', methods=['GET'])
+@auth_required
+def unread_summary():
+    db = get_db()
+    rows = db.execute(
+        "SELECT sender, COUNT(*) AS c, MAX(id) AS last_id FROM messages "
+        "WHERE receiver = ? AND is_read = 0 GROUP BY sender ORDER BY last_id DESC LIMIT 20",
+        (g.current_profile['nickname'],)
+    ).fetchall()
+    items = [{"sender": r[0], "count": r[1], "last_id": r[2]} for r in rows]
+    return jsonify({"senders": items, "count": sum(i["count"] for i in items)})
+
+
 _typing_lock = threading.Lock()
 _typing_status = {}
 
@@ -1800,8 +1812,10 @@ tr:hover{background:#2d323c}
 <main>
   <div class="stats">
     <div class="stat"><div class="num">{{ stats.total_profiles }}</div><div class="label">Пользователей</div></div>
+    <div class="stat"><div class="num">{{ stats.online }}</div><div class="label">В сети</div></div>
     <div class="stat"><div class="num">{{ stats.total_banned }}</div><div class="label">Забанено</div></div>
     <div class="stat"><div class="num">{{ stats.total_admins }}</div><div class="label">Админов</div></div>
+    <div class="stat"><div class="num">{{ stats.coins_total }}</div><div class="label">Монет у игроков</div></div>
   </div>
 
   <section>
@@ -4155,6 +4169,8 @@ def admin_dashboard():
         "total_profiles": db.execute("SELECT COUNT(*) FROM profiles").fetchone()[0],
         "total_banned": db.execute("SELECT COUNT(*) FROM profiles WHERE is_banned = 1").fetchone()[0],
         "total_admins": db.execute("SELECT COUNT(*) FROM profiles WHERE is_admin = 1").fetchone()[0],
+        "online": sum(1 for r in db.execute("SELECT last_seen FROM profiles").fetchall() if is_online(r[0])),
+        "coins_total": round(db.execute("SELECT COALESCE(SUM(coins), 0) FROM profiles").fetchone()[0] or 0),
     }
     upload_error = session.pop('upload_error', None)
     upload_ok = session.pop('upload_ok', None)
@@ -4375,7 +4391,7 @@ def web_upload_chunk():
         return jsonify({"error": "bad offset"}), 400
     os.makedirs(CHUNKS_DIR, exist_ok=True)
     now = time.time()
-    for fn in os.listdir(CHUNKS_DIR):                                                         
+    for fn in os.listdir(CHUNKS_DIR):
         fp = os.path.join(CHUNKS_DIR, fn)
         try:
             if now - os.path.getmtime(fp) > 86400:
@@ -4388,7 +4404,7 @@ def web_upload_chunk():
         size = 0
         open(path, 'wb').close()
     if offset != size:
-        return jsonify({"error": "offset mismatch", "size": size}), 409                              
+        return jsonify({"error": "offset mismatch", "size": size}), 409
     data = request.get_data(cache=False)
     if size + len(data) > MAX_UPDATE_SIZE_BYTES:
         return jsonify({"error": "file too large"}), 413
@@ -5493,8 +5509,7 @@ SITE_DISCORD = os.environ.get("SITE_DISCORD", "")
 SITE_TELEGRAM = os.environ.get("SITE_TELEGRAM", "https://t.me/mafinlauncher")
 
 SITE_CSS = """
-:root{--bg:#0f1218;--card:#181d27;--card2:#1f2533;--line:#2a3142;--text:#e8ecf4;--mut:#8b95a9;--acc:#5b8cff;--acc2:#7c5cff;--ok:#3ecf8e;--bad:#ff6b6b}
-@media (prefers-color-scheme:light){:root{--bg:#f4f6fb;--card:#fff;--card2:#eef1f8;--line:#dde2ee;--text:#1b2233;--mut:#667089}}
+:root{--bg:#14181a;--card:#171b1d;--card2:#20262a;--line:#33403d;--text:#e6e9ee;--mut:#8f9b97;--acc:#43b581;--acc2:#2c8a60;--ok:#43b581;--bad:#d96b6b}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
 body{margin:0;font:16px/1.6 -apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
 a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
@@ -5536,6 +5551,23 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{text-align:left;p
 .hatview canvas{display:block;width:260px;height:340px}
 .skinprev{image-rendering:pixelated;width:128px;height:128px;background:var(--card2);border-radius:10px;border:1px solid var(--line)}
 .row{display:flex;gap:16px;flex-wrap:wrap}.row>*{flex:1;min-width:200px}
+.btn{background:var(--acc)!important;color:#08180f!important;border:2px solid #000!important;border-radius:0!important;box-shadow:inset 0 -3px 0 var(--acc2)}
+.btn.ghost{background:var(--card2)!important;color:var(--text)!important;border:1px solid var(--line)!important;box-shadow:none}
+.btn.red{background:var(--bad)!important}
+.card,.stat div,.hatview,.skinprev,input,select{border-radius:0!important}
+.card{border:2px solid #000;box-shadow:inset 0 0 0 1px var(--line)}
+.hero{text-align:left}.hero p{margin-left:0}
+.steps li:before{border-radius:0!important}
+input:focus,select:focus{border-color:var(--acc);outline:0}
+.hero2{display:grid;grid-template-columns:1.1fr 1fr;gap:32px;align-items:start;padding:56px 0 24px}
+.hero2 h1{font-size:42px;line-height:1.15;margin:6px 0 14px}.hero2 p{color:var(--mut);max-width:520px;margin:0 0 24px}
+.kick{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--acc)}
+.acts{display:flex;gap:10px;flex-wrap:wrap}
+.spec{background:var(--card);border:2px solid #000;box-shadow:inset 0 0 0 1px var(--line)}
+.spec-h{padding:12px 16px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);border-bottom:1px solid var(--line)}
+.spec-r{padding:12px 16px;border-bottom:1px solid var(--line);display:grid;gap:2px}.spec-r:last-child{border:0}
+.spec-r b{font-weight:600}.spec-r span{color:var(--mut);font-size:14px}
+@media(max-width:760px){.hero2{grid-template-columns:1fr;padding-top:32px}.hero2 h1{font-size:32px}}
 """
 
 
@@ -5552,7 +5584,7 @@ def _site_page(title, body, head_extra=""):
     page = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{_html.escape(title)} — {_html.escape(SITE_NAME)}</title><style>{SITE_CSS}</style>{head_extra}</head><body>
-<header class="top"><div class="wrap"><a class="logo" href="/">⛏ {_html.escape(SITE_NAME)}</a>
+<header class="top"><div class="wrap"><a class="logo" href="/">{_html.escape(SITE_NAME)}</a>
 <nav><a href="/">Главная</a><a href="/cabinet">Личный кабинет</a><a href="/terms">Условия использования</a><a href="/privacy">Политика конфиденциальности</a><a href="/download" class="dl">Скачать</a></nav></div></header>
 {body}{footer}</body></html>"""
     resp = app.response_class(page, mimetype="text/html")
@@ -5644,6 +5676,28 @@ def site_download():
     return send_from_directory(folder, name, as_attachment=True)
 
 
+def _site_home_body(btn, meta):
+    name = _html.escape(SITE_NAME)
+    return f"""<div class="wrap home">
+<section class="hero2"><div>
+<div class="kick">Лаунчер Minecraft</div>
+<h1>Играйте в Minecraft<br>с {name}</h1>
+<p>Лаунчер с друзьями, чатом, скинами, достижениями и привилегиями на нашем сервере. Моды, сборки и ресурспаки ставятся из каталога Modrinth.</p>
+<div class="acts">{btn}</div>{meta}</div>
+<div class="spec">
+<div class="spec-h">Что внутри</div>
+<div class="spec-r"><b>Скины</b><span>Загрузите скин в лаунчере или в кабинете, его увидят игроки лаунчера</span></div>
+<div class="spec-r"><b>Привилегии</b><span>Покупаются за монеты, которые дают за игру и задания</span></div>
+<div class="spec-r"><b>Друзья</b><span>Список друзей, личные сообщения, подарки, топ по времени в игре</span></div>
+<div class="spec-r"><b>Моды и сборки</b><span>Forge, Fabric, NeoForge, Quilt, установка из Modrinth</span></div>
+<div class="spec-r"><b>P2P-игра</b><span>Мультиплеер с друзьями без VPN и аренды сервера</span></div>
+</div></section>
+<h2>Как начать</h2><ol class="steps">
+<li>Нажмите «Скачать лаунчер» и запустите файл.</li>
+<li>Зарегистрируйтесь в лаунчере или здесь, в <a href="/cabinet">личном кабинете</a>.</li>
+<li>Выберите версию Minecraft и нажмите «Играть».</li></ol></div>"""
+
+
 @app.route('/', methods=['GET'])
 def site_index():
     found = _site_latest_download()
@@ -5651,27 +5705,18 @@ def site_index():
         folder, name, version = found
         size = _fmt_size(os.path.getsize(os.path.join(folder, name)))
         ver = f" · версия {_html.escape(str(version))}" if version else ""
-        btn = '<a class="btn" href="/download">⬇ Скачать лаунчер</a>'
+        btn = '<a class="btn" href="/download">Скачать лаунчер</a>'
         apk = _site_mobile_apk()
         if apk:
-            btn += f' <a class="btn" href="/download/mobile">📱 Android · {_fmt_size(os.path.getsize(apk))}</a>'
+            btn += f' <a class="btn ghost" href="/download/mobile">Android · {_fmt_size(os.path.getsize(apk))}</a>'
         meta = f'<div class="meta">{_html.escape(name)} · {size}{ver} · Windows</div>'
     else:
         btn = '<span class="btn" style="opacity:.5">Скоро</span>'
         apk = _site_mobile_apk()
         if apk:
-            btn += f' <a class="btn" href="/download/mobile">📱 Android · {_fmt_size(os.path.getsize(apk))}</a>'
+            btn += f' <a class="btn ghost" href="/download/mobile">Android · {_fmt_size(os.path.getsize(apk))}</a>'
         meta = '<div class="meta">Файл лаунчера ещё не загружен</div>'
-    body = f"""<div class="wrap"><section class="hero"><h1>Играйте в Minecraft<br>с {_html.escape(SITE_NAME)}</h1>
-<p>Свой лаунчер с друзьями, чатом, достижениями, скинами и привилегиями на нашем сервере.</p>{btn}{meta}</section>
-<div class="grid">
-<div class="card"><h3>🧑 Свои скины</h3><p>Загрузите скин в лаунчере или в личном кабинете — его увидят игроки лаунчера.</p></div>
-<div class="card"><h3>👑 Привилегии</h3><p>Покупайте привилегии на сервере за монеты, которые вы зарабатываете игрой и заданиями.</p></div>
-<div class="card"><h3>👥 Друзья и чат</h3><p>Список друзей, личные сообщения, подарки и таблица лидеров по времени в игре.</p></div></div>
-<h2>Как начать</h2><ol class="steps">
-<li>Нажмите «Скачать лаунчер» и запустите файл.</li>
-<li>Зарегистрируйтесь в лаунчере или здесь, в <a href="/cabinet">личном кабинете</a>.</li>
-<li>Выберите версию Minecraft и нажмите «Играть».</li></ol></div>"""
+    body = _site_home_body(btn, meta)
     return _site_page("Главная", body)
 
 
@@ -6031,7 +6076,7 @@ def site_cabinet():
     return resp
 
 
-HUB_CSS = r""":root{--bg:#1a1d23;--bg2:#23272e;--bg3:#2d323c;--tx:#e1e4e8;--mu:#7a8599;--ac:#43b581;--bad:#ed4245;--r:12px}
+HUB_CSS = r""":root{--bg:#14181a;--bg2:#171b1d;--bg3:#2a3236;--tx:#e6e9ee;--mu:#8f9b97;--ac:#43b581;--bad:#d96b6b;--r:0px;--ln:#33403d}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--tx);font-family:'Segoe UI',system-ui,Arial,sans-serif;font-size:15px}
 #app{min-height:100vh;display:flex;flex-direction:column;max-width:720px;margin:0 auto}
@@ -6070,6 +6115,18 @@ textarea{resize:vertical}
 .bub{background:var(--bg3);padding:7px 11px;border-radius:14px;word-break:break-word;white-space:pre-wrap}.bub.me{background:var(--ac);color:#fff}.bub.gift img{width:48px;height:48px;display:block}
 .typing{min-height:16px;font-size:12px}
 .skinprev{width:128px;height:128px;image-rendering:pixelated;object-fit:contain;background:var(--bg);border-radius:8px;align-self:center}
+.card,.chat{border:2px solid #000!important;box-shadow:inset 0 0 0 1px var(--ln);border-radius:0!important}
+input,textarea,select,.btn,.bub,.toast,.tab,.skinprev{border-radius:0!important}
+input,textarea,select{border:1px solid var(--ln)!important;background:#20262a!important}
+input:focus,textarea:focus,select:focus{border-color:var(--ac)!important;outline:0}
+.btn{color:#08180f!important;border:2px solid #000!important;box-shadow:inset 0 -3px 0 #2c8a60;font-weight:700}
+.btn.ghost{color:var(--tx)!important;background:#20262a;border:1px solid var(--ln)!important;box-shadow:none}
+.bub.me{color:#08180f!important}
+.toast{color:#08180f!important;border:2px solid #000}
+.plates{display:grid;grid-template-columns:1fr 1fr;gap:8px}.plate{background:var(--bg2);border:2px solid #000;box-shadow:inset 0 0 0 1px var(--ln);padding:10px 12px;display:grid;gap:2px;cursor:pointer}.plate b{font-size:20px;color:var(--ac)}.plist{grid-column:1/3;background:var(--bg2);border:1px solid var(--ln);padding:8px 12px;font-size:14px}
+.top{background:var(--bg2);border-bottom:1px solid var(--ln)}.tabs{border-top:1px solid var(--ln)}
+.tab span{display:none}.tab{min-width:72px;padding:11px 8px}.tab small{font-size:12px}.tab.on{background:#20262a;box-shadow:inset 0 2px 0 var(--ac)}
+.bar,.bar i,.dot{border-radius:0!important}
 """
 
 HUB_JS = r"""const $=(s,r=document)=>r.querySelector(s);
@@ -6140,7 +6197,16 @@ VIEWS.profile=async main=>{
     card(stat('🪙 Монеты',num(p.coins)),stat('⏱ Время в игре',fmtMin(p.total_playtime_minutes)),stat('🚀 Запусков',p.total_launches),stat('🏆 Ачивок',p.achievements_count)),
     card(h('label',{class:'chk'},vis,' Показывать подарки на моём профиле'),h('h3',{},'🎁 Полученные подарки'),gifts),
     card(h('button',{class:'btn ghost wide',onclick:()=>signOut()},'Выйти из аккаунта')));
-  await fillReceived(gifts,S.nick)};
+  await fillReceived(gifts,S.nick);
+  const pl=h('div',{class:'plates'});main.prepend(pl);
+  try{const[fl,us]=await Promise.all([api('/api/friends/list'),api('/api/messages/unread_summary').catch(()=>({senders:[],count:0}))]);
+    const on=(fl.friends||[]).filter(f=>f.is_online);
+    const a=h('div',{class:'plate'},h('span',{class:'muted'},'Друзей в сети'),h('b',{},on.length+' / '+(fl.friends||[]).length));
+    const bx=h('div',{class:'plist',style:'display:none'},on.length?on.map(f=>h('div',{},dot(true),' '+f.nickname)):h('span',{class:'muted'},'Никого нет в сети'));
+    a.onclick=()=>{bx.style.display=bx.style.display==='none'?'block':'none'};
+    const n=h('div',{class:'plate',onclick:()=>{S.tab='friends';S.chat=null;render()}},h('span',{class:'muted'},'Новые сообщения'),h('b',{},String(us.count||0)));
+    const nl=h('div',{class:'plist'},(us.senders||[]).map(x=>h('div',{},x.sender+' · '+x.count)));
+    pl.append(a,n,bx,us.senders&&us.senders.length?nl:'')}catch(e){}};
 async function fillReceived(box,nick){
   try{const d=await api('/api/gifts/received/'+encodeURIComponent(nick));
     if(d.hidden){box.append(h('p',{class:'muted'},'Подарки скрыты владельцем профиля'));return}
@@ -8651,6 +8717,112 @@ def tg_unlink():
     db.execute("DELETE FROM tg_links WHERE bot = ? AND nickname = ?", (bot, g.current_profile['nickname']))
     db.commit()
     return jsonify({"success": True})
+
+MAFIN_THEME_CSS = """
+:root{--mf-bg:#14181a;--mf-pan:#171b1d;--mf-pan2:#20262a;--mf-pan3:#2a3236;--mf-line:#33403d;--mf-tx:#e6e9ee;--mf-mu:#8f9b97;--mf-ac:#43b581;--mf-acd:#2c8a60;--mf-bad:#d96b6b}
+html,body{background:var(--mf-bg)!important;color:var(--mf-tx)!important;font-family:"Segoe UI",system-ui,sans-serif!important}
+body{padding-left:210px!important;margin:0!important}
+.mf-side{position:fixed;left:0;top:0;bottom:0;width:210px;background:var(--mf-pan);border-right:1px solid var(--mf-line);padding:18px 12px;overflow:auto;z-index:50;box-sizing:border-box}
+.mf-side .mf-t{font-size:17px;font-weight:600;margin:0 6px 2px;color:var(--mf-tx)}
+.mf-side .mf-s{font-size:11px;color:var(--mf-mu);margin:0 6px 16px}
+.mf-side a{display:block;padding:9px 12px;color:var(--mf-mu)!important;text-decoration:none;border:1px solid transparent;margin-bottom:3px;font-size:13px}
+.mf-side a:hover{color:var(--mf-tx)!important;background:var(--mf-pan2)}
+.mf-side a.on{color:var(--mf-tx)!important;background:var(--mf-pan2);border-color:var(--mf-line);box-shadow:inset 3px 0 0 var(--mf-ac)}
+.mf-side .mf-g{font-size:10px;letter-spacing:.1em;color:#5f6b67;margin:16px 12px 6px}
+header{background:transparent!important;border:0!important;padding:26px 28px 0!important;display:block!important}
+header>div{display:none!important}
+header h1{color:var(--mf-tx)!important;font-size:22px!important;font-weight:600!important}
+main{padding:18px 28px 40px!important;max-width:1180px!important;margin:0 auto!important}
+section,.card,.stat,.panel,.box{background:var(--mf-pan)!important;border:2px solid #000!important;box-shadow:inset 0 0 0 1px var(--mf-line)!important;border-radius:0!important}
+section h2,h2{color:var(--mf-tx)!important;font-size:15px!important;font-weight:600!important}
+.stat .num{color:var(--mf-tx)!important;font-weight:600!important}
+.stat .label{color:var(--mf-mu)!important;text-transform:uppercase;font-size:10px!important;letter-spacing:.08em}
+table{border-collapse:collapse}
+th{color:var(--mf-mu)!important;font-weight:500!important;font-size:11px!important}
+th,td{border-bottom:1px solid var(--mf-line)!important}
+tr:hover{background:var(--mf-pan2)!important}
+input,textarea,select{background:var(--mf-pan2)!important;border:1px solid var(--mf-line)!important;border-radius:0!important;color:var(--mf-tx)!important}
+input:focus,textarea:focus,select:focus{border-color:var(--mf-ac)!important;outline:0!important}
+button,.btn{border-radius:0!important;background:var(--mf-pan2)!important;color:var(--mf-tx)!important;border:1px solid var(--mf-line)!important}
+button:hover{background:var(--mf-pan3)!important}
+button.primary,.upload-form button,button[type=submit].primary,button.success:hover{background:var(--mf-ac)!important;color:#08180f!important;border:2px solid #000!important;font-weight:700!important;box-shadow:inset 0 -3px 0 var(--mf-acd)}
+button.danger,.actions button.danger{color:var(--mf-bad)!important}
+button.danger:hover{background:#3a2020!important}
+.badge,.active-pill,.pill,.tag{border-radius:0!important;font-weight:500!important;background:var(--mf-pan2)!important;color:var(--mf-mu)!important;border:1px solid var(--mf-line)}
+.badge.admin,.active-pill{background:#1f3a2f!important;color:#8fe0b9!important;border-color:var(--mf-acd)}
+.badge.banned{background:transparent!important;color:var(--mf-bad)!important;border-color:#5a3030}
+.err{background:#2a1c1c!important;border:1px solid #5a3030!important;color:#e8a0a0!important;border-radius:0!important}
+.okmsg,.ok-box{background:#1b2a24!important;border:1px solid var(--mf-acd)!important;color:#a6f0c6!important;border-radius:0!important}
+pre,.item,code{background:#0f1315!important;border-radius:0!important}
+.muted,.kv div:nth-child(odd){color:var(--mf-mu)!important}
+.ok{color:var(--mf-ac)!important}.bad{color:var(--mf-bad)!important}
+.bar,.bar div{border-radius:0!important}.bar{background:var(--mf-pan3)!important}.bar div{background:var(--mf-ac)!important}
+a{color:var(--mf-ac)}
+@media (max-width:820px){body{padding-left:0!important;padding-top:56px}.mf-side{width:auto;right:0;bottom:auto;height:auto;display:flex;overflow-x:auto;padding:8px;border-right:0;border-bottom:1px solid var(--mf-line)}.mf-side .mf-t,.mf-side .mf-s,.mf-side .mf-g{display:none}.mf-side a{white-space:nowrap;margin:0 3px 0 0}}
+"""
+
+_MF_NAV = (("/admin/dashboard", "Пользователи", "dash"), ("/admin/minecraft", "Minecraft-сервер", "mc"),
+           ("/admin/shop", "Магазин", "shop"), ("/admin/cosmetics", "Косметика", "cos"),
+           ("/admin/modpack", "Сборка сервера", "pack"), ("/admin/quests", "Задания", "quests"),
+           ("/admin/gifts", "Подарки", "gifts"), ("/admin/news", "Новости", "news"))
+_MF_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\ufe0f\u200d]+\\s*")
+
+
+def _mafin_theme(tpl, active):
+    nav = '<nav class="mf-side"><div class="mf-t">Mafin</div><div class="mf-s">админ-панель</div>'
+    for href, title, key in _MF_NAV:
+        nav += '<a href="%s"%s>%s</a>' % (href, ' class="on"' if key == active else "", title)
+    nav += '<div class="mf-g">СИСТЕМА</div><a href="/admin/logout">Выход</a></nav>'
+    out = tpl.replace("</style>", "</style><style>" + MAFIN_THEME_CSS + "</style>", 1)
+    out = out.replace("<body>", "<body>" + nav, 1)
+
+    def strip_tag(m):
+        return m.group(1) + _MF_EMOJI.sub("", m.group(2)) + m.group(3)
+    out = re.sub(r"(<(?:h1|h2|h3|button|label|a|summary)\b[^>]*>)([^<]{0,160})(</|<)", strip_tag, out)
+    return out
+
+
+LOGIN_TEMPLATE = """
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mafin — вход в админ-панель</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#14181a radial-gradient(ellipse at 50% 45%,#1d2a26,#14181a 65%);color:#e6e9ee;font-family:"Segoe UI",system-ui,sans-serif}
+.card{width:min(400px,calc(100vw - 32px));background:#171b1d;border:2px solid #000;box-shadow:inset 0 0 0 1px #33403d;padding:28px}
+.hd{display:flex;gap:12px;align-items:center;margin-bottom:22px}
+.lg{width:48px;height:48px;background:#2a3236;border:1px solid #33403d;display:grid;place-items:center}
+.lg i{width:16px;height:16px;background:#43b581;display:block}
+h1{margin:0;font-size:18px;font-weight:600}.sub{color:#8f9b97;font-size:12px;margin-top:2px}
+label{display:block;font-size:10px;letter-spacing:.08em;color:#8f9b97;text-transform:uppercase;margin-bottom:6px}
+input{width:100%;height:38px;background:#20262a;border:1px solid #33403d;color:#e6e9ee;padding:0 12px;font-size:14px;margin-bottom:14px;border-radius:0}
+input:focus{border-color:#43b581;outline:0}
+button{width:100%;height:42px;background:#43b581;color:#08180f;border:2px solid #000;box-shadow:inset 0 -3px 0 #2c8a60;font-weight:700;font-size:14px;cursor:pointer;border-radius:0}
+button:hover{background:#4cc28e}
+.err{background:#2a1c1c;border:1px solid #5a3030;color:#e8a0a0;padding:10px 12px;margin-bottom:14px;white-space:pre-wrap;font-size:13px}
+.hint{font-size:12px;color:#8f9b97;margin:-6px 0 14px}code{background:#0f1315;padding:1px 5px}
+</style></head>
+<body><div class="card">
+<div class="hd"><div class="lg"><i></i></div><div><h1>Mafin · админ-панель</h1><div class="sub">Только для администраторов</div></div></div>
+{% if error %}<div class="err">{{ error }}</div>{% endif %}
+<form method="post" action="/admin/login">
+<label>Никнейм</label><input type="text" name="nickname" required autofocus>
+<label>Одноразовый код</label><input type="text" name="code" autocomplete="off" required>
+<div class="hint">Получить код: на сервере <code>python app.py admin-code ВАШ_НИК</code></div>
+<button type="submit">Войти</button>
+</form>
+</div></body></html>
+"""
+
+DASHBOARD_TEMPLATE = _mafin_theme(DASHBOARD_TEMPLATE, "dash")
+MC_ADMIN_TEMPLATE = _mafin_theme(MC_ADMIN_TEMPLATE, "mc")
+SHOP_ADMIN_TEMPLATE = _mafin_theme(SHOP_ADMIN_TEMPLATE, "shop")
+COSMETICS_ADMIN_TEMPLATE = _mafin_theme(COSMETICS_ADMIN_TEMPLATE, "cos")
+MODPACK_ADMIN_TEMPLATE = _mafin_theme(MODPACK_ADMIN_TEMPLATE, "pack")
+QUESTS_TEMPLATE = _mafin_theme(QUESTS_TEMPLATE, "quests")
+GIFTS_TEMPLATE = _mafin_theme(GIFTS_TEMPLATE, "gifts")
+NEWS_TEMPLATE = _mafin_theme(NEWS_TEMPLATE, "news")
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == "set-password":
