@@ -182,9 +182,22 @@ def animate_image_on_label(label, image_bytes, max_px=96, circular=False):
     label.after(durations[0], step)
 
 
-if "--autostart" in sys.argv:
+def _data_home():
+    base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    if os.access(base, os.W_OK):
+        return base
+    drive = os.path.splitdrive(base)[0]
+    alt = os.path.join(drive + os.sep, "MafinLauncher") if drive else os.path.join(os.path.expanduser("~"), "MafinLauncher")
     try:
-        os.chdir(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)))
+        os.makedirs(alt, exist_ok=True)
+        return alt
+    except OSError:
+        return base
+
+
+if getattr(sys, "frozen", False) or "--autostart" in sys.argv or not os.access(os.getcwd(), os.W_OK):
+    try:
+        os.chdir(_data_home())
     except OSError:
         pass
 
@@ -192,6 +205,8 @@ if "--autostart" in sys.argv:
 def _resolve_config_path():
     name = "launcher_config.json"
     base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    if not os.access(base, os.W_OK):
+        base = _data_home()
     p_base = os.path.join(base, name)
     p_cwd = os.path.abspath(name)
     if os.path.exists(p_base):
@@ -203,7 +218,7 @@ def _resolve_config_path():
 
 CONFIG_FILE = _resolve_config_path()
 
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.9.8"
 
 
 def _sha256_file(path):
@@ -357,9 +372,9 @@ DEFAULT_WINDOW_MATERIAL = "mica" if _win_build() >= 22000 else "solid"
 
 PALETTES = {
     "solid": {
-        "bg": "#1a1d23", "surface": "#242830", "surface2": "#2d323c", "surface3": "#363c48",
-        "console": "#0d1117", "border": "#3a3f4a",
-        "text": "#e6e9ee", "text_dim": "#8a94a6", "text_faint": "#5c6270",
+        "bg": "#14181a", "surface": "#1b2023", "surface2": "#20262a", "surface3": "#2a3236",
+        "console": "#0d1113", "border": "#33403d",
+        "text": "#e6e9ee", "text_dim": "#8f9b97", "text_faint": "#5c6865",
     },
     "mica": {
         "bg": "#000000", "surface": "#2a2a2e", "surface2": "#343439", "surface3": "#3f3f46",
@@ -395,6 +410,8 @@ _ACCENT_BG_OPTS = {"background", "activebackground", "selectbackground", "highli
 
 
 def _pal(token):
+    if token == "sel":
+        return _sel_bg()
     if token == "accent":
         return _THEME["accent"]
     if token == "accent_hover":
@@ -453,7 +470,7 @@ _TOKEN_DEFAULTS = {
              "highlightbackground": "border", "highlightcolor": "accent",
              "selectbackground": "accent", "selectforeground": "text"},
     "listbox": {"background": "surface", "foreground": "text", "highlightbackground": "border",
-                "highlightcolor": "accent", "selectbackground": "accent",
+                "highlightcolor": "accent", "selectbackground": "sel",
                 "selectforeground": "text"},
     "scrollbar": {"background": "surface3", "troughcolor": "surface", "activebackground": "text_faint",
                   "highlightbackground": "bg"},
@@ -469,7 +486,7 @@ _LITERAL_DEFAULTS = {
     "entry": {"relief": "flat", "highlightthickness": 1},
     "spinbox": {"relief": "flat", "highlightthickness": 1},
     "text": {"relief": "flat", "highlightthickness": 1},
-    "listbox": {"relief": "flat", "highlightthickness": 1},
+    "listbox": {"relief": "flat", "highlightthickness": 1, "activestyle": "none"},
     "scrollbar": {"relief": "flat", "borderwidth": 0},
     "scale": {"relief": "flat", "highlightthickness": 0, "borderwidth": 0},
     "checkbutton": {"highlightthickness": 0},
@@ -609,10 +626,59 @@ def _colorref(hex_color):
     return (b << 16) | (g << 8) | r
 
 
+_HDR_CACHE = {"t": 0.0, "v": False}
+
+
+def _hdr_active():
+    if os.name != "nt":
+        return False
+    if time.time() - _HDR_CACHE["t"] < 30:
+        return _HDR_CACHE["v"]
+    result = False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("lo", wintypes.DWORD), ("hi", ctypes.c_long)]
+
+        class HDR(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_uint32), ("size", ctypes.c_uint32),
+                        ("adapterId", LUID), ("id", ctypes.c_uint32)]
+
+        class ACI(ctypes.Structure):
+            _fields_ = [("header", HDR), ("value", ctypes.c_uint32),
+                        ("colorEncoding", ctypes.c_uint32), ("bitsPerColorChannel", ctypes.c_uint32)]
+
+        user32 = ctypes.windll.user32
+        npaths, nmodes = ctypes.c_uint32(), ctypes.c_uint32()
+        if user32.GetDisplayConfigBufferSizes(2, ctypes.byref(npaths), ctypes.byref(nmodes)) == 0 and npaths.value:
+            paths = ((ctypes.c_char * 72) * npaths.value)()
+            modes = ((ctypes.c_char * 64) * max(nmodes.value, 1))()
+            if user32.QueryDisplayConfig(2, ctypes.byref(npaths), paths, ctypes.byref(nmodes), modes, None) == 0:
+                for i in range(npaths.value):
+                    raw = bytes(paths[i])
+                    info = ACI()
+                    info.header.type = 9
+                    info.header.size = ctypes.sizeof(ACI)
+                    info.header.adapterId.lo = int.from_bytes(raw[20:24], "little")
+                    info.header.adapterId.hi = int.from_bytes(raw[24:28], "little", signed=True)
+                    info.header.id = int.from_bytes(raw[28:32], "little")
+                    if user32.DisplayConfigGetDeviceInfo(ctypes.byref(info)) == 0 and (info.value >> 1) & 1:
+                        result = True
+                        break
+    except Exception:
+        result = False
+    _HDR_CACHE.update(t=time.time(), v=result)
+    return result
+
+
 def apply_window_material(win, material=None, caption=None):
     material = material or _THEME["material"]
     if os.name != "nt":
         return "solid"
+    if material != "solid" and _hdr_active():
+        material = "solid"
     try:
         import ctypes
         from ctypes import wintypes
@@ -702,6 +768,86 @@ def _style_toplevel(win):
         pass
 
 
+_SCROLLERS = []
+
+
+def make_scrollable(parent, pad_bottom=0):
+    cv = tk.Canvas(parent, highlightthickness=0, bd=0)
+    sb = ttk.Scrollbar(parent, orient="vertical", command=cv.yview)
+    cv.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    cv.pack(side="left", fill="both", expand=True)
+    inner = ttk.Frame(cv)
+    win = cv.create_window(0, 0, window=inner, anchor="nw")
+    state = {"need": False}
+
+    def relayout(_e=None):
+        cw, ch = cv.winfo_width(), cv.winfo_height()
+        rh = inner.winfo_reqheight()
+        cv.itemconfigure(win, width=cw, height=max(rh, ch))
+        cv.configure(scrollregion=(0, 0, cw, max(rh, ch)))
+        need = rh > ch + 1
+        if need != state["need"]:
+            state["need"] = need
+            if need:
+                sb.pack(side="right", fill="y", before=cv)
+            else:
+                sb.pack_forget()
+                cv.yview_moveto(0)
+
+    cv.bind("<Configure>", relayout)
+    inner.bind("<Configure>", relayout)
+    inner._scroll_canvas = cv
+    cv._scroll_state = state
+    _SCROLLERS.append(cv)
+    return inner
+
+
+def _setup_wheel(root):
+    def find_canvas(w):
+        while w is not None:
+            if w in _SCROLLERS:
+                return w
+            w = getattr(w, "master", None)
+        return None
+
+    def on_wheel(e):
+        try:
+            w = root.winfo_containing(e.x_root, e.y_root)
+        except Exception:
+            return
+        if w is None:
+            return
+        cls = w.winfo_class()
+        if cls in ("Listbox", "Text", "Treeview", "TCombobox") or (cls == "Canvas" and w not in _SCROLLERS):
+            return
+        cv = find_canvas(w)
+        if cv is None or not cv._scroll_state["need"]:
+            return
+        if getattr(e, "num", 0) == 4:
+            d = -1
+        elif getattr(e, "num", 0) == 5:
+            d = 1
+        else:
+            d = -1 if e.delta > 0 else 1
+        cv.yview_scroll(d * 3, "units")
+
+    root.bind_all("<MouseWheel>", on_wheel, add="+")
+    root.bind_all("<Button-4>", on_wheel, add="+")
+    root.bind_all("<Button-5>", on_wheel, add="+")
+
+
+def _sel_bg():
+    try:
+        a = _THEME["accent"].lstrip("#")
+        b = _THEME["pal"]["surface"].lstrip("#")
+        ca = [int(a[i:i + 2], 16) for i in (0, 2, 4)]
+        cb = [int(b[i:i + 2], 16) for i in (0, 2, 4)]
+        return "#%02x%02x%02x" % tuple(int(x * 0.32 + y * 0.68) for x, y in zip(ca, cb))
+    except Exception:
+        return _THEME["accent"]
+
+
 def apply_ttk_styles(style, root):
     p, A, AH = _THEME["pal"], _THEME["accent"], _THEME["hover"]
     BG, S1, S2, S3 = p["bg"], p["surface"], p["surface2"], p["surface3"]
@@ -721,13 +867,13 @@ def apply_ttk_styles(style, root):
               background=[("disabled", S1), ("pressed", S1), ("active", S3)],
               foreground=[("disabled", p["text_faint"])],
               bordercolor=[("active", A), ("focus", A)])
-    style.configure("Accent.TButton", background=A, foreground="#ffffff",
-                    font=("Segoe UI", 12, "bold"), padding=(18, 11), borderwidth=0,
-                    bordercolor=A, lightcolor=A, darkcolor=A, focuscolor=A)
+    style.configure("Accent.TButton", background=A, foreground="#08180f",
+                    font=("Segoe UI", 11, "bold"), padding=(18, 10), borderwidth=2,
+                    bordercolor="#000000", lightcolor=A, darkcolor=A, focuscolor=A)
     style.map("Accent.TButton",
               background=[("disabled", S2), ("pressed", AH), ("active", AH)],
-              bordercolor=[("active", AH)], lightcolor=[("active", AH)], darkcolor=[("active", AH)],
-              foreground=[("disabled", p["text_faint"])])
+              bordercolor=[("active", "#000000")], lightcolor=[("active", AH)], darkcolor=[("active", AH)],
+              foreground=[("disabled", p["text_faint"]), ("!disabled", "#08180f")])
     style.configure("Small.TButton", background=S2, foreground=TXT, font=("Segoe UI", 9),
                     padding=(8, 4), borderwidth=1, bordercolor=BRD, lightcolor=S2, darkcolor=S2)
     style.map("Small.TButton", background=[("pressed", S1), ("active", S3)],
@@ -799,8 +945,8 @@ def apply_ttk_styles(style, root):
                     lightcolor=BG, darkcolor=BG, bordercolor=BG)
 
     style.configure("Treeview", background=S1, fieldbackground=S1, foreground=TXT,
-                    bordercolor=BRD, lightcolor=S1, darkcolor=S1, rowheight=26, borderwidth=0)
-    style.map("Treeview", background=[("selected", A)], foreground=[("selected", "#ffffff")])
+                    bordercolor=BRD, lightcolor=S1, darkcolor=S1, rowheight=30, borderwidth=0)
+    style.map("Treeview", background=[("selected", _sel_bg())], foreground=[("selected", TXT)])
     style.configure("Treeview.Heading", background=S2, foreground=TXT, relief="flat",
                     font=("Segoe UI", 10, "bold"), padding=(8, 6), borderwidth=0)
     style.map("Treeview.Heading", background=[("active", S3)])
@@ -869,7 +1015,7 @@ def migrate_legacy_game_dir(config=None):
 migrate_legacy_game_dir()
 
 DEFAULT_CONFIG = {
-    "minecraft_dir": os.path.join(os.getcwd(), GAME_DIR_NAME),
+    "minecraft_dir": os.path.join(_data_home(), GAME_DIR_NAME),
     "java_path": "java",
     "memory_mb": 2048,
     "auto_memory": False,
@@ -1211,6 +1357,9 @@ class ServerAPI:
 
     def get_typing(self, nickname):
         return self._get(f"/api/messages/typing/{nickname}")
+
+    def unread_summary(self):
+        return self._get("/api/messages/unread_summary")
 
     def unread_message_count(self):
         return self._get("/api/messages/unread_count")
@@ -1656,7 +1805,7 @@ class QuestsPanel(tk.Frame):
 
         top = tk.Frame(self)
         top.pack(fill="x", padx=10, pady=8)
-        tk.Label(top, text="📋 Задания", font=("Segoe UI", 13, "bold")).pack(side="left")
+        tk.Label(top, text="Задания", font=("Segoe UI", 13, "bold"), bg=_pal("bg"), fg=_pal("text")).pack(side="left")
         tk.Button(top, text="Обновить", command=self.refresh).pack(side="right")
 
         container = tk.Frame(self)
@@ -1666,7 +1815,8 @@ class QuestsPanel(tk.Frame):
         scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
         self.list_frame = tk.Frame(canvas)
         self.list_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        _qw = canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(_qw, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -1706,34 +1856,36 @@ class QuestsPanel(tk.Frame):
             return None, e
 
     def _render_quest_row(self, q):
-        row = tk.Frame(self.list_frame, relief="groove", borderwidth=1)
+        S, T, D, A = _pal("surface"), _pal("text"), _pal("text_dim"), _pal("accent")
+        row = tk.Frame(self.list_frame, bg=S, highlightthickness=2, highlightbackground="#000000")
         row.pack(fill="x", pady=4, padx=2)
 
         title = q["title"] + (f" — {q['description']}" if q.get("description") else "")
-        tk.Label(row, text=title, font=("Segoe UI", 10, "bold"), anchor="w", justify="left",
-                 wraplength=420).pack(fill="x", padx=8, pady=(6, 2))
+        tk.Label(row, text=title, font=("Segoe UI", 10, "bold"), anchor="w", justify="left", bg=S, fg=T,
+                 wraplength=620).pack(fill="x", padx=12, pady=(10, 4))
 
         progress = min(q["progress"], q["target_value"])
         pct = int(100 * progress / q["target_value"]) if q["target_value"] else 0
-        bar_frame = tk.Frame(row)
-        bar_frame.pack(fill="x", padx=8)
-        bar_bg = tk.Frame(bar_frame, bg="#333", height=8)
+        bar_frame = tk.Frame(row, bg=S)
+        bar_frame.pack(fill="x", padx=12)
+        bar_bg = tk.Frame(bar_frame, bg=_pal("surface3"), height=8)
         bar_bg.pack(fill="x")
-        bar_fg = tk.Frame(bar_bg, bg="#43b581", height=8, width=max(1, pct * 4))
-        bar_fg.place(x=0, y=0, relheight=1)
+        bar_fg = tk.Frame(bar_bg, bg=A, height=8)
+        bar_fg.place(x=0, y=0, relheight=1, relwidth=max(0.01, pct / 100))
 
-        info_frame = tk.Frame(row)
-        info_frame.pack(fill="x", padx=8, pady=(4, 8))
-        tk.Label(info_frame, text=f"{progress:g}/{q['target_value']:g}   Награда: {q['reward_coins']:g} 🪙",
-                 fg="#888").pack(side="left")
+        info_frame = tk.Frame(row, bg=S)
+        info_frame.pack(fill="x", padx=12, pady=(6, 10))
+        tk.Label(info_frame, text=f"{progress:g} из {q['target_value']:g}   ·   награда {q['reward_coins']:g} монет",
+                 bg=S, fg=D).pack(side="left")
 
         if q["claimed"]:
-            tk.Label(info_frame, text="✅ Получено", fg="#43b581").pack(side="right")
+            tk.Label(info_frame, text="получено", bg=S, fg=A).pack(side="right")
         elif q["completed"]:
-            tk.Button(info_frame, text="Забрать награду", bg="#43b581", fg="white",
+            tk.Button(info_frame, text="Забрать награду", bg=A, fg="#08180f", relief="flat", bd=0,
+                      font=("Segoe UI", 9, "bold"), padx=12, pady=3, cursor="hand2",
                       command=lambda qid=q["id"]: self._claim(qid)).pack(side="right")
         else:
-            tk.Label(info_frame, text="В процессе", fg="#888").pack(side="right")
+            tk.Label(info_frame, text="в процессе", bg=S, fg=D).pack(side="right")
 
     def _claim(self, quest_id):
         status, data = self.api.claim_quest(quest_id)
@@ -2218,7 +2370,6 @@ def _log_discord(message):
         pass
 
 
-
 _AUTOSTART_NAME = "MafinLauncher"
 
 
@@ -2255,13 +2406,24 @@ def _win_run_key(enabled, cmd=""):
                 pass
 
 
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+
+
+def _win_startup_approved(enabled):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _APPROVED_KEY) as k:
+        data = (b"\x02\x00\x00\x00" if enabled else b"\x03\x00\x00\x00") + b"\x00" * 8
+        winreg.SetValueEx(k, _AUTOSTART_NAME, 0, winreg.REG_BINARY, data)
+
+
 def is_autostart_enabled():
     try:
         if os.name == "nt":
-            if _schtasks("/query", "/tn", _AUTOSTART_NAME).returncode == 0:
+            if _win_task_exists():
                 return True
             import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as k:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
                 winreg.QueryValueEx(k, _AUTOSTART_NAME)
             return True
         if sys.platform.startswith("linux"):
@@ -2271,21 +2433,68 @@ def is_autostart_enabled():
     return False
 
 
+def _win_task_create(argv):
+    import tempfile
+    from xml.sax.saxutils import escape
+    user = os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
+    user = user.lstrip("\\")
+    args = subprocess.list2cmdline(argv[1:])
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        '<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>'
+        '<Principals><Principal id="A"><UserId>%s</UserId><LogonType>InteractiveToken</LogonType>'
+        '<RunLevel>HighestAvailable</RunLevel></Principal></Principals>'
+        '<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>'
+        '<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>'
+        '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><StartWhenAvailable>true</StartWhenAvailable><Enabled>true</Enabled></Settings>'
+        '<Actions Context="A"><Exec><Command>%s</Command><Arguments>%s</Arguments><WorkingDirectory>%s</WorkingDirectory></Exec></Actions>'
+        '</Task>'
+    ) % (escape(user), escape(user), escape(argv[0]), escape(args), escape(os.path.dirname(argv[0])))
+    fd, path = tempfile.mkstemp(suffix=".xml")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-16") as f:
+            f.write(xml)
+        r = _schtasks("/create", "/tn", _AUTOSTART_NAME, "/xml", path, "/f")
+        return r.returncode == 0
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _win_task_exists():
+    try:
+        return _schtasks("/query", "/tn", _AUTOSTART_NAME).returncode == 0
+    except Exception:
+        return False
+
+
 def set_autostart(enabled):
     try:
         if os.name == "nt":
-            cmd = subprocess.list2cmdline(_autostart_argv())
-            workdir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
-            if not enabled:
+            argv = _autostart_argv()
+            cmd = subprocess.list2cmdline(argv)
+            try:
                 _schtasks("/delete", "/tn", _AUTOSTART_NAME, "/f")
+            except Exception:
+                pass
+            if not enabled:
                 _win_run_key(False)
                 return True, ""
-            r = _schtasks("/create", "/tn", _AUTOSTART_NAME, "/tr", cmd, "/sc", "onlogon",
-                          "/delay", "0000:15", "/rl", "limited", "/f")
-            if r.returncode == 0:
-                _win_run_key(False)
-                return True, ""
+            try:
+                if _win_task_create(argv):
+                    _win_run_key(False)
+                    return True, ""
+            except Exception:
+                pass
             _win_run_key(True, cmd)
+            try:
+                _win_startup_approved(True)
+            except Exception:
+                pass
             return True, ""
         if sys.platform.startswith("linux"):
             path = _autostart_path_linux()
@@ -3006,7 +3215,11 @@ class SplashScreen:
 class LauncherCore:
     def __init__(self, config):
         self.config = config
-        self.minecraft_dir = config.get("minecraft_dir", os.path.join(os.getcwd(), GAME_DIR_NAME))
+        self.minecraft_dir = config.get("minecraft_dir", os.path.join(_data_home(), GAME_DIR_NAME))
+        _sysroot = os.path.normcase(os.environ.get("SystemRoot", "")) if os.name == "nt" else ""
+        if _sysroot and os.path.normcase(str(self.minecraft_dir)).startswith(_sysroot):
+            self.minecraft_dir = os.path.join(_data_home(), GAME_DIR_NAME)
+            config["minecraft_dir"] = self.minecraft_dir
         self.java_path = config.get("java_path", "java")
         self.memory = config.get("memory_mb", 2048)
         self.pack_java = None
@@ -3063,22 +3276,43 @@ class LauncherCore:
             info = None
 
         if not info:
-            return "java"
+            return self._fallback_java()
 
         runtime_name = info["name"]
         try:
             exe = mll_runtime.get_executable_path(runtime_name, self.minecraft_dir)
-            if not exe or not os.path.exists(exe):
+            ok_mark = os.path.join(self.minecraft_dir, "runtime", runtime_name, ".mafin_ok")
+            if not exe or not os.path.exists(exe) or not os.path.exists(ok_mark):
                 if status_callback:
-                    status_callback(f"☕ Скачивание Java {info.get('javaMajorVersion', '')} ({runtime_name})...")
+                    status_callback(f"Скачивание Java {info.get('javaMajorVersion', '')} ({runtime_name})...")
                 mll_runtime.install_jvm_runtime(runtime_name, self.minecraft_dir)
                 exe = mll_runtime.get_executable_path(runtime_name, self.minecraft_dir)
+                try:
+                    os.makedirs(os.path.dirname(ok_mark), exist_ok=True)
+                    with open(ok_mark, "w") as mf:
+                        mf.write("ok")
+                except OSError:
+                    pass
             if exe and os.path.exists(exe):
                 return exe
         except Exception as e:
             print(f"Не удалось скачать/найти JVM-рантайм {runtime_name}: {e}")
 
-        return "java"
+        return self._fallback_java()
+
+    def _fallback_java(self):
+        if self._system_java_ok():
+            return "java"
+        base = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+        exe = os.path.join(base, "java", "bin", "java.exe" if os.name == "nt" else "java")
+        return exe if os.path.isfile(exe) else "java"
+
+    def _system_java_ok(self):
+        try:
+            return subprocess.run(["java", "-version"], capture_output=True, timeout=10,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+        except Exception:
+            return False
 
     def get_versions(self, include_alpha_beta=False):
         try:
@@ -3950,6 +4184,10 @@ def _fmt_mb(done, total=None):
     return f"{mb(done)} МБ"
 
 
+class InstallCancelled(BaseException):
+    pass
+
+
 class DownloadMeter:
 
     def __init__(self, minecraft_dir, version_id):
@@ -4291,6 +4529,292 @@ def ping_minecraft_server(host, port, timeout=3.0):
                 "ms": int((time.time() - start) * 1000)}
     except Exception:
         return None
+
+
+def _skin_default():
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    skin, hair, shirt, pants = (198, 151, 107, 255), (74, 47, 27, 255), (63, 127, 208, 255), (45, 58, 107, 255)
+    d.rectangle((0, 0, 31, 15), fill=skin)
+    d.rectangle((8, 0, 23, 7), fill=hair)
+    d.rectangle((0, 8, 7, 9), fill=hair)
+    d.rectangle((8, 8, 15, 9), fill=hair)
+    d.rectangle((16, 8, 31, 9), fill=hair)
+    d.rectangle((24, 8, 31, 15), fill=hair)
+    d.rectangle((9, 12, 10, 12), fill=(255, 255, 255, 255))
+    d.rectangle((10, 12, 10, 12), fill=(58, 90, 168, 255))
+    d.rectangle((13, 12, 13, 12), fill=(58, 90, 168, 255))
+    d.rectangle((14, 12, 14, 12), fill=(255, 255, 255, 255))
+    d.rectangle((11, 14, 12, 14), fill=(138, 74, 58, 255))
+    d.rectangle((16, 16, 39, 31), fill=shirt)
+    d.rectangle((40, 16, 55, 31), fill=skin)
+    d.rectangle((32, 48, 47, 63), fill=skin)
+    d.rectangle((0, 16, 15, 31), fill=pants)
+    d.rectangle((16, 48, 31, 63), fill=pants)
+    return img
+
+
+def _skin_normalize(img):
+    if img is None:
+        return None
+    img = img.convert("RGBA")
+    if img.size == (64, 64):
+        return img
+    if img.size != (64, 32):
+        return None
+    out = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    out.paste(img, (0, 0))
+
+    def flip(box, dest):
+        out.paste(img.crop(box).transpose(Image.FLIP_LEFT_RIGHT), dest)
+
+    for sx, sy, dx, dy in ((0, 16, 16, 48), (40, 16, 32, 48)):
+        flip((sx + 4, sy, sx + 8, sy + 4), (dx + 4, dy))
+        flip((sx + 8, sy, sx + 12, sy + 4), (dx + 8, dy))
+        flip((sx, sy + 4, sx + 4, sy + 16), (dx + 8, dy + 4))
+        flip((sx + 4, sy + 4, sx + 8, sy + 16), (dx + 4, dy + 4))
+        flip((sx + 8, sy + 4, sx + 12, sy + 16), (dx, dy + 4))
+        flip((sx + 12, sy + 4, sx + 16, sy + 16), (dx + 12, dy + 4))
+    return out
+
+
+_SKIN_PARTS = (
+    ((-4, 24, -4), (8, 8, 8), (0, 0), (32, 0), 0.5),
+    ((-4, 12, -2), (8, 12, 4), (16, 16), (16, 32), 0.25),
+    ((-8, 12, -2), (4, 12, 4), (40, 16), (40, 32), 0.25),
+    ((4, 12, -2), (4, 12, 4), (32, 48), (48, 48), 0.25),
+    ((-4, 0, -2), (4, 12, 4), (0, 16), (0, 32), 0.25),
+    ((0, 0, -2), (4, 12, 4), (16, 48), (0, 48), 0.25),
+)
+_FACE_NORMALS = {"front": (0, 0, 1), "back": (0, 0, -1), "right": (-1, 0, 0),
+                 "left": (1, 0, 0), "top": (0, 1, 0), "bottom": (0, -1, 0)}
+
+
+def _skin_build_geometry(skin):
+    px = skin.load()
+    faces = []
+    for (x0, y0, z0), (w, h, d), uv_base, uv_over, infl in _SKIN_PARTS:
+        for (u, v), e in ((uv_base, 0.0), (uv_over, infl)):
+            regions = {
+                "front": (u + d, v + d, w, h), "back": (u + 2 * d + w, v + d, w, h),
+                "right": (u, v + d, d, h), "left": (u + d + w, v + d, d, h),
+                "top": (u + d, v, w, d), "bottom": (u + d + w, v, w, d),
+            }
+            X0, X1, Y0, Y1, Z0, Z1 = x0 - e, x0 + w + e, y0 - e, y0 + h + e, z0 - e, z0 + d + e
+            for name, (ru, rv, nu, nv) in regions.items():
+                texels = []
+                for j in range(nv):
+                    for i in range(nu):
+                        r, g, b, a = px[ru + i, rv + j]
+                        if a >= 128:
+                            texels.append((i, j, (r, g, b)))
+                if not texels:
+                    continue
+
+                def vert(i, j, name=name, nu=nu, nv=nv, X0=X0, X1=X1, Y0=Y0, Y1=Y1, Z0=Z0, Z1=Z1):
+                    s, t = i / nu, j / nv
+                    if name == "front":
+                        return (X0 + (X1 - X0) * s, Y1 - (Y1 - Y0) * t, Z1)
+                    if name == "back":
+                        return (X1 - (X1 - X0) * s, Y1 - (Y1 - Y0) * t, Z0)
+                    if name == "right":
+                        return (X0, Y1 - (Y1 - Y0) * t, Z0 + (Z1 - Z0) * s)
+                    if name == "left":
+                        return (X1, Y1 - (Y1 - Y0) * t, Z1 - (Z1 - Z0) * s)
+                    if name == "top":
+                        return (X0 + (X1 - X0) * s, Y1, Z0 + (Z1 - Z0) * t)
+                    return (X0 + (X1 - X0) * s, Y0, Z1 - (Z1 - Z0) * t)
+
+                grid = [[vert(i, j) for i in range(nu + 1)] for j in range(nv + 1)]
+                faces.append((name, grid, texels, ((X0 + X1) / 2, (Y0 + Y1) / 2, (Z0 + Z1) / 2)))
+    return faces
+
+
+def render_skin_model(faces, yaw, pitch, w, h, ss=2):
+    """Рисует модель игрока в RGBA-картинку w×h (мягкая тень под ногами, без сглаживания текселей)."""
+    cy_, sy_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    cp_, sp_ = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
+    D = 110.0
+    f = 0.64 * h / 32.0 * D
+    W, H = w * ss, h * ss
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(img)
+
+    def rot(x, y, z):
+        y -= 16
+        x1, z1 = x * cy_ + z * sy_, -x * sy_ + z * cy_
+        y1, z2 = y * cp_ - z1 * sp_, y * sp_ + z1 * cp_
+        return x1, y1, z2
+
+    def proj(p):
+        k = f / (D - p[2]) * ss
+        return W / 2 + p[0] * k, H * 0.47 - p[1] * k
+
+    sx0, sy0 = proj(rot(0, -0.3, 0))
+    rw, rh = 11 * f / D * ss, 2.4 * f / D * ss
+    dr.ellipse((sx0 - rw, sy0 - rh, sx0 + rw, sy0 + rh), fill=(0, 0, 0, 105))
+
+    order = []
+    for name, grid, texels, center in faces:
+        n = _FACE_NORMALS[name]
+        x1, z1 = n[0] * cy_ + n[2] * sy_, -n[0] * sy_ + n[2] * cy_
+        nvec = (x1, n[1] * cp_ - z1 * sp_, n[1] * sp_ + z1 * cp_)
+        if nvec[2] <= 0.02:
+            continue
+        cx, cy2, cz = rot(*center)
+        order.append((cz, name, grid, texels, nvec))
+    order.sort(key=lambda t: t[0])
+    light = (-0.35, 0.55, 0.76)
+    for cz, name, grid, texels, nvec in order:
+        pg = [[proj(rot(*pt)) for pt in row] for row in grid]
+        shade = 0.62 + 0.5 * max(0.0, nvec[0] * light[0] + nvec[1] * light[1] + nvec[2] * light[2])
+        for i, j, (r, g, b) in texels:
+            col = (min(255, int(r * shade)), min(255, int(g * shade)), min(255, int(b * shade)), 255)
+            quad = [pg[j][i], pg[j][i + 1], pg[j + 1][i + 1], pg[j + 1][i]]
+            dr.polygon(quad, fill=col, outline=col)
+    if ss > 1:
+        img = img.reduce(ss)
+    return img
+
+
+class SkinStage(tk.Canvas):
+    HINT = "Потяните мышью, чтобы повернуть"
+
+    def __init__(self, master, app):
+        super().__init__(master, highlightthickness=0, bd=0, bg=_pal("bg"))
+        self.app = app
+        self.yaw, self.pitch = 24.0, 7.0
+        self._drag = None
+        self._idle_at = 0.0
+        self._t0 = time.time()
+        self._faces = None
+        self._skin = _skin_default()
+        self._bg = None
+        self._bg_size = None
+        self._photo = None
+        self._bg_photo = None
+        self._bg_id = None
+        self._img_id = None
+        self._ov_sig = None
+        self.server_info = None
+        self.show_social = False
+        self.friends_online = None
+        self.notif_unread = 0
+        self.pills = []
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+        self._last_draw = 0.0
+        self.after(80, self._tick)
+
+    def set_skin(self, pil):
+        img = _skin_normalize(pil) if pil is not None else None
+        self._skin = img or _skin_default()
+        self._faces = None
+
+    def _press(self, e):
+        for x1, y1, x2, y2, cb in self.pills:
+            if x1 <= e.x <= x2 and y1 <= e.y <= y2:
+                self._drag = None
+                cb()
+                return
+        self._drag = (e.x, e.y, self.yaw, self.pitch)
+        self._idle_at = time.time()
+
+    def _release(self, e):
+        self._drag = None
+        self._idle_at = time.time()
+        self._draw()
+
+    def _motion(self, e):
+        if not self._drag:
+            return
+        x, y, yaw, pitch = self._drag
+        self.yaw = yaw + (e.x - x) * 0.8
+        self.pitch = max(-40.0, min(40.0, pitch + (e.y - y) * 0.4))
+        self._idle_at = time.time()
+        if time.time() - self._last_draw > 0.012:
+            self._draw()
+
+    def _background(self, w, h):
+        if self._bg_size == (w, h) and self._bg is not None:
+            return self._bg
+        try:
+            grad = Image.radial_gradient("L").resize((w, h), Image.BICUBIC)
+            base = Image.new("RGB", (w, h), _pal("bg"))
+            glow = Image.new("RGB", (w, h), "#2f3b36")
+            bg = Image.composite(base, glow, grad.point(lambda v: min(255, int(v * 1.5)))).convert("RGBA")
+        except Exception:
+            bg = Image.new("RGBA", (w, h), _pal("bg"))
+        self._bg, self._bg_size = bg, (w, h)
+        return bg
+
+    def _tick(self):
+        try:
+            if self.winfo_viewable() and self.winfo_width() > 80:
+                self._draw()
+        except Exception:
+            pass
+        self.after(33, self._tick)
+
+    def _draw(self):
+        self._last_draw = time.time()
+        w, h = self.winfo_width(), self.winfo_height()
+        if self._faces is None:
+            self._faces = _skin_build_geometry(self._skin)
+        if time.time() - self._idle_at > 4.0:
+            self.yaw = 24.0 + 22.0 * math.sin((time.time() - self._t0) * 0.7)
+            self.pitch += (7.0 - self.pitch) * 0.1
+        lw = int(h * 0.82)
+        moving = self._drag is not None and time.time() - self._idle_at < 0.25
+        model = render_skin_model(self._faces, self.yaw, self.pitch, lw, h, ss=1 if moving else 2)
+        if self._bg_size != (w, h) or self._bg_id is None:
+            bg = self._background(w, h)
+            self._bg_photo = ImageTk.PhotoImage(bg.convert("RGB"))
+            if self._bg_id is None:
+                self._bg_id = self.create_image(0, 0, image=self._bg_photo, anchor="nw")
+                self._img_id = self.create_image(0, 0, anchor="nw")
+            else:
+                self.itemconfigure(self._bg_id, image=self._bg_photo)
+            self._ov_sig = None
+        box = model.getbbox()
+        if box:
+            self._photo = ImageTk.PhotoImage(model.crop(box))
+            self.itemconfigure(self._img_id, image=self._photo, state="normal")
+            self.coords(self._img_id, (w - lw) // 2 + box[0], box[1])
+        else:
+            self.itemconfigure(self._img_id, state="hidden")
+        self.tag_raise("ov")
+        self._overlay(w, h)
+
+    def _overlay(self, w, h):
+        info = self.server_info
+        sig = (w, h, repr(info), self.show_social, self.friends_online, self.notif_unread)
+        if sig == self._ov_sig:
+            return
+        self._ov_sig = sig
+        self.delete("ov")
+        self.pills = []
+        if self.show_social:
+            specs = (("ДРУЗЬЯ В СЕТИ", "—" if self.friends_online is None else str(self.friends_online), 16, 170,
+                      getattr(self.app, "_friends_popup_toggle", None), self.friends_online),
+                     ("УВЕДОМЛЕНИЯ", str(self.notif_unread), 194, 150,
+                      getattr(self.app, "_open_notifs", None), self.notif_unread))
+            for label, val, x0, wd, cb, hot in specs:
+                self.create_rectangle(x0, 16, x0 + wd, 66, fill=_pal("surface"), outline="#000000", width=2, tags="ov")
+                self.create_text(x0 + 12, 28, text=label, fill=_pal("text_dim"), font=("Segoe UI", 8), anchor="w", tags="ov")
+                self.create_text(x0 + 12, 49, text=val, fill=_pal("accent") if hot else _pal("text"),
+                                 font=("Segoe UI Semibold", 15), anchor="w", tags="ov")
+                if cb:
+                    self.pills.append((x0, 16, x0 + wd, 66, cb))
+        self.create_text(w / 2, h - 14, text=self.HINT, fill=_pal("text_dim"), font=("Segoe UI", 9), tags="ov")
+        if info:
+            x1, y1, x2, y2 = w - 250, 16, w - 16, 104
+            self.create_rectangle(x1, y1, x2, y2, fill=_pal("surface"), outline=_pal("border"), tags="ov")
+            self.create_text(x1 + 14, y1 + 16, text="СЕРВЕР", fill=_pal("accent"), font=("Segoe UI", 8, "bold"), anchor="w", tags="ov")
+            self.create_text(x1 + 14, y1 + 38, text=info.get("name", ""), fill=_pal("text"), font=("Segoe UI Semibold", 13), anchor="w", tags="ov")
+            self.create_text(x1 + 14, y1 + 62, text=info.get("line", ""), fill=_pal("text_dim"), font=("Segoe UI", 9), anchor="w", tags="ov")
+            self.create_rectangle(x1 + 14, y1 + 74, x1 + 24, y1 + 80, fill=_pal("accent") if info.get("ok") else _pal("text_faint"), outline="", tags="ov")
 
 
 def detect_game_version_and_loader(version_id):
@@ -6801,6 +7325,173 @@ def _install_universal_clipboard_bindings(root):
         root.bind_class(widget_class, "<Control-KeyPress>", _handle, add="+")
 
 
+def _dlg_base(parent, title, w, h):
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.configure(bg=_pal("bg"))
+    win.resizable(False, False)
+    win.transient(parent)
+    parent.update_idletasks()
+    x = parent.winfo_rootx() + max(0, (parent.winfo_width() - w) // 2)
+    y = parent.winfo_rooty() + max(0, (parent.winfo_height() - h) // 2)
+    win.geometry(f"{w}x{h}+{x}+{y}")
+    return win
+
+
+def _dlg_label(parent, text, size=10, bold=False, color="text", **kw):
+    return tk.Label(parent, text=text, bg=_pal("bg"), fg=_pal(color),
+                    font=("Segoe UI", size, "bold" if bold else "normal"), **kw)
+
+
+class AuthDialog:
+
+    def __init__(self, app, expired=False):
+        self.app = app
+        self.mode = "login"
+        self.win = win = tk.Frame(app.root, bg=_pal("bg"))
+        win.place(x=0, y=0, relwidth=1, relheight=1)
+        win.lift()
+        quit_lbl = _dlg_label(win, "Выход", 9, color="text_dim", cursor="hand2")
+        quit_lbl.place(relx=1.0, x=-18, y=12, anchor="ne")
+        quit_lbl.bind("<Button-1>", lambda e: app.root.destroy())
+        _dlg_label(win, f"Mafin Launcher v{APP_VERSION}", 9, color="text_faint").place(x=24, rely=1.0, y=-14, anchor="sw")
+        holder = tk.Frame(win, bg=_pal("bg"))
+        holder.pack(fill="both", expand=True, pady=(40, 30))
+        body = make_scrollable(holder)
+        body.configure(style="TFrame")
+        body = tk.Frame(body, bg=_pal("bg"), width=400)
+        body.place(relx=0.5, rely=0.5, anchor="center")
+        body.master.configure(height=480)
+        _dlg_label(body, "Вход в Mafin", 17, True).pack(anchor="w")
+        _dlg_label(body, "Аккаунт нужен для скинов, друзей и статистики", 9, color="text_dim").pack(anchor="w", pady=(2, 14))
+        if expired:
+            tk.Label(body, text="Сессия истекла. Войдите снова.", bg="#221e14", fg="#d9a24a",
+                     font=("Segoe UI", 9), anchor="w", padx=10, pady=8).pack(fill="x", pady=(0, 12))
+        tabs = tk.Frame(body, bg=_pal("bg"))
+        tabs.pack(fill="x", pady=(0, 14))
+        self.tab_btns = {}
+        for key, text in (("login", "Вход"), ("register", "Регистрация")):
+            b = tk.Label(tabs, text=text, bg=_pal("bg"), fg=_pal("text_dim"), font=("Segoe UI", 10),
+                         padx=14, pady=6, cursor="hand2")
+            b.pack(side="left")
+            b.bind("<Button-1>", lambda e, k=key: self._set_mode(k))
+            self.tab_btns[key] = b
+        self.line = tk.Frame(body, bg=_pal("border"), height=1)
+        self.line.pack(fill="x", pady=(0, 14))
+        _dlg_label(body, "НИКНЕЙМ", 8, color="text_dim").pack(anchor="w")
+        self.nick = tk.StringVar(value=app.config.get("server_nickname", ""))
+        self.pw = tk.StringVar()
+        self.e1 = ttk.Entry(body, textvariable=self.nick, width=44)
+        self.e1.pack(fill="x", pady=(4, 12), ipady=4)
+        _dlg_label(body, "ПАРОЛЬ", 8, color="text_dim").pack(anchor="w")
+        self.e2 = ttk.Entry(body, textvariable=self.pw, show="*")
+        self.e2.pack(fill="x", pady=(4, 6), ipady=4)
+        self.msg = tk.Label(body, text="", bg=_pal("bg"), fg="#d96b6b", font=("Segoe UI", 9), anchor="w",
+                            wraplength=360, justify="left")
+        self.msg.pack(fill="x", pady=(2, 6))
+        self.go = ttk.Button(body, text="Войти", style="Accent.TButton", command=self._submit)
+        self.go.pack(fill="x", ipady=6)
+        skip = _dlg_label(body, "Играть без аккаунта", 9, color="text_dim", cursor="hand2")
+        skip.pack(anchor="w", pady=(14, 0))
+        skip.bind("<Button-1>", lambda e: self._skip())
+        for e in (self.e1, self.e2):
+            e.bind("<Return>", lambda ev: self._submit())
+            e.bind("<Escape>", lambda ev: self._skip())
+        self._set_mode("login")
+        (self.e2 if self.nick.get() else self.e1).focus_set()
+
+    def _set_mode(self, mode):
+        self.mode = mode
+        for k, b in self.tab_btns.items():
+            b.config(fg=_pal("text") if k == mode else _pal("text_dim"))
+        self.go.config(text="Войти" if mode == "login" else "Создать аккаунт")
+        self.msg.config(text="")
+
+    def _skip(self):
+        self.app.config["auth_skipped"] = True
+        save_json_file(CONFIG_FILE, self.app.config)
+        self.win.destroy()
+
+    def _submit(self):
+        nick, pw = self.nick.get().strip(), self.pw.get().strip()
+        if not nick or not pw:
+            self.msg.config(text="Введите никнейм и пароль.")
+            return
+        app = self.app
+        app._current_server_url()
+        self.go.config(state="disabled")
+        self.msg.config(text="", fg="#8f9b97")
+        mode = self.mode
+
+        def work():
+            if mode == "register":
+                st, data = app.api.register(nick, pw)
+                if not (st == 201 and data.get("success")):
+                    return st, data
+            return app.api.login(nick, pw)
+
+        def done(result, error):
+            if not self.win.winfo_exists():
+                return
+            self.go.config(state="normal")
+            if error:
+                self.msg.config(text=f"Сервер недоступен: {error}", fg="#d96b6b")
+                return
+            st, data = result
+            if st == 200 and data.get("success"):
+                app.server_nick_var.set(nick)
+                app._on_server_login_success(persist=True)
+                app.config["auth_skipped"] = False
+                save_json_file(CONFIG_FILE, app.config)
+                self.win.destroy()
+            else:
+                self.msg.config(text=data.get("error", "Не удалось выполнить"), fg="#d96b6b")
+
+        app._async(work, done)
+
+
+class UpdateDialog:
+
+    def __init__(self, app, data, remote_version, changelog):
+        self.app, self.data, self.ver = app, data, remote_version
+        self.win = win = _dlg_base(app.root, "Доступно обновление", 600, 440)
+        body = tk.Frame(win, bg=_pal("bg"))
+        body.pack(fill="both", expand=True, padx=26, pady=22)
+        _dlg_label(body, "Доступно обновление", 17, True).pack(anchor="w")
+        _dlg_label(body, "Mafin Launcher", 9, color="text_dim").pack(anchor="w", pady=(2, 14))
+        row = tk.Frame(body, bg=_pal("surface2"), highlightthickness=1, highlightbackground=_pal("border"))
+        row.pack(fill="x", pady=(0, 14))
+        tk.Label(row, text=APP_VERSION, bg=_pal("surface2"), fg=_pal("text_dim"), font=("Segoe UI", 10)).pack(side="left", padx=(12, 8), pady=10)
+        tk.Label(row, text="→", bg=_pal("surface2"), fg=_THEME["accent"], font=("Segoe UI", 11)).pack(side="left")
+        tk.Label(row, text=remote_version, bg=_pal("surface2"), fg=_pal("text"), font=("Segoe UI", 12, "bold")).pack(side="left", padx=8)
+        _dlg_label(body, "ЧТО НОВОГО", 8, color="text_dim").pack(anchor="w")
+        box = tk.Text(body, height=8, wrap="word", bg=_pal("surface"), fg=_pal("text"), relief="flat",
+                      highlightthickness=1, highlightbackground=_pal("border"), font=("Segoe UI", 10), padx=10, pady=8)
+        box.insert("1.0", changelog)
+        box.config(state="disabled")
+        box.pack(fill="both", expand=True, pady=(4, 14))
+        btns = tk.Frame(body, bg=_pal("bg"))
+        btns.pack(fill="x")
+        skip = _dlg_label(btns, "Пропустить версию", 9, color="text_dim", cursor="hand2")
+        skip.pack(side="left")
+        skip.bind("<Button-1>", lambda e: self._skip())
+        ttk.Button(btns, text="Обновить и перезапустить", style="Accent.TButton", command=self._go).pack(side="right")
+        later = tk.Label(btns, text="Позже", bg=_pal("surface2"), fg=_pal("text"), font=("Segoe UI", 10),
+                         padx=16, pady=7, cursor="hand2", highlightthickness=1, highlightbackground=_pal("border"))
+        later.pack(side="right", padx=8)
+        later.bind("<Button-1>", lambda e: win.destroy())
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+    def _skip(self):
+        self.app.config["skip_update"] = self.ver
+        save_json_file(CONFIG_FILE, self.app.config)
+        self.win.destroy()
+
+    def _go(self):
+        self.win.destroy()
+        self.app._download_and_apply_update(self.data)
+
+
 class LauncherApp:
     def __init__(self, root):
         self.root = root
@@ -6825,6 +7516,7 @@ class LauncherApp:
         self._tray_notified = False
         self._loader_tokens = {}
         self._pending_loader_version = {}
+        self._install_cancel = threading.Event()
         self.p2p = P2PManager(log_callback=self._p2p_log)
         self.stats = StatsManager()
         self.achievements = AchievementManager(self.stats, self.config)
@@ -6884,6 +7576,7 @@ class LauncherApp:
         self._setup_hotkeys()
         self._try_restore_server_session()
         self.root.after(1500, self._check_for_updates)
+        self.root.after(3000, self._social_poll)
 
     _HOTKEY_KEYSYMS = {
         "l": "launch", "cyrillic_de": "launch",
@@ -7315,10 +8008,18 @@ class LauncherApp:
         style = ttk.Style()
         self._style = style
         _THEME["root"] = self.root
+        if not self.config.get("ui_v2"):
+            self.config["ui_v2"] = True
+            self.config["window_material"] = "solid"
+            self.config["nav_style"] = "groups"
+            try:
+                self.save_config()
+            except Exception:
+                pass
         theme_key = self.config.get("launcher_theme", DEFAULT_LAUNCHER_THEME)
         theme = LAUNCHER_THEMES.get(theme_key, LAUNCHER_THEMES[DEFAULT_LAUNCHER_THEME])
         material = self.config.get("window_material", DEFAULT_WINDOW_MATERIAL)
-        if material not in WINDOW_MATERIALS:
+        if material not in WINDOW_MATERIALS or _hdr_active():
             material = "solid"
         set_theme(material, theme["accent"], theme["accent_hover"])
         apply_ttk_styles(style, self.root)
@@ -7367,6 +8068,7 @@ class LauncherApp:
             ("🎁 Подарки", self.build_gifts_tab),
             ("👑 Привилегии", self.build_privileges_tab),
             ("📋 Задания", self.build_quests_tab),
+            ("🔔 Уведомления", self.build_notifs_tab),
             ("🛡️ Админка", self.build_admin_tab),
             ("⚙️ Настройки", self.build_settings_tab),
             ("📰 Новости", self.build_news_tab),
@@ -7382,21 +8084,24 @@ class LauncherApp:
         self.notebook.tab = _tab
         self._orig_notebook_tab = _orig_tab
 
+        _setup_wheel(self.root)
         for name, builder in tabs:
             tab = ttk.Frame(self.notebook)
             self.notebook.add(tab, text=name)
             self._add_nav_item(name, tab)
-            builder(tab)
+            inner = tab if name.endswith("Игра") else make_scrollable(tab)
+            builder(inner)
+            self._polish_tab(inner)
             if name == "🛡️ Админка":
                 self.admin_tab_id = tab
             if name == "👥 Друзья":
-                self.friends_tab_frame = tab
+                self.friends_tab_frame = inner
             if name == "📋 Задания":
-                self.quests_tab_frame = tab
+                self.quests_tab_frame = inner
             if name == "🎁 Подарки":
-                self.gifts_tab_frame = tab
+                self.gifts_tab_frame = inner
             if name == "👑 Привилегии":
-                self.privileges_tab_frame = tab
+                self.privileges_tab_frame = inner
 
         if self.admin_tab_id is not None:
             self.notebook.tab(self.admin_tab_id, state="hidden")
@@ -7404,6 +8109,41 @@ class LauncherApp:
         self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._nav_sync(), add="+")
         self._nav_sync()
         self._update_stats_label()
+
+    _EMOJI_LEAD = re.compile("^[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF\ufe0f\u200d\\s]+")
+
+    def _polish_tab(self, widget):
+        for w in widget.winfo_children():
+            cls = w.winfo_class()
+            if cls in ("TButton", "TLabel", "TCheckbutton", "TRadiobutton", "TLabelframe", "Button", "Label"):
+                try:
+                    txt = str(w.cget("text"))
+                except tk.TclError:
+                    txt = ""
+                new = self._EMOJI_LEAD.sub("", txt)
+                if txt and new and new != txt and len(new) > 1:
+                    try:
+                        w.configure(text=new)
+                    except tk.TclError:
+                        pass
+            elif cls == "Listbox":
+                try:
+                    w.configure(highlightthickness=2, highlightbackground="#000000", activestyle="none",
+                                selectbackground=_sel_bg())
+                except tk.TclError:
+                    pass
+            self._polish_tab(w)
+
+    def _to_toolbar(self, bar, before, per_row=5):
+        bar.pack_forget()
+        bar.pack(in_=before.master, fill="x", padx=10, pady=(10, 0), before=before)
+        kids = list(bar.winfo_children())
+        for c in kids:
+            c.pack_forget()
+        for i, c in enumerate(kids):
+            c.grid(row=i // per_row, column=i % per_row, sticky="ew", padx=(0, 6), pady=3)
+        for col in range(per_row):
+            bar.columnconfigure(col, weight=1, uniform="tb")
 
     def _sync_color_attrs(self):
         self._bg, self._bg2 = _pal("bg"), _pal("surface")
@@ -7413,7 +8153,17 @@ class LauncherApp:
         "list": "📃 Список (с полоской)",
         "pill": "💊 Пилюли (акцентная заливка)",
         "compact": "▫️ Компактно (только иконки)",
+        "groups": "🗂️ Группы (карточки, перетаскивание)",
     }
+    NAV_PIN_TOP = ("Игра",)
+    NAV_PIN_BOTTOM = ("Настройки",)
+    NAV_DEFAULT_GROUPS = (
+        ("Запуск", ("Профили", "Скин", "Сборки", "Версии", "Моды", "Ресурспаки")),
+        ("Сообщество", ("Уведомления", "Друзья", "Серверы", "P2P", "Топ недели", "Ачивки", "Задания")),
+        ("Магазин", ("Подарки", "Привилегии")),
+        ("Данные", ("Бэкапы", "Скриншоты", "Логи")),
+        ("Прочее", ("Новости", "Аккаунт", "Админка", "О программе")),
+    )
 
     @staticmethod
     def _rrect(cv, x1, y1, x2, y2, r, **kw):
@@ -7422,10 +8172,11 @@ class LauncherApp:
         return cv.create_polygon(pts, smooth=True, **kw)
 
     def _build_sidebar(self, parent, before=None):
-        style = self.config.get("nav_style", "list")
+        style = self.config.get("nav_style", "groups")
         if style not in self.NAV_STYLES:
-            style = "list"
+            style = "groups"
         self._nav_style = style
+        self._nav_heads, self._nav_new, self._nav_bottom, self._nav_bottom_items, self._nav_acc = [], None, None, None, None
         compact = style == "compact"
         width = 72 if compact else 236
         side = tk.Frame(parent, width=width)
@@ -7445,7 +8196,7 @@ class LauncherApp:
             toggle.pack(pady=(8, 0))
         else:
             toggle.pack(side="right")
-            tk.Label(brand, text="⚡ Mafin", anchor="w", fg=_pal("text"),
+            tk.Label(brand, text="Mafin" if style == "groups" else "⚡ Mafin", anchor="w", fg=_pal("text"),
                      font=("Segoe UI Semibold", 18)).pack(fill="x")
             tk.Label(brand, text=f"Launcher  •  v{APP_VERSION}", anchor="w",
                      fg=_pal("text_dim"), font=("Segoe UI", 8)).pack(fill="x")
@@ -7453,11 +8204,21 @@ class LauncherApp:
         play = tk.Label(side, text="▶" if compact else "▶  Играть", cursor="hand2",
                         bg=_pal("accent"), fg="#ffffff", pady=10,
                         font=("Segoe UI", 12 if compact else 11, "bold"))
-        play.pack(side="bottom", fill="x", padx=12, pady=(6, 14))
+        if style != "groups":
+            play.pack(side="bottom", fill="x", padx=12, pady=(6, 14))
         play.bind("<Button-1>", lambda e: self.launch_only())
         play.bind("<Enter>", lambda e: play.configure(bg=_pal("accent_hover")))
         play.bind("<Leave>", lambda e: play.configure(bg=_pal("accent")))
 
+        if style == "groups":
+            self._nav_bottom = tk.Frame(side)
+            self._nav_bottom.pack(side="bottom", fill="x", padx=8, pady=(0, 4))
+            self._nav_bottom_items = tk.Frame(self._nav_bottom)
+            self._nav_bottom_items.pack(fill="x")
+            self._nav_acc = tk.Canvas(self._nav_bottom, highlightthickness=0, bd=0, height=56, cursor="hand2")
+            self._nav_acc.pack(fill="x", pady=(2, 0))
+            self._nav_acc.bind("<Configure>", lambda e: self._nav_acc_paint())
+            self._nav_acc.bind("<Button-1>", lambda e: self._nav_acc_click())
         self._nav_canvas = tk.Canvas(side, highlightthickness=0, bd=0, width=width)
         self._nav_canvas.pack(fill="both", expand=True)
         self._nav_inner = tk.Frame(self._nav_canvas)
@@ -7502,15 +8263,403 @@ class LauncherApp:
         if not text:
             icon, text = "•", name
         compact = self._nav_style == "compact"
-        cv = tk.Canvas(self._nav_inner, highlightthickness=0, bd=0, cursor="hand2",
-                       height=44 if compact else 40, width=56 if compact else 10)
+        groups = self._nav_style == "groups"
+        master = self._nav_bottom_items if (groups and text in self.NAV_PIN_BOTTOM) else self._nav_inner
+        cv = tk.Canvas(master, highlightthickness=0, bd=0, cursor="hand2",
+                       height=44 if compact else (36 if groups else 40), width=56 if compact else 10)
         item = {"tab": tab, "cv": cv, "icon": icon, "text": text, "hover": False}
         self._nav_items.append(item)
-        cv.bind("<Button-1>", lambda e, t=tab: self.notebook.select(t))
+        if groups:
+            cv.bind("<ButtonPress-1>", lambda e, i=item: self._nav_press(e, i))
+            cv.bind("<B1-Motion>", lambda e, i=item: self._nav_motion(e, i))
+            cv.bind("<ButtonRelease-1>", lambda e, i=item: self._nav_release(e, i))
+        else:
+            cv.bind("<Button-1>", lambda e, t=tab: self.notebook.select(t))
         cv.bind("<Enter>", lambda e, i=item: self._nav_hover(i, True))
         cv.bind("<Leave>", lambda e, i=item: self._nav_hover(i, False))
         cv.bind("<Configure>", lambda e, i=item: self._nav_paint(i))
         cv.bind("<MouseWheel>", self._nav_wheel)
+
+    def _nav_item_hidden(self, item):
+        try:
+            return str(self._orig_notebook_tab(item["tab"], "state")) == "hidden"
+        except Exception:
+            return False
+
+    def _nav_groups_cfg(self):
+        by_text = {i["text"]: i for i in self._nav_items}
+        pinned = set(self.NAV_PIN_TOP) | set(self.NAV_PIN_BOTTOM)
+        groups = self.config.get("nav_groups")
+        if not isinstance(groups, list) or not groups:
+            groups = [{"name": n, "open": True, "items": list(it)} for n, it in self.NAV_DEFAULT_GROUPS]
+        seen, clean = set(), []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            items = [t for t in g.get("items", []) if t in by_text and t not in pinned and t not in seen]
+            seen.update(items)
+            clean.append({"name": str(g.get("name") or "Группа"), "open": bool(g.get("open", True)), "items": items})
+        rest = [t for t in by_text if t not in seen and t not in pinned]
+        if rest:
+            tgt = next((g for g in clean if g["name"] == "Прочее"), None)
+            if tgt is None:
+                tgt = {"name": "Прочее", "open": True, "items": []}
+                clean.append(tgt)
+            tgt["items"] += rest
+        self.config["nav_groups"] = clean
+        return clean
+
+    def _nav_sync_groups(self):
+        for w in self._nav_heads:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._nav_heads = []
+        if self._nav_new is not None:
+            try:
+                self._nav_new.destroy()
+            except Exception:
+                pass
+            self._nav_new = None
+        for item in self._nav_items:
+            item["cv"].pack_forget()
+        by_text = {i["text"]: i for i in self._nav_items}
+        groups = self._nav_groups_cfg()
+        for t in self.NAV_PIN_TOP:
+            it = by_text.get(t)
+            if it and not self._nav_item_hidden(it):
+                it["cv"].pack(fill="x", padx=8, pady=(2, 4))
+        for gi, g in enumerate(groups):
+            head = self._nav_make_head(gi, g)
+            head.pack(fill="x", padx=8, pady=(6, 2))
+            self._nav_heads.append(head)
+            if g["open"]:
+                for t in g["items"]:
+                    it = by_text[t]
+                    if not self._nav_item_hidden(it):
+                        it["cv"].pack(fill="x", padx=8, pady=1)
+        new = tk.Label(self._nav_inner, text="+  Новая группа", fg=_pal("text_faint"), cursor="hand2",
+                       font=("Segoe UI", 9), pady=7, highlightthickness=1, highlightbackground=_pal("border"))
+        new.bind("<Button-1>", lambda e: self._nav_new_group())
+        new.bind("<MouseWheel>", self._nav_wheel)
+        new.pack(fill="x", padx=8, pady=(8, 6))
+        self._nav_new = new
+        for t in self.NAV_PIN_BOTTOM:
+            it = by_text.get(t)
+            if it and not self._nav_item_hidden(it):
+                it["cv"].pack(fill="x", pady=1)
+        for item in self._nav_items:
+            self._nav_paint(item)
+        self._nav_acc_paint()
+        self.root.after(30, self._nav_reveal_selected)
+        try:
+            title = self._orig_notebook_tab(self.notebook.select(), "text")
+            self._page_title.configure(text=title.partition(" ")[2] or title)
+        except Exception:
+            pass
+
+    def _nav_reveal_selected(self):
+        try:
+            sel = str(self.notebook.select())
+            for it in self._nav_items:
+                if str(it["tab"]) == sel and it["cv"].winfo_ismapped() and it["text"] not in self.NAV_PIN_BOTTOM:
+                    cv, inner = self._nav_canvas, self._nav_inner
+                    top = it["cv"].winfo_y()
+                    bottom = top + it["cv"].winfo_height()
+                    view_h = cv.winfo_height()
+                    total = max(inner.winfo_height(), 1)
+                    y0 = cv.canvasy(0)
+                    if top < y0:
+                        cv.yview_moveto(max(0, top - 6) / total)
+                    elif bottom > y0 + view_h:
+                        cv.yview_moveto((bottom - view_h + 6) / total)
+                    return
+        except Exception:
+            pass
+
+    def _nav_make_head(self, gi, g):
+        cv = tk.Canvas(self._nav_inner, highlightthickness=0, bd=0, cursor="hand2", height=32)
+        cv._nav_gi, cv._nav_group, cv._drop = gi, g, False
+        cv.bind("<Configure>", lambda e, c=cv: self._nav_paint_head(c))
+        cv.bind("<Button-1>", lambda e, c=cv: self._nav_toggle_group(c._nav_gi))
+        cv.bind("<Button-3>", lambda e, c=cv: self._nav_group_menu(e, c._nav_gi))
+        cv.bind("<MouseWheel>", self._nav_wheel)
+        return cv
+
+    def _nav_paint_head(self, cv):
+        g = cv._nav_group
+        w, h = max(cv.winfo_width(), 20), 32
+        cv.delete("all")
+        accent = _pal("accent")
+        cv.create_rectangle(2, 2, w - 2, h - 2, fill=_pal("surface2") if cv._drop else _pal("surface"),
+                            outline=accent if cv._drop else _pal("border"), width=2 if cv._drop else 1,
+                            dash=(3, 2) if cv._drop else ())
+        cv.create_text(14, h / 2, text="v" if g["open"] else ">", fill=accent, font=("Consolas", 10, "bold"))
+        cv.create_text(30, h / 2, text=g["name"], fill=_pal("text"), font=("Segoe UI Semibold", 10), anchor="w")
+        cv.create_text(w - 12, h / 2, text=str(len(g["items"])), fill=_pal("text_dim"), font=("Segoe UI", 9), anchor="e")
+
+    def _nav_toggle_group(self, gi):
+        groups = self.config.get("nav_groups") or []
+        if 0 <= gi < len(groups):
+            groups[gi]["open"] = not groups[gi]["open"]
+            self.save_config()
+            self._nav_sync()
+
+    def _nav_group_menu(self, event, gi):
+        groups = self.config.get("nav_groups") or []
+        if not 0 <= gi < len(groups):
+            return
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Переименовать", command=lambda: self._nav_rename_group(gi))
+        m.add_command(label="Выше", command=lambda: self._nav_move_group(gi, -1), state="normal" if gi > 0 else "disabled")
+        m.add_command(label="Ниже", command=lambda: self._nav_move_group(gi, 1), state="normal" if gi < len(groups) - 1 else "disabled")
+        m.add_separator()
+        m.add_command(label="Удалить группу (вкладки уйдут в «Прочее»)", command=lambda: self._nav_delete_group(gi))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def _nav_rename_group(self, gi):
+        groups = self.config["nav_groups"]
+        name = simpledialog.askstring("Группа", "Название группы:", initialvalue=groups[gi]["name"], parent=self.root)
+        if name and name.strip():
+            groups[gi]["name"] = name.strip()[:24]
+            self.save_config()
+            self._nav_sync()
+
+    def _nav_move_group(self, gi, d):
+        groups = self.config["nav_groups"]
+        j = gi + d
+        if 0 <= j < len(groups):
+            groups[gi], groups[j] = groups[j], groups[gi]
+            self.save_config()
+            self._nav_sync()
+
+    def _nav_delete_group(self, gi):
+        groups = self.config["nav_groups"]
+        g = groups.pop(gi)
+        if g["items"]:
+            tgt = next((x for x in groups if x["name"] == "Прочее"), None)
+            if tgt is None:
+                tgt = {"name": "Прочее", "open": True, "items": []}
+                groups.append(tgt)
+            tgt["items"] += g["items"]
+        self.save_config()
+        self._nav_sync()
+
+    def _nav_new_group(self, first_item=None):
+        name = simpledialog.askstring("Новая группа", "Название группы:", parent=self.root)
+        if not name or not name.strip():
+            return None
+        groups = self._nav_groups_cfg()
+        groups.append({"name": name.strip()[:24], "open": True, "items": [first_item] if first_item else []})
+        self.save_config()
+        self._nav_sync()
+        return len(groups) - 1
+
+    def _nav_press(self, event, item):
+        self._nd = {"item": item, "x": event.x_root, "y": event.y_root, "on": False, "ghost": None, "hit": None}
+
+    def _nav_motion(self, event, item):
+        d = getattr(self, "_nd", None)
+        if not d or d["item"] is not item:
+            return
+        if item["text"] in self.NAV_PIN_TOP or item["text"] in self.NAV_PIN_BOTTOM:
+            return
+        if not d["on"]:
+            if abs(event.x_root - d["x"]) + abs(event.y_root - d["y"]) < 8:
+                return
+            d["on"] = True
+            g = tk.Label(self.root, text=item["text"], bg=_pal("accent"), fg="#08180f",
+                         font=("Segoe UI Semibold", 10), padx=12, pady=5)
+            d["ghost"] = g
+        g = d["ghost"]
+        g.place(x=event.x_root - self.root.winfo_rootx() + 12, y=event.y_root - self.root.winfo_rooty() + 6)
+        g.lift()
+        hit = self._nav_hit(event.x_root, event.y_root)
+        if hit != d["hit"]:
+            self._nav_clear_drop()
+            d["hit"] = hit
+            if hit and hit[0] == "head":
+                for h in self._nav_heads:
+                    h._drop = h._nav_gi == hit[1]
+                    self._nav_paint_head(h)
+            elif hit and hit[0] == "item":
+                by_text = {i["text"]: i for i in self._nav_items}
+                tgt = by_text.get(self.config["nav_groups"][hit[1]]["items"][hit[2]])
+                if tgt is not None and tgt is not item:
+                    tgt["drop"] = True
+                    self._nav_paint(tgt)
+            elif hit and hit[0] == "new" and self._nav_new is not None:
+                self._nav_new.configure(highlightbackground=_pal("accent"), fg=_pal("accent"))
+
+    def _nav_clear_drop(self):
+        for h in self._nav_heads:
+            if h._drop:
+                h._drop = False
+                self._nav_paint_head(h)
+        for i in self._nav_items:
+            if i.get("drop"):
+                i["drop"] = False
+                self._nav_paint(i)
+        if self._nav_new is not None:
+            self._nav_new.configure(highlightbackground=_pal("border"), fg=_pal("text_faint"))
+
+    def _nav_hit(self, xr, yr):
+        def inside(w):
+            return (w.winfo_rootx() <= xr < w.winfo_rootx() + w.winfo_width()
+                    and w.winfo_rooty() <= yr < w.winfo_rooty() + w.winfo_height())
+        for h in self._nav_heads:
+            if inside(h):
+                return ("head", h._nav_gi)
+        by_text = {i["text"]: i for i in self._nav_items}
+        for gi, g in enumerate(self.config.get("nav_groups") or []):
+            if not g["open"]:
+                continue
+            for idx, t in enumerate(g["items"]):
+                it = by_text.get(t)
+                if it and it["cv"].winfo_ismapped() and inside(it["cv"]):
+                    return ("item", gi, idx)
+        if self._nav_new is not None and inside(self._nav_new):
+            return ("new",)
+        return None
+
+    def _nav_release(self, event, item):
+        d = getattr(self, "_nd", None)
+        self._nd = None
+        if not d or d["item"] is not item:
+            return
+        if not d["on"]:
+            self.notebook.select(item["tab"])
+            return
+        try:
+            d["ghost"].destroy()
+        except Exception:
+            pass
+        self._nav_clear_drop()
+        hit = self._nav_hit(event.x_root, event.y_root)
+        if not hit:
+            return
+        groups = self.config["nav_groups"]
+        text = item["text"]
+        before = None
+        if hit[0] == "item":
+            before = groups[hit[1]]["items"][hit[2]]
+            if before == text:
+                return
+        for g in groups:
+            if text in g["items"]:
+                g["items"].remove(text)
+        if hit[0] == "head":
+            groups[hit[1]]["items"].append(text)
+            groups[hit[1]]["open"] = True
+        elif hit[0] == "item":
+            g = groups[hit[1]]
+            g["items"].insert(g["items"].index(before), text)
+        else:
+            if self._nav_new_group(first_item=text) is None:
+                self._nav_groups_cfg()
+                groups[-1]["items"].append(text)
+            return
+        self.save_config()
+        self._nav_sync()
+
+    def _nav_acc_click(self):
+        for it in self._nav_items:
+            if it["text"] == "Аккаунт":
+                self.notebook.select(it["tab"])
+                return
+
+    def _nav_acc_paint(self):
+        cv = getattr(self, "_nav_acc", None)
+        if cv is None:
+            return
+        try:
+            w, h = max(cv.winfo_width(), 40), 56
+        except Exception:
+            return
+        cv.delete("all")
+        cv.create_rectangle(2, 2, w - 2, h - 2, fill=_pal("surface"), outline=_pal("border"))
+        face = getattr(self, "_nav_face_img", None)
+        if face is not None:
+            cv.create_image(14, h / 2, image=face, anchor="w")
+        else:
+            cv.create_rectangle(14, h / 2 - 17, 48, h / 2 + 17, fill=_pal("surface3"), outline="")
+        nick = ""
+        try:
+            nick = self.player_var.get().strip()
+        except Exception:
+            pass
+        cv.create_text(58, h / 2 - 8, text=nick or "Игрок", fill=_pal("text"), font=("Segoe UI Semibold", 10), anchor="w")
+        cv.create_text(58, h / 2 + 9, text="Mafin-аккаунт", fill=_pal("text_dim"), font=("Segoe UI", 8), anchor="w")
+
+    def _skin_pil(self, nick):
+        key = (nick or "").lower()
+        cache = self.__dict__.setdefault("_skin_cache", {})
+        if key in cache:
+            return cache[key]
+        img = None
+        acc = self._get_account_by_name(nick)
+        path = acc.get("skin_path") if acc else None
+        try:
+            if path and os.path.isfile(path):
+                img = Image.open(path).convert("RGBA")
+            else:
+                if nick and self.api.is_logged_in():
+                    try:
+                        code, data = self.api.skin_mine(nick)
+                        sk = (data or {}).get("skin") if code == 200 else None
+                        if sk:
+                            c2, raw = self.api.fetch_bytes(f"/yggdrasil/textures/{sk['hash']}")
+                            if c2 == 200 and raw[:4] == b"\x89PNG":
+                                img = Image.open(io.BytesIO(raw)).convert("RGBA")
+                    except Exception:
+                        img = None
+            if img is None and nick and not (path and os.path.isfile(path)):
+                for url in (f"https://mc-heads.net/skin/{nick}", f"https://minotar.net/skin/{nick}"):
+                    try:
+                        r = requests.get(url, timeout=6)
+                        if r.status_code == 200 and r.content[:4] == b"\x89PNG":
+                            img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            img = None
+        if img is not None and img.size not in ((64, 64), (64, 32)):
+            img = None
+        cache[key] = img
+        return img
+
+    def _nav_account_refresh(self):
+        if not HAS_PIL or getattr(self, "_nav_acc", None) is None:
+            return
+        try:
+            nick = self.player_var.get().strip()
+        except Exception:
+            nick = ""
+
+        def work():
+            skin = self._skin_pil(nick)
+            def apply():
+                st = getattr(self, "skin_stage", None)
+                if st is not None and hasattr(st, "set_skin") and skin is not None:
+                    st.set_skin(skin)
+                st2 = getattr(self, "skin_tab_stage", None)
+                if st2 is not None and skin is not None:
+                    st2.set_skin(skin)
+                if skin is not None:
+                    face = skin.crop((8, 8, 16, 16))
+                    hat = skin.crop((40, 8, 48, 16))
+                    if skin.size == (64, 64) and hat.getbbox() is not None:
+                        face.paste(hat, (0, 0), hat)
+                    self._nav_face_img = ImageTk.PhotoImage(face.resize((34, 34), Image.NEAREST))
+                    if hasattr(self, "acc_head_face") and self.acc_head_face.winfo_exists():
+                        self._acc_head_img = ImageTk.PhotoImage(face.resize((64, 64), Image.NEAREST))
+                        self.acc_head_face.config(image=self._acc_head_img, width=64, height=64)
+                        self.acc_head_name.config(text=nick or "Игрок")
+                self._nav_acc_paint()
+            self.root.after(0, apply)
+        threading.Thread(target=work, daemon=True).start()
 
     def _nav_hover(self, item, state):
         item["hover"] = state
@@ -7546,6 +8695,16 @@ class LauncherApp:
         dim, txt = _pal("text_dim"), _pal("text")
         fg = txt if (selected or hover) else dim
         font = ("Segoe UI Semibold", 10) if selected else ("Segoe UI", 10)
+        if style == "groups":
+            pinned = item["text"] in self.NAV_PIN_TOP or item["text"] in self.NAV_PIN_BOTTOM
+            x0 = 2 if pinned else 16
+            fill = _pal("surface2") if (selected or hover) else _pal("surface")
+            outline = accent if (selected or item.get("drop")) else _pal("border")
+            cv.create_rectangle(x0, 2, w - 2, h - 2, fill=fill, outline=outline,
+                                width=2 if item.get("drop") else 1, dash=(3, 2) if item.get("drop") else ())
+            cv.create_rectangle(x0 + 10, h / 2 - 4, x0 + 18, h / 2 + 4, fill=accent, outline="")
+            cv.create_text(x0 + 30, h / 2, text=item["text"], fill=fg, font=font, anchor="w")
+            return
         if style == "pill":
             if selected:
                 self._rrect(cv, 2, 3, w - 2, h - 3, 17, fill=accent, outline="")
@@ -7566,6 +8725,9 @@ class LauncherApp:
 
     def _nav_sync(self):
         if not hasattr(self, "_nav_items"):
+            return
+        if self._nav_style == "groups":
+            self._nav_sync_groups()
             return
         for item in self._nav_items:
             item["cv"].pack_forget()
@@ -7672,7 +8834,8 @@ class LauncherApp:
         theme = LAUNCHER_THEMES.get(self.config.get("launcher_theme"),
                                     LAUNCHER_THEMES[DEFAULT_LAUNCHER_THEME])
         wanted = self.config.get("window_material", DEFAULT_WINDOW_MATERIAL)
-        if wanted not in WINDOW_MATERIALS:
+        hdr = _hdr_active()
+        if wanted not in WINDOW_MATERIALS or hdr:
             wanted = "solid"
         set_theme(wanted, theme["accent"], theme["accent_hover"])
         applied = apply_window_material(self.root, wanted)
@@ -7728,9 +8891,31 @@ class LauncherApp:
             self._bump_achievement("theme_changes", 1)
 
     def build_game_tab(self, frame):
-        left = ttk.Frame(frame)
-        left.pack(side="left", fill="both", expand=True, padx=15, pady=15)
-
+        self._game_frame = frame
+        self.progress = ttk.Progressbar(frame, orient="horizontal", mode="determinate")
+        bar = tk.Frame(frame, height=88)
+        bar.pack(side="bottom", fill="x", padx=14, pady=(4, 12))
+        bar.pack_propagate(False)
+        self.progress.pack(side="bottom", fill="x", padx=14, pady=(2, 0))
+        self.skin_stage = SkinStage(frame, self) if HAS_PIL else tk.Canvas(frame, highlightthickness=0, bd=0)
+        self.skin_stage.pack(fill="both", expand=True, padx=14, pady=(6, 0))
+        if hasattr(self.skin_stage, "show_social"):
+            self.skin_stage.show_social = True
+        self._game_drawer = tk.Frame(frame, highlightthickness=2, highlightbackground="#000000", bg=_pal("surface"))
+        self._game_bar_build(bar)
+        drawer_head = tk.Frame(self._game_drawer, bg=_pal("surface"))
+        drawer_head.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(drawer_head, text="Параметры запуска", fg=_pal("text"), bg=_pal("surface"),
+                 font=("Segoe UI", 13, "bold")).pack(side="left")
+        close = tk.Label(drawer_head, text="закрыть", fg=_pal("text_dim"), bg=_pal("surface"), cursor="hand2", font=("Segoe UI", 9))
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: self._game_toggle_drawer())
+        body = ttk.Frame(self._game_drawer)
+        body.pack(fill="both", expand=True)
+        for var in (self.version_var, self.modloader_var, self.mem_var):
+            var.trace_add("write", lambda *_: self._game_bar_paint())
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True, padx=15, pady=12)
         search_frame = ttk.Frame(left)
         search_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         ttk.Label(search_frame, text="🔍").pack(side="left")
@@ -7806,10 +8991,8 @@ class LauncherApp:
         self.launch_btn = ttk.Button(btn_frame, text="🚀 Запустить", command=self.launch_only)
         self.launch_btn.pack(side="left", padx=5)
 
-        self.progress = ttk.Progressbar(left, orient="horizontal", length=420, mode="determinate")
-        self.progress.grid(row=8, column=0, columnspan=3, pady=10)
 
-        right = ttk.Frame(frame, width=160)
+        right = ttk.Frame(body, width=160)
         right.pack(side="right", fill="y", padx=15, pady=15)
         if HAS_PIL:
             self.skin_label = ttk.Label(right, text="🧑 Скин")
@@ -7827,6 +9010,202 @@ class LauncherApp:
         ).pack(side="bottom", pady=10)
 
         self._on_loader_change()
+
+
+    def _game_toggle_drawer(self):
+        d = self._game_drawer
+        if d.winfo_ismapped():
+            d.place_forget()
+        else:
+            d.place(x=28, y=22)
+            d.lift()
+
+    def _game_bar_build(self, bar):
+        self._gb = {}
+        for key, width in (("build", None), ("acts", 196), ("play", 310)):
+            cv = tk.Canvas(bar, highlightthickness=0, bd=0, cursor="hand2", **({"width": width} if width else {}))
+            if width:
+                cv.pack(side="right", padx=(8, 0), fill="y")
+            else:
+                cv.pack(side="left", fill="both", expand=True)
+            cv.bind("<Configure>", lambda e: self._game_bar_paint())
+            self._gb[key] = cv
+        self._gb["play"].pack_forget()
+        self._gb["acts"].pack_forget()
+        self._gb["play"].pack(side="right", padx=(8, 0), fill="y")
+        self._gb["acts"].pack(side="right", padx=(8, 0), fill="y")
+        self._gb["build"].bind("<Button-1>", lambda e: self._game_toggle_drawer())
+        self._gb["acts"].bind("<Button-1>", self._game_acts_click)
+        self._gb["play"].bind("<Button-1>", self._game_play_click)
+        self._game_hover = ""
+        for k, cv in self._gb.items():
+            cv.bind("<Enter>", lambda e, k=k: self._game_set_hover(k))
+            cv.bind("<Leave>", lambda e: self._game_set_hover(""))
+        self._game_srv_at = 0.0
+        self.root.after(1500, self._game_bar_loop)
+        self.root.after(2500, self._offer_resume_install)
+
+    def _offer_resume_install(self):
+        p = self.config.get("install_pending")
+        if not p or self.installing:
+            return
+        self.config.pop("install_pending", None)
+        self.save_config()
+        ok = messagebox.askyesno(
+            "Докачать игру?",
+            f"Загрузка версии {p.get('version')} была прервана: лаунчер закрылся или вылетел.\n\nДокачать сейчас? Уже скачанные файлы повторно не качаются.")
+        if not ok:
+            return
+        self.version_var.set(p.get("version", ""))
+        loader = p.get("loader") or "vanilla"
+        self.modloader_var.set(loader)
+        if p.get("loader_version"):
+            self._pending_loader_version[loader] = p["loader_version"]
+        self._on_loader_change()
+        self._resume_install_wait(0, loader)
+
+    def _resume_install_wait(self, tries, loader):
+        if loader != "vanilla" and self._pending_loader_version.get(loader) and tries < 20:
+            self.root.after(500, lambda: self._resume_install_wait(tries + 1, loader))
+            return
+        self.install_and_launch()
+
+    def _game_server_poll(self):
+        pinned = getattr(self, "_pinned_server", None)
+        stage = getattr(self, "skin_stage", None)
+        if not pinned or not pinned.get("address") or not hasattr(stage, "server_info"):
+            if hasattr(stage, "server_info"):
+                stage.server_info = None
+            return
+        host, _, port_s = str(pinned["address"]).partition(":")
+        port = int(port_s) if port_s.isdigit() else 25565
+        name = pinned.get("name") or "Mafin Server"
+
+        def work():
+            res = ping_minecraft_server(host, port)
+            if res:
+                info = {"name": name, "ok": True, "line": f"в сети · {res['online']} игроков · {res['ms']} мс"}
+            else:
+                info = {"name": name, "ok": False, "line": "не отвечает"}
+            try:
+                self.root.after(0, lambda: setattr(stage, "server_info", info))
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def _game_set_hover(self, k):
+        self._game_hover = k
+        self._game_bar_paint()
+
+    def _game_bar_loop(self):
+        try:
+            if self._gb["play"].winfo_viewable():
+                self._game_bar_paint()
+            if time.time() - self._game_srv_at > 45:
+                self._game_srv_at = time.time()
+                self._game_server_poll()
+        except Exception:
+            pass
+        self.root.after(700, self._game_bar_loop)
+
+    def _game_acts_click(self, e):
+        h = self._gb["acts"].winfo_height()
+        if e.y < h / 2:
+            self.open_game_folder()
+        else:
+            self.install_and_launch()
+
+    def cancel_install(self):
+        if self.installing and not self._install_cancel.is_set():
+            self._install_cancel.set()
+            self.status_var.set("Останавливаю загрузку…")
+            self._game_bar_paint()
+
+    def _game_play_click(self, e):
+        if self.installing:
+            self.cancel_install()
+            return
+        try:
+            if str(self.launch_btn.cget("state")) == "disabled":
+                return
+        except Exception:
+            pass
+        self.launch_only()
+
+    def _game_bar_paint(self):
+        gb = getattr(self, "_gb", None)
+        if not gb:
+            return
+        accent, border = _pal("accent"), _pal("border")
+        text, dim = _pal("text"), _pal("text_dim")
+        try:
+            pack_name = self.config.get("active_modpack", "") or "Основная"
+            loader = (self.modloader_var.get() or "vanilla")
+            loader = {"neoforge": "NeoForge"}.get(loader, loader.capitalize())
+            version = self.version_var.get().strip() or "версия не выбрана"
+            try:
+                mem = int(float(self.mem_var.get()))
+                mem_s = f"{mem / 1024:g} ГБ"
+            except Exception:
+                mem_s = "авто"
+            minutes = int(round(self.stats.stats.get("total_play_time_minutes", 0)))
+            hours = f"{minutes // 60} ч"
+            launches = int(self.stats.stats.get("total_launches", 0))
+            last = self.stats.stats.get("last_launch") or ""
+            try:
+                last = datetime.fromisoformat(last).strftime("%d.%m %H:%M")
+            except Exception:
+                last = "ещё не было"
+            meta = f"запусков {launches}  ·  последний {last}"
+        except Exception:
+            return
+        cv = gb["build"]
+        w, h = max(cv.winfo_width(), 60), max(cv.winfo_height(), 60)
+        cv.delete("all")
+        cv.create_rectangle(1, 1, w - 1, h - 1, fill=_pal("surface2") if self._game_hover == "build" else _pal("surface"), outline=border)
+        cv.create_rectangle(16, h / 2 - 23, 62, h / 2 + 23, fill=_pal("surface3"), outline=border)
+        cv.create_rectangle(26, h / 2 - 7, 52, h / 2 + 7, fill=accent, outline="")
+        cv.create_text(80, 18, text="СБОРКА", fill=dim, font=("Segoe UI", 8), anchor="w")
+        cv.create_text(w - 18, 18, text=meta, fill=dim, font=("Segoe UI", 8), anchor="e")
+        cv.create_text(80, 40, text=pack_name, fill=text, font=("Segoe UI Semibold", 15), anchor="w")
+        x = 80
+        for chip in (loader, version, mem_s):
+            tid = cv.create_text(x + 8, 66, text=chip, fill=dim, font=("Segoe UI", 8), anchor="w")
+            bb = cv.bbox(tid)
+            cv.create_rectangle(bb[0] - 6, bb[1] - 2, bb[2] + 6, bb[3] + 2, outline=border)
+            x = bb[2] + 14
+        cv.create_text(w - 40, h / 2 - 8, text=hours, fill=text, font=("Segoe UI Semibold", 15), anchor="e")
+        cv.create_text(w - 40, h / 2 + 12, text="в игре", fill=dim, font=("Segoe UI", 8), anchor="e")
+        cv.create_text(w - 18, h / 2, text="v" if not self._game_drawer.winfo_ismapped() else "^", fill=accent, font=("Consolas", 10, "bold"))
+        cv = gb["acts"]
+        w, h = max(cv.winfo_width(), 60), max(cv.winfo_height(), 60)
+        cv.delete("all")
+        cv.create_rectangle(1, 1, w - 1, h - 1, fill=_pal("surface"), outline=border)
+        cv.create_line(14, h / 2, w - 14, h / 2, fill=border)
+        cv.create_text(16, h / 4, text="Папка игры", fill=text if self._game_hover == "acts" else dim, font=("Segoe UI", 9), anchor="w")
+        cv.create_text(16, h * 3 / 4, text="Установить и запустить", fill=text if self._game_hover == "acts" else dim, font=("Segoe UI", 9), anchor="w")
+        cv = gb["play"]
+        w, h = max(cv.winfo_width(), 60), max(cv.winfo_height(), 60)
+        try:
+            busy = str(self.launch_btn.cget("state")) == "disabled"
+        except Exception:
+            busy = False
+        cv.delete("all")
+        stopping = self.installing
+        fill = "#b9514f" if stopping else (_pal("surface3") if busy else (_pal("accent_hover") if self._game_hover == "play" else accent))
+        cv.create_rectangle(1, 1, w - 1, h - 1, fill=fill, outline="#000000")
+        cv.create_rectangle(1, h - 7, w - 1, h - 1, fill="#8f3b3a" if stopping else (_pal("surface2") if busy else "#2c8a60"), outline="")
+        if stopping:
+            ptxt = "Остановка…" if self._install_cancel.is_set() else "Остановить"
+            cv.create_text(w / 2, h / 2 - 8, text=ptxt, fill="#ffffff", font=("Segoe UI", 22, "bold"))
+        else:
+            cv.create_text(w / 2, h / 2 - 8, text="Занято…" if busy else "Играть", fill=dim if busy else "#08180f", font=("Segoe UI", 22, "bold"))
+        status = ""
+        try:
+            status = self.status_var.get()
+        except Exception:
+            pass
+        cv.create_text(w / 2, h / 2 + 20, text=(status or "Готов")[:44], fill="#ffe3e2" if stopping else (dim if busy else "#0d3a24"), font=("Segoe UI", 9))
 
     def _filter_versions(self):
         query = self.search_var.get().strip().lower()
@@ -8062,6 +9441,44 @@ class LauncherApp:
         btn_frame.pack(side="right", fill="y", padx=15, pady=10)
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.remove_account).pack(pady=5, fill="x")
         ttk.Button(btn_frame, text="✅ Выбрать", command=self.select_account).pack(pady=5, fill="x")
+        card = tk.Frame(frame, bg=_pal("surface"), highlightthickness=2, highlightbackground="#000000", width=220)
+        card.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        card.pack_propagate(False)
+        tk.Label(card, text="ВЫБРАННЫЙ ПРОФИЛЬ", bg=_pal("surface"), fg=_pal("text_dim"),
+                 font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(14, 10))
+        self.prof_face = tk.Label(card, bg=_pal("surface3"), width=12, height=6)
+        self.prof_face.pack(padx=14, anchor="w")
+        self.prof_name = tk.Label(card, text="", bg=_pal("surface"), fg=_pal("text"), font=("Segoe UI", 13, "bold"))
+        self.prof_name.pack(anchor="w", padx=14, pady=(10, 0))
+        self.prof_sub = tk.Label(card, text="", bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 9))
+        self.prof_sub.pack(anchor="w", padx=14)
+        self.acc_listbox.bind("<<ListboxSelect>>", lambda e: self._profile_card_update())
+
+    def _profile_card_update(self):
+        sel = self.acc_listbox.curselection()
+        if not sel or sel[0] >= len(self.core.accounts):
+            return
+        idx = sel[0]
+        nick = self.core.accounts[idx]["name"]
+        self.prof_name.config(text=nick)
+        self.prof_sub.config(text="активный профиль" if idx == self.core.selected_account else "локальный профиль")
+        if not HAS_PIL:
+            return
+
+        def work():
+            skin = self._skin_pil(nick)
+
+            def apply():
+                if skin is None or not self.prof_face.winfo_exists():
+                    return
+                face = skin.crop((8, 8, 16, 16))
+                hat = skin.crop((40, 8, 48, 16))
+                if skin.size == (64, 64) and hat.getbbox() is not None:
+                    face.paste(hat, (0, 0), hat)
+                self._prof_face_img = ImageTk.PhotoImage(face.resize((96, 96), Image.NEAREST))
+                self.prof_face.config(image=self._prof_face_img, width=96, height=96)
+            self.root.after(0, apply)
+        threading.Thread(target=work, daemon=True).start()
 
     def update_accounts_ui(self):
         if not hasattr(self, "acc_listbox"):
@@ -8072,6 +9489,12 @@ class LauncherApp:
             if i == self.core.selected_account:
                 label += "  ✅ (активен)"
             self.acc_listbox.insert(tk.END, label)
+        if self.core.accounts and hasattr(self, "prof_name"):
+            try:
+                self.acc_listbox.selection_set(min(self.core.selected_account, len(self.core.accounts) - 1))
+                self._profile_card_update()
+            except Exception:
+                pass
 
     def update_player_from_accounts(self):
         acc = self.core.accounts[self.core.selected_account] if self.core.accounts else None
@@ -8086,6 +9509,7 @@ class LauncherApp:
             if hasattr(self, "player_display"):
                 self.player_display.config(text="(не выбран)")
         self._refresh_skin_tab()
+        self._nav_account_refresh()
 
     def load_skin(self, player_name):
         if not HAS_PIL:
@@ -8181,11 +9605,8 @@ class LauncherApp:
     def build_skin_tab(self, frame):
         ttk.Label(
             frame,
-            text="ℹ️ Выберите PNG-скин (64×64 или 64×32). Он загружается на наш сервер скинов и\n"
-                 "виден всем, кто играет через этот лаунчер, — на нашем сервере и на любых\n"
-                 "пиратских (offline) серверах. Нужен вход в аккаунт лаунчера. Игроки с другими\n"
-                 "лаунчерами видят стандартного Стива/Алекс.",
-            foreground="#7a8599", justify="left", wraplength=520
+            text="Выберите PNG-скин (64×64 или 64×32). Он загружается на наш сервер скинов и виден всем, кто играет через этот лаунчер, на нашем сервере и на любых пиратских (offline) серверах. Нужен вход в аккаунт лаунчера. Игроки с другими лаунчерами видят стандартного Стива/Алекс.",
+            foreground="#7a8599", justify="left", wraplength=700
         ).pack(anchor="w", padx=10, pady=(10, 15))
 
         top = ttk.Frame(frame)
@@ -8194,8 +9615,11 @@ class LauncherApp:
         preview_frame = ttk.Frame(top)
         preview_frame.pack(side="left", padx=(0, 20))
         if HAS_PIL:
-            self.skin_tab_preview = ttk.Label(preview_frame, text="🧑")
-            self.skin_tab_preview.pack()
+            self.skin_tab_preview = ttk.Label(preview_frame, text="")
+            self.skin_tab_stage = SkinStage(preview_frame, self)
+            self.skin_tab_stage.configure(width=300, height=380, highlightthickness=2, highlightbackground="#000000")
+            self.skin_tab_stage.pack()
+            self.root.after(300, self._nav_account_refresh)
         else:
             ttk.Label(preview_frame, text="(PIL не установлен —\nпревью недоступно)",
                        foreground="#555", justify="center").pack()
@@ -8495,8 +9919,8 @@ class LauncherApp:
         self.modpack_listbox.config(yscrollcommand=scroll.set)
         self.modpack_listbox.bind("<Double-Button-1>", lambda e: self.modpack_activate())
 
-        btns = ttk.Frame(area)
-        btns.pack(side="right", fill="y", padx=10)
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
         ttk.Button(btns, text="▶ Сделать активной", style="Accent.TButton",
                    command=self.modpack_activate).pack(pady=4, fill="x")
         ttk.Button(btns, text="➕ Создать из текущих", command=self.modpack_create).pack(pady=4, fill="x")
@@ -8509,6 +9933,7 @@ class LauncherApp:
         ttk.Button(btns, text="📥 Импорт из .zip", command=self.modpack_import).pack(pady=4, fill="x")
         ttk.Button(btns, text="🗑️ Удалить", command=self.modpack_delete).pack(pady=4, fill="x")
         ttk.Button(btns, text="📂 Открыть папку", command=self.modpack_open_folder).pack(pady=4, fill="x")
+        self._to_toolbar(btns, area, 4)
         self.refresh_modpacks()
 
     def refresh_modpacks(self):
@@ -9075,8 +10500,8 @@ class LauncherApp:
         scroll.pack(side="left", fill="y")
         self.mod_listbox.config(yscrollcommand=scroll.set)
 
-        btn_frame = ttk.Frame(list_area)
-        btn_frame.pack(side="right", fill="y", padx=10)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
         ttk.Button(btn_frame, text="🔎 Каталог Modrinth", style="Accent.TButton",
                    command=lambda: ModrinthBrowser(self, "mods")).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="➕ Добавить мод", command=self.add_mod).pack(pady=4, fill="x")
@@ -9088,6 +10513,7 @@ class LauncherApp:
         ttk.Button(btn_frame, text="🎯 Найти виновного", command=lambda: ModBisectWindow(self)).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="🔄 Обновить", command=self.refresh_mods).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="📂 Открыть папку", command=self._open_mods_folder).pack(pady=4, fill="x")
+        self._to_toolbar(btn_frame, list_area, 5)
         self.refresh_mods()
         self.root.after(1500, self._bisect_check_leftover)
 
@@ -9335,6 +10761,7 @@ class LauncherApp:
         ttk.Button(btn_frame, text="🗑️ Удалить версию", command=self.delete_selected_version).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="🧹 Очистить кэш", command=self.clean_orphan_assets).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="✨ Умная очистка", command=self.run_smart_cleanup).pack(side="left", padx=5)
+        self._to_toolbar(btn_frame, list_frame, 4)
         self.refresh_installed_versions()
 
     def refresh_installed_versions(self):
@@ -9532,14 +10959,15 @@ class LauncherApp:
         scroll.pack(side="left", fill="y")
         self.rp_listbox.config(yscrollcommand=scroll.set)
 
-        btn_frame = ttk.Frame(list_area)
-        btn_frame.pack(side="right", fill="y", padx=10)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
         ttk.Button(btn_frame, text="🔎 Каталог Modrinth", style="Accent.TButton",
                    command=lambda: ModrinthBrowser(self, "resourcepacks")).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="➕ Добавить", command=self.add_rp).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.delete_rp).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="🔄 Обновить", command=self.refresh_rps).pack(pady=4, fill="x")
         ttk.Button(btn_frame, text="📂 Открыть папку", command=self._open_rp_folder).pack(pady=4, fill="x")
+        self._to_toolbar(btn_frame, list_area, 5)
         self.refresh_rps()
 
     def _open_rp_folder(self):
@@ -9600,6 +11028,7 @@ class LauncherApp:
         ttk.Button(btn_frame, text="🗑️ Удалить", command=self.remove_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="📶 Проверить", command=self.ping_server).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="🧩 Сборка сервера", command=self.open_server_pack).pack(side="left", padx=5)
+        self._to_toolbar(btn_frame, list_frame, 3)
         self.server_listbox.bind("<Double-Button-1>", lambda e: self.play_selected_server())
         self._pinned_server = None
         self.refresh_servers_ui()
@@ -9823,8 +11252,12 @@ class LauncherApp:
             foreground="#7a8599"
         ).pack(anchor="w", padx=10, pady=(0, 10))
 
-        host_frame = ttk.LabelFrame(frame, text="🎮 Создать комнату (хост)")
-        host_frame.pack(fill="x", padx=10, pady=5)
+        p2p_cards = ttk.Frame(frame)
+        p2p_cards.pack(fill="x", padx=10, pady=5)
+        p2p_cards.columnconfigure(0, weight=1, uniform="p2p")
+        p2p_cards.columnconfigure(1, weight=1, uniform="p2p")
+        host_frame = ttk.LabelFrame(p2p_cards, text="Создать комнату (хост)")
+        host_frame.grid(row=0, column=0, columnspan=2, sticky="nsew")
         row1 = ttk.Frame(host_frame)
         row1.pack(fill="x", padx=10, pady=5)
         ttk.Label(row1, text="Порт MC:").pack(side="left")
@@ -9848,8 +11281,8 @@ class LauncherApp:
                                              command=self.p2p_copy_host_address, state="disabled")
         self.p2p_copy_host_btn.pack(side="left", padx=10)
 
-        join_frame = ttk.LabelFrame(frame, text="🔌 Подключиться")
-        join_frame.pack(fill="x", padx=10, pady=5)
+        join_frame = ttk.LabelFrame(p2p_cards, text="Подключиться")
+        join_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
         row2 = ttk.Frame(join_frame)
         row2.pack(fill="x", padx=10, pady=5)
         ttk.Label(row2, text="Адрес (ip:порт):").pack(side="left")
@@ -9962,6 +11395,11 @@ class LauncherApp:
         scroll.pack(side="left", fill="y")
         self.screenshot_listbox.config(yscrollcommand=scroll.set)
         self.screenshot_listbox.bind("<Double-Button-1>", lambda e: self.open_selected_screenshot())
+        self.shot_preview = tk.Label(list_frame, text="Выберите скриншот", width=48, anchor="center",
+                                     bg=_pal("surface"), fg=_pal("text_dim"), highlightthickness=2,
+                                     highlightbackground="#000000")
+        self.shot_preview.pack(side="right", fill="y", padx=(10, 0))
+        self.screenshot_listbox.bind("<<ListboxSelect>>", lambda e: self._show_screenshot_preview())
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
@@ -9969,6 +11407,21 @@ class LauncherApp:
         ttk.Button(btn_frame, text="🖼️ Открыть", command=self.open_selected_screenshot).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="📂 Папка", command=self._open_screenshots_folder).pack(side="left", padx=5)
         self.refresh_screenshots()
+
+    def _show_screenshot_preview(self):
+        sel = self.screenshot_listbox.curselection()
+        if not sel or not HAS_PIL:
+            return
+        name = self.screenshot_listbox.get(sel[0]).replace("  📷 ", "").strip()
+        path = os.path.join(self.core.game_path(), "screenshots", name)
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((380, 260))
+            self._shot_ref = ImageTk.PhotoImage(img)
+            self.shot_preview.configure(image=self._shot_ref, text="")
+        except Exception:
+            self.shot_preview.configure(image="", text="Не удалось открыть изображение")
 
     def _open_screenshots_folder(self):
         self._open_folder(os.path.join(self.core.game_path(), "screenshots"))
@@ -10015,6 +11468,36 @@ class LauncherApp:
         self._open_folder(log_dir)
 
     def refresh_logs(self):
+        self._refresh_logs_raw()
+        try:
+            self._colorize_logs()
+        except Exception:
+            pass
+
+    def _colorize_logs(self):
+        t = self.log_viewer
+        t.tag_configure("lg_err", foreground="#ff7b72")
+        t.tag_configure("lg_warn", foreground="#e3b341")
+        t.tag_configure("lg_dim", foreground="#6e7a76")
+        t.tag_configure("lg_head", foreground=_pal("accent"))
+        t.config(highlightthickness=2, highlightbackground="#000000", highlightcolor="#000000", relief="flat")
+        end = int(t.index("end-1c").split(".")[0])
+        for i in range(1, end + 1):
+            line = t.get(f"{i}.0", f"{i}.end")
+            low = line.lower()
+            tag = None
+            if line.startswith("==="):
+                tag = "lg_head"
+            elif "error" in low or "exception" in low or "fatal" in low:
+                tag = "lg_err"
+            elif "warn" in low:
+                tag = "lg_warn"
+            elif "/debug]" in low or "/trace]" in low:
+                tag = "lg_dim"
+            if tag:
+                t.tag_add(tag, f"{i}.0", f"{i}.end")
+
+    def _refresh_logs_raw(self):
         if not hasattr(self, "log_viewer"):
             return
         self.log_viewer.config(state="normal")
@@ -10078,6 +11561,8 @@ class LauncherApp:
     def _try_restore_server_session(self):
         token = self.config.get("server_token", "")
         if not token:
+            if not self.config.get("auth_skipped") and "--autostart" not in sys.argv:
+                self.root.after(900, lambda: self._show_auth(False))
             return
         self.api.token = token
         self._achievements_restore_pending = True
@@ -10097,11 +11582,21 @@ class LauncherApp:
                 self.api.drop_local()
                 self.config["server_token"] = ""
                 save_json_file(CONFIG_FILE, self.config)
+                if "--autostart" not in sys.argv:
+                    self._show_auth(True)
                 return
             self._restore_tries = 0
             self._on_server_login_success(persist=False)
 
         self._async(work, done)
+
+    def _show_auth(self, expired):
+        dlg = getattr(self, "_auth_dlg", None)
+        if dlg is not None and dlg.win.winfo_exists():
+            return
+        if self.api.token:
+            return
+        self._auth_dlg = AuthDialog(self, expired)
 
     def _on_server_login_success(self, persist=True):
         self.achievements.ensure_owner(self.api.nickname)
@@ -10121,6 +11616,8 @@ class LauncherApp:
                 self.refresh_admin_panel()
         self._refresh_account_info_label()
         self._sync_profile_with_server(self.api.nickname)
+        self.__dict__.pop("_skin_cache", None)
+        self._nav_account_refresh()
         if hasattr(self, "_tg_rows"):
             self._tg_refresh()
         self._rebuild_friends_tab()
@@ -10447,10 +11944,7 @@ class LauncherApp:
 
     def build_privileges_tab(self, frame):
         if not self.api.is_logged_in():
-            ttk.Label(
-                frame, text="Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы покупать привилегии за монеты.",
-                foreground="#7a8599", wraplength=500, justify="left"
-            ).pack(padx=20, pady=30)
+            self._login_needed(frame, "Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы покупать привилегии за монеты.")
             return
         self._build_privileges_tab(frame)
 
@@ -10493,14 +11987,14 @@ class LauncherApp:
         for col, text, width in (("title", "Привилегия", 260), ("duration", "Срок", 110), ("price", "Цена, 🪙", 90)):
             self._priv_tree.heading(col, text=text)
             self._priv_tree.column(col, width=width, anchor="w")
-        self._priv_tree.pack(fill="x", padx=8, pady=4)
+        self._priv_cards = tk.Frame(frame, bg=_pal("bg"))
+        self._priv_cards.pack(fill="x", padx=8, pady=6)
         self._priv_tree.bind("<<TreeviewSelect>>", lambda e: self._priv_show_description())
 
         self._priv_desc = ttk.Label(frame, text="", foreground="#7a8599", wraplength=560, justify="left")
-        self._priv_desc.pack(anchor="w", padx=10)
         btns = ttk.Frame(frame)
         btns.pack(fill="x", padx=8, pady=6)
-        ttk.Button(btns, text="👑 Купить", style="Accent.TButton", command=self._buy_privilege).pack(side="left")
+        ttk.Button(btns, text="Купить", style="Accent.TButton", command=self._buy_privilege)
         self._priv_status = ttk.Label(btns, text="Загрузка...", foreground="#7a8599")
         self._priv_status.pack(side="left", padx=10)
 
@@ -10526,7 +12020,7 @@ class LauncherApp:
             try:
                 if not self._priv_tree.winfo_exists():
                     return
-                if self._priv_tree.winfo_ismapped() and not self._priv_loading:
+                if self._priv_cards.winfo_ismapped() and not self._priv_loading:
                     self._load_privileges()
                 self.root.after(5000, tick)
             except Exception:
@@ -10554,7 +12048,7 @@ class LauncherApp:
             self._priv_status.config(text=f"Не удалось загрузить: {data.get('error', 'нет связи с сервером')}")
             return
         self.api.coins = data.get("coins", self.api.coins)
-        self._priv_balance.config(text=f"🪙 {data.get('coins', 0):g}")
+        self._priv_balance.config(text=f"{data.get('coins', 0):g} монет")
         keep = self._priv_tree.selection()
         for row in self._priv_tree.get_children():
             self._priv_tree.delete(row)
@@ -10566,6 +12060,9 @@ class LauncherApp:
                 it["title"], shop_duration_text(it["duration_days"]), f"{it['price']:g}"))
         if keep and keep[0] in self._priv_items:
             self._priv_tree.selection_set(keep[0])
+        elif self._priv_items:
+            self._priv_tree.selection_set(next(iter(self._priv_items)))
+        self._render_priv_cards()
         self._priv_status.config(text="" if self._priv_items else "Привилегий пока нет в продаже")
         for row in self._priv_hist.get_children():
             self._priv_hist.delete(row)
@@ -10574,6 +12071,45 @@ class LauncherApp:
                 str(p.get("created_at", ""))[:16], f"{p['item_title']} ({shop_duration_text(p['duration_days'])})",
                 p["game_name"], SHOP_STATUS_TEXT.get(p.get("status"), p.get("status", ""))))
         self._priv_show_description()
+
+    def _render_priv_cards(self):
+        box = self._priv_cards
+        for w in box.winfo_children():
+            w.destroy()
+        sel = self._priv_tree.selection()
+        cur = sel[0] if sel else None
+        cols = 3
+        for c in range(cols):
+            box.columnconfigure(c, weight=1, uniform="pv")
+        for i, (iid, it) in enumerate(self._priv_items.items()):
+            active = iid == cur
+            card = tk.Frame(box, bg=_pal("surface"), highlightthickness=2,
+                            highlightbackground=_pal("accent") if active else "#000000", cursor="hand2")
+            card.grid(row=i // cols, column=i % cols, sticky="nsew", padx=5, pady=5)
+            tk.Label(card, text=it["title"].upper(), bg=_pal("surface"), fg=_pal("text_dim"),
+                     font=("Segoe UI", 8)).pack(anchor="w", padx=14, pady=(14, 2))
+            tk.Label(card, text=f"{it['price']:g} монет", bg=_pal("surface"), fg=_pal("text"),
+                     font=("Segoe UI Semibold", 17)).pack(anchor="w", padx=14)
+            tk.Label(card, text=shop_duration_text(it["duration_days"]), bg=_pal("surface"), fg=_pal("accent"),
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=14)
+            tk.Label(card, text=(it.get("description") or "")[:160], bg=_pal("surface"), fg=_pal("text_dim"),
+                     font=("Segoe UI", 9), justify="left", wraplength=210).pack(anchor="w", padx=14, pady=(8, 10))
+            buy = tk.Button(card, text="Купить", bg=_pal("accent"), fg="#08180f", relief="flat", bd=0,
+                            font=("Segoe UI", 10, "bold"), padx=14, pady=5, cursor="hand2",
+                            command=lambda k=iid: self._priv_card_buy(k))
+            buy.pack(anchor="w", padx=14, pady=(0, 14))
+            for w in (card,) + tuple(card.winfo_children()):
+                if w is not buy:
+                    w.bind("<Button-1>", lambda e, k=iid: self._priv_card_select(k))
+
+    def _priv_card_select(self, iid):
+        self._priv_tree.selection_set(iid)
+        self._render_priv_cards()
+
+    def _priv_card_buy(self, iid):
+        self._priv_tree.selection_set(iid)
+        self._buy_privilege()
+        self._render_priv_cards()
 
     def _priv_show_description(self):
         sel = self._priv_tree.selection()
@@ -10658,13 +12194,10 @@ class LauncherApp:
                 if not silent:
                     messagebox.showinfo("Обновлений нет", f"У вас установлена последняя версия ({APP_VERSION}).")
                 return
+            if silent and self.config.get("skip_update") == remote_version:
+                return
             changelog = (data.get("changelog") or "").strip() or "Список изменений не указан."
-            if messagebox.askyesno(
-                "🚀 Доступно обновление",
-                f"Прилетела новая версия лаунчера: {remote_version} (у вас {APP_VERSION}).\n\n"
-                f"Что нового:\n{changelog}\n\nСкачать и установить сейчас?"
-            ):
-                self._download_and_apply_update(data)
+            UpdateDialog(self, data, remote_version, changelog)
 
         self._async(work, done)
 
@@ -10809,9 +12342,20 @@ class LauncherApp:
         wrap = ttk.Frame(frame)
         wrap.pack(fill="both", expand=True, padx=20, pady=20)
 
-        ttk.Label(wrap, text="🖥️ Личный кабинет Mafin Launcher", font=("Segoe UI", 13, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 15)
+        ttk.Label(wrap, text="Личный кабинет Mafin Launcher", font=("Segoe UI", 13, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
+        head = tk.Frame(wrap, bg=_pal("surface"), highlightthickness=2, highlightbackground="#000000")
+        head.grid(row=1, column=0, columnspan=2, sticky="we", pady=(0, 14))
+        self.acc_head_face = tk.Label(head, bg=_pal("surface3"), width=8, height=4)
+        self.acc_head_face.pack(side="left", padx=14, pady=14)
+        hb = tk.Frame(head, bg=_pal("surface"))
+        hb.pack(side="left")
+        self.acc_head_name = tk.Label(hb, text=self.player_var.get() or "Игрок", bg=_pal("surface"),
+                                      fg=_pal("text"), font=("Segoe UI", 15, "bold"))
+        self.acc_head_name.pack(anchor="w")
+        tk.Label(hb, textvariable=self.server_status_var, bg=_pal("surface"), fg=_pal("accent"),
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(wrap, text="Никнейм:").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(wrap, textvariable=self.server_nick_var, width=38).grid(row=2, column=1, sticky="w", pady=4)
@@ -10866,6 +12410,17 @@ class LauncherApp:
                    command=self.open_hat_adjust).pack(anchor="w", padx=10, pady=(6, 10))
         self._tg_polling = 0
         self.root.after(600, self._tg_refresh)
+
+    def _login_needed(self, frame, text):
+        card = tk.Frame(frame, bg=_pal("surface"), highlightthickness=2, highlightbackground="#000000")
+        card.pack(padx=24, pady=30, anchor="nw")
+        inner = tk.Frame(card, bg=_pal("surface"))
+        inner.pack(padx=22, pady=18)
+        tk.Label(inner, text="Нужен вход", bg=_pal("surface"), fg=_pal("text"), font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(inner, text=text, bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 10),
+                 wraplength=420, justify="left").pack(anchor="w", pady=(4, 14))
+        ttk.Button(inner, text="Войти или зарегистрироваться", style="Accent.TButton",
+                   command=lambda: self._show_auth(False)).pack(anchor="w")
 
     def _tg_refresh(self):
         if not hasattr(self, "_tg_rows"):
@@ -11349,10 +12904,7 @@ class LauncherApp:
 
     def build_quests_tab(self, frame):
         if not self.api.is_logged_in():
-            ttk.Label(
-                frame, text="Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы видеть и выполнять задания.",
-                foreground="#7a8599", wraplength=500, justify="left"
-            ).pack(padx=20, pady=30)
+            self._login_needed(frame, "Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы видеть и выполнять задания.")
             return
         panel = QuestsPanel(frame, self.api)
         panel.pack(fill="both", expand=True)
@@ -11360,10 +12912,7 @@ class LauncherApp:
 
     def build_gifts_tab(self, frame):
         if not self.api.is_logged_in():
-            ttk.Label(
-                frame, text="Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы дарить и получать подарки.",
-                foreground="#7a8599", wraplength=500, justify="left"
-            ).pack(padx=20, pady=30)
+            self._login_needed(frame, "Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы дарить и получать подарки.")
             return
 
         sub = ttk.Notebook(frame)
@@ -11411,6 +12960,7 @@ class LauncherApp:
     def _load_gifts_shop_tab(self):
         for w in self._gifts_shop_holder.winfo_children():
             w.destroy()
+        self._gift_grid_i = 0
 
         def work():
             return self.api.list_gifts()
@@ -11430,27 +12980,32 @@ class LauncherApp:
         self._async(work, done)
 
     def _render_shop_gift_card(self, gift):
-        row = tk.Frame(self._gifts_shop_holder, bg=self._bg2, bd=0)
-        row.pack(fill="x", pady=3, padx=2)
-
-        thumb = tk.Label(row, text="🎁", width=8, height=4, bg=self._bg2, fg="white")
-        thumb.pack(side="left", padx=8, pady=8)
-        self._load_gift_image_async(thumb, self.api.gift_image_url(gift["image_url"]), max_px=80)
-
-        info = tk.Frame(row, bg=self._bg2)
-        info.pack(side="left", fill="x", expand=True, padx=6)
-        tk.Label(info, text=gift["name"], font=("Segoe UI", 11, "bold"), bg=self._bg2, fg="white").pack(anchor="w")
-        qty_txt = "неограничено" if gift.get("quantity") is None else f"осталось: {gift['quantity']}"
-        tk.Label(info, text=f"🪙 {gift['price']:g} монет · {qty_txt}",
-                 bg=self._bg2, fg="#7a8599").pack(anchor="w")
+        i = getattr(self, "_gift_grid_i", 0)
+        self._gift_grid_i = i + 1
+        cols = 4
+        S = self._bg2
+        holder = self._gifts_shop_holder
+        holder.columnconfigure(i % cols, weight=1, uniform="gf")
+        card = tk.Frame(holder, bg=S, highlightthickness=2, highlightbackground="#000000")
+        card.grid(row=i // cols, column=i % cols, sticky="nsew", padx=5, pady=5)
+        thumb = tk.Label(card, text="", width=14, height=6, bg=_pal("surface3"), fg=_pal("text"))
+        thumb.pack(padx=10, pady=(10, 8))
+        self._load_gift_image_async(thumb, self.api.gift_image_url(gift["image_url"]), max_px=96)
+        tk.Label(card, text=gift["name"], font=("Segoe UI", 10, "bold"), bg=S, fg=_pal("text"),
+                 wraplength=150).pack(anchor="w", padx=12)
+        qty_txt = "без ограничений" if gift.get("quantity") is None else f"осталось {gift['quantity']}"
+        tk.Label(card, text=f"{gift['price']:g} монет  ·  {qty_txt}", bg=S, fg=_pal("text_dim"),
+                 font=("Segoe UI", 9), wraplength=170, justify="left").pack(anchor="w", padx=12)
         if gift.get("sale_until"):
-            tk.Label(info, text=f"⏳ Продажа до {gift['sale_until']}",
-                     bg=self._bg2, fg="#faa61a", font=("Segoe UI", 8)).pack(anchor="w")
-
-        btns = tk.Frame(row, bg=self._bg2)
-        btns.pack(side="right", padx=8)
-        tk.Button(btns, text="🎁 Подарить", command=lambda g=gift: self._open_gift_send_dialog(g)).pack(pady=2)
-        tk.Button(btns, text="Себе", command=lambda g=gift: self._open_gift_send_dialog(g, to=self.api.nickname)).pack(pady=2)
+            tk.Label(card, text=f"до {gift['sale_until']}", bg=S, fg="#d9a24a", font=("Segoe UI", 8)).pack(anchor="w", padx=12)
+        btns = tk.Frame(card, bg=S)
+        btns.pack(fill="x", padx=12, pady=(8, 12))
+        tk.Button(btns, text="Подарить", bg=_pal("accent"), fg="#08180f", relief="flat", bd=0,
+                  font=("Segoe UI", 9, "bold"), padx=10, pady=4, cursor="hand2",
+                  command=lambda g=gift: self._open_gift_send_dialog(g)).pack(side="left")
+        tk.Button(btns, text="Себе", bg=_pal("surface3"), fg=_pal("text"), relief="flat", bd=0,
+                  font=("Segoe UI", 9), padx=10, pady=4, cursor="hand2",
+                  command=lambda g=gift: self._open_gift_send_dialog(g, to=self.api.nickname)).pack(side="left", padx=(6, 0))
 
     def _load_gifts_mine_tab(self):
         for w in self._gifts_mine_holder.winfo_children():
@@ -11559,10 +13114,7 @@ class LauncherApp:
 
     def build_friends_tab(self, frame):
         if not self.api.is_logged_in():
-            ttk.Label(
-                frame, text="Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы добавлять друзей и переписываться.",
-                foreground="#7a8599", wraplength=500, justify="left"
-            ).pack(padx=20, pady=30)
+            self._login_needed(frame, "Войдите в аккаунт на вкладке «🖥️ Аккаунт», чтобы добавлять друзей и переписываться.")
             return
 
         root_pane = ttk.Frame(frame)
@@ -12057,6 +13609,7 @@ class LauncherApp:
         ttk.Button(actions, text="👑 Сделать админом", command=self.admin_make_admin_selected).pack(side="left", padx=4)
         ttk.Button(actions, text="⬇️ Снять права админа", command=self.admin_remove_admin_selected).pack(side="left", padx=4)
         ttk.Button(actions, text="🗑️ Удалить аккаунт", command=self.admin_delete_account_selected).pack(side="left", padx=4)
+        self.admin_tree.configure(height=12)
 
         logs_frame = ttk.LabelFrame(frame, text="Логи сервера")
         logs_frame.pack(fill="both", expand=True, padx=10, pady=(5, 10))
@@ -12101,7 +13654,9 @@ class LauncherApp:
                         f"{p.get('total_playtime_minutes', 0):.1f}",
                         p.get("total_launches", 0),
                         p.get("last_login") or "-",
-                    ))
+                    ), tags=("banned" if p["is_banned"] else ("admin" if p["is_admin"] else "",)))
+                self.admin_tree.tag_configure("banned", foreground="#d96b6b")
+                self.admin_tree.tag_configure("admin", foreground=_pal("accent"))
 
             if s2 == 200 and isinstance(stats, dict):
                 self.admin_stats_label.config(text=(
@@ -12241,6 +13796,30 @@ class LauncherApp:
         self._async(work, done)
 
     def build_settings_tab(self, frame):
+        root_frame = frame
+        frame.columnconfigure(0, weight=1)
+        sw_bar = ttk.Frame(root_frame)
+        sw_bar.grid(row=0, column=0, sticky="w", padx=10, pady=(0, 8))
+        pages = {}
+        sw_btns = {}
+
+        def show_page(key):
+            for k, pg in pages.items():
+                if k == key:
+                    pg.grid()
+                else:
+                    pg.grid_remove()
+            for k, bt in sw_btns.items():
+                bt.configure(style="Accent.TButton" if k == key else "TButton")
+
+        for key, title in (("game", "Игра"), ("look", "Внешний вид"), ("system", "Система")):
+            pg = ttk.Frame(root_frame)
+            pg.grid(row=1, column=0, sticky="nw")
+            pages[key] = pg
+            bt = ttk.Button(sw_bar, text=title, command=lambda k=key: show_page(k))
+            bt.pack(side="left", padx=(0, 6))
+            sw_btns[key] = bt
+        frame = pages["game"]
         row = 0
         ttk.Label(frame, text="Путь к Java:").grid(row=row, column=0, sticky="w", pady=5, padx=10)
         self.java_entry = ttk.Entry(frame, width=45)
@@ -12282,7 +13861,8 @@ class LauncherApp:
                         variable=self.show_alpha_beta_var,
                         command=self.on_toggle_alpha_beta).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
 
-        row += 1
+        frame = pages["system"]
+        row = 0
         self.auto_clean_var = tk.BooleanVar(value=self.config.get("auto_clean_logs", True))
         ttk.Checkbutton(frame, text="Автоочистка старых логов",
                         variable=self.auto_clean_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
@@ -12311,7 +13891,8 @@ class LauncherApp:
                         variable=self.discord_rpc_var, command=self._on_discord_toggle
                         ).grid(row=row, column=0, columnspan=3, sticky="w", pady=5, padx=10)
 
-        row += 1
+        frame = pages["look"]
+        row = 0
         ttk.Label(frame, text="Акцентный цвет:").grid(row=row, column=0, sticky="w", pady=5, padx=10)
         current_theme = self.config.get("launcher_theme", DEFAULT_LAUNCHER_THEME)
         self._theme_labels = {v["label"]: k for k, v in LAUNCHER_THEMES.items()}
@@ -12349,13 +13930,17 @@ class LauncherApp:
         nav_combo.bind("<<ComboboxSelected>>",
                        lambda e: self.set_nav_style(self._nav_labels.get(self.nav_style_var.get())))
 
-        row += 1
+        frame = pages["game"]
+        row = 50
         ttk.Button(frame, text="📂 Открыть папку игры",
                    command=self.open_game_folder).grid(row=row, column=0, columnspan=3, sticky="w", pady=10, padx=10)
 
-        row += 1
+        frame = pages["system"]
+        row = 50
         java_info = self.core.get_java_version() or "❌ Java не найдена"
-        ttk.Label(frame, text=f"☕ Java: {java_info}", foreground="#7a8599").grid(
+        java_lines = [ln for ln in str(java_info).splitlines() if ln.strip() and not ln.startswith("Picked up")]
+        java_info = (java_lines[0] if java_lines else str(java_info))[:120]
+        ttk.Label(frame, text=f"☕ Java: {java_info}", foreground="#7a8599", wraplength=640).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=2, padx=10)
 
         row += 1
@@ -12371,12 +13956,12 @@ class LauncherApp:
         ttk.Button(frame, text="🔄 Проверить обновление",
                    command=self.check_for_updates_manual).grid(row=row, column=0, sticky="w", pady=(4, 0), padx=10)
 
-        row += 1
-        btn_row = ttk.Frame(frame)
-        btn_row.grid(row=row, column=0, columnspan=3, pady=15)
-        ttk.Button(btn_row, text="💾 Сохранить", command=self.save_settings).pack(side="left", padx=5)
+        btn_row = ttk.Frame(root_frame)
+        btn_row.grid(row=2, column=0, sticky="w", padx=10, pady=15)
+        ttk.Button(btn_row, text="💾 Сохранить", style="Accent.TButton", command=self.save_settings).pack(side="left", padx=5)
         ttk.Button(btn_row, text="📤 Экспорт конфига", command=self.export_config).pack(side="left", padx=5)
         ttk.Button(btn_row, text="📥 Импорт конфига", command=self.import_config).pack(side="left", padx=5)
+        show_page("game")
 
     def _update_game_size_label(self):
         total = self.core.get_total_game_size()
@@ -12701,21 +14286,46 @@ class LauncherApp:
         self._async(work, done)
 
     def build_about_tab(self, frame):
-        ttk.Label(frame, text=f"⚡ Mafin Launcher v{APP_VERSION}",
-                  font=("Segoe UI", 20, "bold")).pack(pady=(30, 5))
-        ttk.Label(frame, text="Неофициальный лаунчер Minecraft в стиле TLauncher",
-                  foreground="#7a8599").pack(pady=2)
-        ttk.Label(frame, text="Установка: minecraft-launcher-lib + кастомные скрипты").pack(pady=2)
-        ttk.Label(frame, text="Forge (вкл. 1.7.10) • Fabric • NeoForge • Quilt • Сборки • Modrinth • P2P • Моды • Ресурспаки").pack(pady=2)
-        ttk.Label(frame, text="Python 3.10+ совместимость", foreground="#7a8599").pack(pady=10)
+        wrap = ttk.Frame(frame)
+        wrap.pack(fill="x", padx=20, pady=10)
+        wrap.columnconfigure(0, weight=3, uniform="ab")
+        wrap.columnconfigure(1, weight=2, uniform="ab")
 
-        sep = ttk.Separator(frame, orient="horizontal")
-        sep.pack(fill="x", padx=50, pady=10)
+        def card(col):
+            c = tk.Frame(wrap, bg=_pal("surface"), highlightthickness=2, highlightbackground="#000000")
+            c.grid(row=0, column=col, sticky="nsew", padx=(0, 12) if col == 0 else 0)
+            return c
 
-        ttk.Label(frame, text="Горячие клавиши:", font=("Segoe UI", 11, "bold")).pack(pady=5)
-        ttk.Label(frame, text="Ctrl+L — Запустить игру").pack()
-        ttk.Label(frame, text="Ctrl+I — Установить и запустить").pack()
-        ttk.Label(frame, text="Ctrl+Q — Выход").pack()
+        left = card(0)
+        head = tk.Frame(left, bg=_pal("surface"))
+        head.pack(anchor="w", padx=20, pady=(20, 6))
+        if HAS_PIL:
+            try:
+                self._about_icon = ImageTk.PhotoImage(_app_logo_image(64))
+                tk.Label(head, image=self._about_icon, bg=_pal("surface")).pack(side="left", padx=(0, 14))
+            except Exception:
+                pass
+        tb = tk.Frame(head, bg=_pal("surface"))
+        tb.pack(side="left")
+        tk.Label(tb, text="Mafin Launcher", bg=_pal("surface"), fg=_pal("text"), font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(tb, text=f"Версия {APP_VERSION}", bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(left, text="Неофициальный лаунчер Minecraft.\n"
+                            "Установка: minecraft-launcher-lib и собственные скрипты.\n"
+                            "Forge (включая 1.7.10), Fabric, NeoForge, Quilt, сборки, Modrinth, P2P, моды, ресурспаки.\n"
+                            "Python 3.10 и новее.",
+                 bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 10), justify="left",
+                 wraplength=420).pack(anchor="w", padx=20, pady=(6, 20))
+
+        right = card(1)
+        tk.Label(right, text="ГОРЯЧИЕ КЛАВИШИ", bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 8)).pack(anchor="w", padx=20, pady=(20, 8))
+        for keys, what in (("Ctrl+L", "Запустить игру"), ("Ctrl+I", "Установить и запустить"),
+                           ("Ctrl+K", "Палитра команд"), ("Ctrl+Q", "Выход")):
+            row = tk.Frame(right, bg=_pal("surface"))
+            row.pack(fill="x", padx=20, pady=4)
+            tk.Label(row, text=what, bg=_pal("surface"), fg=_pal("text"), font=("Segoe UI", 10)).pack(side="left")
+            tk.Label(row, text=keys, bg=_pal("surface3"), fg=_pal("text"), font=("Consolas", 9),
+                     padx=7, pady=1).pack(side="right")
+        tk.Frame(right, bg=_pal("surface"), height=14).pack()
 
     def load_versions(self):
         def fetch():
@@ -12757,6 +14367,7 @@ class LauncherApp:
             self._select_account_tab()
             return
         self._apply_auto_memory()
+        self._install_cancel.clear()
         self.installing = True
         self.install_btn.config(state="disabled")
         self.launch_btn.config(state="disabled")
@@ -12787,6 +14398,14 @@ class LauncherApp:
             self.config["last_version"] = version
             self.save_config()
 
+            self.config["install_pending"] = {
+                "version": version, "loader": self.modloader_var.get(),
+                "loader_version": self._current_loader_version(), "time": time.time()}
+            inc_key = f"{version}|{self.modloader_var.get()}"
+            inc = self.config.setdefault("incomplete_installs", [])
+            if inc_key not in inc:
+                inc.append(inc_key)
+            self.save_config()
             meter = DownloadMeter(self.core.minecraft_dir, version)
             meter_state = {"stage": ""}
 
@@ -12796,6 +14415,8 @@ class LauncherApp:
                 self.root.after(0, lambda: (self.progress.config(value=pct), self.status_var.set(text)))
 
             def callback(progress, total, stage):
+                if self._install_cancel.is_set():
+                    raise InstallCancelled()
                 meter_state["stage"] = stage
                 if meter.active:
                     done_b, total_b = meter.snapshot()
@@ -12822,6 +14443,8 @@ class LauncherApp:
 
             loader = self.modloader_var.get()
             launch_version = version
+            if self._install_cancel.is_set():
+                raise InstallCancelled()
 
             if loader == "forge":
                 forge_ver = self.forge_var.get().strip()
@@ -12859,14 +14482,26 @@ class LauncherApp:
                         self.root.after(0, lambda err=e, t=title: messagebox.showerror(f"Ошибка {t}", str(err)))
                         return
 
+            try:
+                self.config.setdefault("incomplete_installs", []).remove(inc_key)
+            except ValueError:
+                pass
+            self.save_config()
             self.root.after(0, lambda: self.progress.config(value=100))
             self.root.after(0, lambda: self.status_var.set("✅ Установка завершена, запуск..."))
             self.root.after(0, self.refresh_installed_versions)
             self._launch_game(launch_version, player, minecraft_dir, mem)
 
+        except InstallCancelled:
+            self.root.after(0, lambda: messagebox.showinfo("Загрузка остановлена", "Уже скачанные файлы сохранены. Нажмите «Установить и запустить», чтобы докачать."))
         except Exception as e:
             self.root.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
         finally:
+            self.config.pop("install_pending", None)
+            try:
+                self.save_config()
+            except Exception:
+                pass
             self.installing = False
             self.root.after(0, lambda: self.install_btn.config(state="normal"))
             self.root.after(0, lambda: self.launch_btn.config(state="normal"))
@@ -12895,6 +14530,220 @@ class LauncherApp:
                 _log_install(f"Сервер «{name}» ({info['address']}) добавлен в «Сетевая игра» для {version}")
         except Exception as e:
             _log_install(f"Не удалось добавить сервер лаунчера в «Сетевая игра»: {e}")
+
+    def _goto_tab(self, key):
+        try:
+            for name, tab in self._nav_defs:
+                if key in name:
+                    self.notebook.select(tab)
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _open_notifs(self):
+        self._goto_tab("Уведомления")
+
+    def _notif_unread(self):
+        return sum(1 for n in self.config.get("notifications", []) if not n.get("read"))
+
+    def _notif_add(self, kind, title, text, key=None):
+        lst = self.config.setdefault("notifications", [])
+        if key and any(n.get("key") == key for n in lst):
+            return
+        lst.insert(0, {"kind": kind, "title": title, "text": text, "ts": time.time(), "read": False, "key": key})
+        del lst[80:]
+        self.save_config()
+        self._notif_refresh_all()
+        try:
+            self._tray_notify(title, text, only_if_hidden=True)
+        except Exception:
+            pass
+
+    def _notif_refresh_all(self):
+        st = getattr(self, "skin_stage", None)
+        if st is not None and hasattr(st, "notif_unread"):
+            st.notif_unread = self._notif_unread()
+            st._ov_sig = None
+        lb = getattr(self, "notif_list", None)
+        if lb is None:
+            return
+        try:
+            if not lb.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        lb.delete(0, tk.END)
+        for i, n in enumerate(self.config.get("notifications", [])):
+            when = datetime.fromtimestamp(n.get("ts", 0)).strftime("%d.%m %H:%M")
+            mark = "●" if not n.get("read") else " "
+            lb.insert(tk.END, f"  {mark}  {when}    {n.get('title', '')} — {n.get('text', '')}")
+            lb.itemconfig(i, fg=_pal("accent") if not n.get("read") else _pal("text_dim"))
+
+    def build_notifs_tab(self, frame):
+        top = ttk.Frame(frame)
+        top.pack(fill="x", padx=10, pady=(10, 5))
+        ttk.Button(top, text="Отметить прочитанными", command=self._notif_mark_all).pack(side="left")
+        ttk.Button(top, text="Очистить", command=self._notif_clear).pack(side="left", padx=6)
+        ttk.Label(top, text="Двойной клик открывает нужную вкладку", foreground=_pal("text_dim")).pack(side="left", padx=10)
+        area = ttk.Frame(frame)
+        area.pack(fill="both", expand=True, padx=10, pady=5)
+        self.notif_list = tk.Listbox(area, height=14, font=("Segoe UI", 10), exportselection=False)
+        self.notif_list.pack(side="left", fill="both", expand=True)
+        sc = ttk.Scrollbar(area, orient="vertical", command=self.notif_list.yview)
+        sc.pack(side="left", fill="y")
+        self.notif_list.config(yscrollcommand=sc.set)
+        self.notif_list.bind("<Double-Button-1>", lambda e: self._notif_open())
+        self._notif_refresh_all()
+
+    def _notif_mark_all(self):
+        for n in self.config.get("notifications", []):
+            n["read"] = True
+        self.save_config()
+        self._notif_refresh_all()
+
+    def _notif_clear(self):
+        self.config["notifications"] = []
+        self.save_config()
+        self._notif_refresh_all()
+
+    def _notif_open(self):
+        sel = self.notif_list.curselection()
+        lst = self.config.get("notifications", [])
+        if not sel or sel[0] >= len(lst):
+            return
+        n = lst[sel[0]]
+        n["read"] = True
+        self.save_config()
+        self._notif_refresh_all()
+        self._goto_tab("Новости" if n.get("kind") == "news" else "Друзья")
+
+    def _social_poll(self):
+        self.root.after(20000, self._social_poll)
+        st = getattr(self, "skin_stage", None)
+        if not self.api.is_logged_in():
+            if st is not None and hasattr(st, "friends_online"):
+                st.friends_online = None
+                st._ov_sig = None
+            return
+
+        def work():
+            out = {}
+            for key, fn in (("friends", self.api.friends_list), ("unread", self.api.unread_message_count),
+                            ("summary", self.api.unread_summary),
+                            ("news", self.api.news_latest_id)):
+                try:
+                    out[key] = fn()
+                except Exception:
+                    pass
+            return out
+
+        def done(res, err):
+            if err or not res:
+                return
+            fr = res.get("friends")
+            if fr and fr[0] == 200:
+                data = fr[1]
+                online = [f["nickname"] for f in data.get("friends", []) if f.get("is_online")]
+                prev = getattr(self, "_prev_online", None)
+                if prev is not None:
+                    for nick in online:
+                        if nick not in prev:
+                            self._notif_add("friend", "Друг в сети", nick, key=f"online:{nick}:{int(time.time() // 900)}")
+                self._prev_online = set(online)
+                self._friends_online_list = online
+                for r in data.get("incoming_requests", []):
+                    self._notif_add("request", "Заявка в друзья", r.get("requester", ""), key=f"req:{r.get('requester')}")
+                if st is not None and hasattr(st, "friends_online"):
+                    st.friends_online = len(online)
+                    st._ov_sig = None
+            un = res.get("unread")
+            sm = res.get("summary")
+            if sm and sm[0] == 200 and isinstance(sm[1], dict) and "senders" in sm[1]:
+                seen = getattr(self, "_unread_seen", {})
+                cur = {}
+                for it in sm[1]["senders"]:
+                    cur[it["sender"]] = it["count"]
+                    if it["count"] > seen.get(it["sender"], 0):
+                        word = "сообщение" if it["count"] == 1 else "сообщения"
+                        self._notif_add("msg", f"Сообщение от {it['sender']}",
+                                        f"Непрочитанных: {it['count']}" if it["count"] > 1 else "Новое " + word,
+                                        key=f"msg:{it['sender']}:{it.get('last_id')}")
+                self._unread_seen = cur
+                un = (200, {"count": sm[1].get("count", 0)})
+                self._last_unread = sm[1].get("count", 0)
+            if un and un[0] == 200:
+                c = int(un[1].get("count", 0))
+                last = getattr(self, "_last_unread", None)
+                if c > (last or 0) and not (sm and sm[0] == 200 and "senders" in sm[1]):
+                    self._notif_add("msg", "Новые сообщения", f"Непрочитанных от друзей: {c}")
+                if c == 0:
+                    for n in self.config.get("notifications", []):
+                        if n.get("kind") == "msg":
+                            n["read"] = True
+                    self._notif_refresh_all()
+                self._last_unread = c
+            nw = res.get("news")
+            if nw and nw[0] == 200:
+                nid = int(nw[1].get("latest_id", 0))
+                if nid > self.config.get("last_seen_news_id", 0) and nid != self.config.get("notified_news_id"):
+                    self.config["notified_news_id"] = nid
+                    self._notif_add("news", "Новости", "Опубликована новая новость", key=f"news:{nid}")
+
+        self._async(work, done)
+
+    def _friends_popup_toggle(self):
+        pop = getattr(self, "_friends_pop", None)
+        if pop is not None and pop.winfo_exists():
+            pop.destroy()
+            self._friends_pop = None
+            return
+        names = list(getattr(self, "_friends_online_list", []))
+        pop = tk.Frame(self._game_frame, bg=_pal("surface"), highlightthickness=2, highlightbackground="#000000")
+        self._friends_pop = pop
+        head = tk.Frame(pop, bg=_pal("surface"))
+        head.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(head, text=f"Друзья в сети: {len(names)}", bg=_pal("surface"), fg=_pal("text"),
+                 font=("Segoe UI", 12, "bold")).pack(side="left")
+        cl = tk.Label(head, text="закрыть", bg=_pal("surface"), fg=_pal("text_dim"), cursor="hand2", font=("Segoe UI", 9))
+        cl.pack(side="right")
+        cl.bind("<Button-1>", lambda e: self._friends_popup_toggle())
+        if names:
+            lb = tk.Listbox(pop, height=min(8, len(names)), font=("Segoe UI", 11), exportselection=False, width=30)
+            for n in names:
+                lb.insert(tk.END, f"  {n}")
+            lb.pack(fill="x", padx=14, pady=(0, 8))
+
+            def open_chat(_e=None):
+                sel = lb.curselection()
+                if not sel:
+                    return
+                nick = names[sel[0]]
+                self._friends_popup_toggle()
+                self._goto_tab("Друзья")
+                self.root.after(300, lambda: self._select_friend_chat(nick))
+            lb.bind("<Double-Button-1>", open_chat)
+            tk.Label(pop, text="Двойной клик открывает чат", bg=_pal("surface"), fg=_pal("text_dim"),
+                     font=("Segoe UI", 9)).pack(anchor="w", padx=14, pady=(0, 12))
+        else:
+            tk.Label(pop, text="Сейчас никого нет в сети" if self.api.is_logged_in() else "Войдите в аккаунт, чтобы видеть друзей",
+                     bg=_pal("surface"), fg=_pal("text_dim"), font=("Segoe UI", 10)).pack(anchor="w", padx=14, pady=(0, 14))
+        pop.place(x=30, y=84)
+        pop.lift()
+
+    def _select_friend_chat(self, nick):
+        lb = getattr(self, "friends_listbox", None)
+        if lb is None:
+            return
+        try:
+            for i in range(lb.size()):
+                if nick in lb.get(i):
+                    lb.selection_clear(0, tk.END)
+                    lb.selection_set(i)
+                    lb.event_generate("<<ListboxSelect>>")
+                    break
+        except tk.TclError:
+            pass
 
     def _select_account_tab(self):
         try:
@@ -12936,6 +14785,11 @@ class LauncherApp:
 
         loader = self.modloader_var.get()
         launch_version = version
+
+        if f"{version}|{loader}" in self.config.get("incomplete_installs", []):
+            self.status_var.set("Установка не была завершена, докачиваю...")
+            self.install_and_launch()
+            return
 
         if loader == "forge":
             forge_ver = self.forge_var.get().strip()
@@ -13367,10 +15221,7 @@ def main():
     splash.close()
 
     root.deiconify()
-    try:
-        root.iconbitmap(default=resource_path("icon.ico"))
-    except Exception:
-        pass
+    _apply_app_icon(root)
     app = LauncherApp(root)
     try:
         if app.config.get("autostart") and os.name == "nt":
@@ -13380,8 +15231,61 @@ def main():
     root.mainloop()
 
 
+def _make_icon_image(size=256):
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    u = size / 16
+    d.rectangle([u, u, size - u - 1, size - u - 1], fill=(20, 24, 26, 255), outline=(0, 0, 0, 255), width=max(1, int(u / 2)))
+    d.rectangle([u * 1.6, u * 1.6, size - u * 1.6 - 1, size - u * 1.6 - 1], outline=(51, 64, 61, 255), width=max(1, int(u / 3)))
+    g = (67, 181, 129, 255)
+    cells = ["X...X", "XX.XX", "X.X.X", "X...X", "X...X"]
+    cs = u * 2
+    ox = (size - cs * 5) / 2
+    oy = (size - cs * 5) / 2
+    for r, row in enumerate(cells):
+        for c, ch in enumerate(row):
+            if ch == "X":
+                d.rectangle([ox + c * cs, oy + r * cs, ox + (c + 1) * cs - 1, oy + (r + 1) * cs - 1], fill=g)
+    return img
+
+
+def _app_logo_image(size=64):
+    for path in (resource_path("icon.ico"), os.path.join(_app_base_dir(), "icon.ico")):
+        if os.path.exists(path):
+            try:
+                im = Image.open(path)
+                try:
+                    best = max(im.ico.sizes())
+                    im = im.ico.getimage(best)
+                except Exception:
+                    pass
+                return im.convert("RGBA").resize((size, size), Image.LANCZOS)
+            except Exception:
+                continue
+    return _make_icon_image(96).resize((size, size), Image.NEAREST)
+
+
+def _apply_app_icon(root):
+    path = resource_path("icon.ico")
+    if not os.path.exists(path):
+        path = os.path.join(_app_base_dir(), "icon.ico")
+    try:
+        if not os.path.exists(path) and HAS_PIL:
+            path = os.path.join(tempfile.gettempdir(), "mafin_launcher_icon.ico")
+            _make_icon_image().save(path, format="ICO", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+        if os.name == "nt":
+            root.iconbitmap(default=path)
+        else:
+            from PIL import ImageTk
+            root._icon_ref = ImageTk.PhotoImage(_make_icon_image(64))
+            root.iconphoto(True, root._icon_ref)
+    except Exception:
+        pass
+
+
 def _write_crash_log(text):
-    for base in (_app_base_dir(), os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MafinLauncher"), tempfile.gettempdir()):
+    for base in (_app_base_dir(), _data_home(), tempfile.gettempdir()):
         try:
             os.makedirs(base, exist_ok=True)
             path = os.path.join(base, "launcher_crash.log")
